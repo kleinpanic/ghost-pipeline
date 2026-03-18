@@ -1476,6 +1476,7 @@ function findChatGuidForPhone(phone, allChats) {
 
 function isFromKlein(m) {
   // BB direct HTTP uses isFromMe:true; mcporter uses from:"me"
+  if (!m || typeof m !== "object") return false;
   return m.isFromMe === true || m.from === "me";
 }
 
@@ -1839,6 +1840,8 @@ function cmdServe() {
 //  ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Only run CLI when executed directly — not when required as a module (e.g. by tests)
+if (require.main === module) {
 const [,, cmd = "serve", ...cmdArgs] = process.argv;
 
 switch (cmd) {
@@ -1880,4 +1883,21 @@ switch (cmd) {
     console.log("  resume                 resume ghost");
     console.log("  schedule               print nightly learn cron line            (Phase 5)");
     process.exit(1);
+}
+} // end require.main === module guard
+
+// ── Test exports (only when required as a module, not run directly) ──────────
+if (require.main !== module) {
+  module.exports = {
+    normalizePhone,
+    isFromKlein,
+    requiresReply,
+    extractBBList,
+    isQuietHours,
+    loadAllowlist,
+    loadContactsMap,
+    isDenied,
+    isLikelySpam,
+    isAllowed,
+  };
 }
