@@ -1,0 +1,26 @@
+{
+  "name": "ghost-pipeline",
+  "version": "3.0.0",
+  "description": "Klein's iMessage auto-reply pipeline via BlueBubbles MCP",
+  "main": "src/ghost.js",
+  "scripts": {
+    "start": "node src/ghost.js serve",
+    "test": "jest --coverage",
+    "test:unit": "jest tests/unit --coverage",
+    "test:integration": "jest tests/integration",
+    "status": "node src/ghost.js status",
+    "pause": "node src/ghost.js pause",
+    "resume": "node src/ghost.js resume"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nock": "^13.5.6"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": [
+      "src/**/*.js"
+    ]
+  }
+}
