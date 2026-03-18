@@ -776,17 +776,21 @@ async function checkSparkAvailable() {
 }
 
 async function generateDraft(systemPrompt, userContent, { contactName, contactPhone, messageText, historyLines } = {}) {
-  // ── Tier 1: Spark vllm fast — skip immediately if known offline (Phase 2)
+  // ── Tier 1: Spark vllm fast — local, low-latency, good for simple acks
   if (await checkSparkAvailable()) {
     log("Draft tier 1: Spark gpt-oss-20b...");
     const t1 = await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent);
     if (t1) return { text: t1.trim(), model: "spark-20b" };
-
-    log("Draft tier 2: Spark gpt-oss-120b...");
-    const t2 = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
-    if (t2) return { text: t2.trim(), model: "spark-120b" };
   } else {
-    log("Draft: Spark offline — skipping to Gemini CLI");
+    log("Draft: Spark offline — skipping tiers 1-2");
+  }
+
+  // ── Tier 2: Ghost Agent — full Klein context (SOUL.md + voice + contact memory + Claude chain)
+  // Moved up from last: 90s latency is fine within the 5-min draft window; quality beats local models.
+  if (contactName && messageText) {
+    log("Draft tier 2: Ghost agent (full context)...");
+    const t2 = await tryGhostAgent(contactName, contactPhone, messageText, historyLines);
+    if (t2) return { text: t2, model: "ghost-agent" };
   }
 
   // ── Tier 3: Gemini CLI (fast, OAuth, strong)
@@ -799,16 +803,16 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
   const t4 = await tryOpenRouter("google/gemma-3-27b-it:free", systemPrompt, userContent);
   if (t4) return { text: t4.trim(), model: "gemma-27b" };
 
-  // ── Tier 5: OR gemma-12b free (last resort)
-  log("Draft tier 5: OR gemma-12b (last resort)...");
+  // ── Tier 5: OR gemma-12b free
+  log("Draft tier 5: OR gemma-12b...");
   const t5 = await tryOpenRouter("google/gemma-3-12b-it:free", systemPrompt, userContent);
   if (t5) return { text: t5.trim(), model: "gemma-12b" };
 
-  // ── Tier 6: Ghost agent as last fallback (slow but thorough)
-  if (contactName && messageText) {
-    log("Draft tier 6: Ghost agent (last resort)...");
-    const t6 = await tryGhostAgent(contactName, contactPhone, messageText, historyLines);
-    if (t6) return { text: t6, model: "ghost-agent" };
+  // ── Tier 6: Spark strong — last local resort if all cloud fails
+  if (await checkSparkAvailable()) {
+    log("Draft tier 6: Spark gpt-oss-120b (last resort)...");
+    const t6 = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
+    if (t6) return { text: t6.trim(), model: "spark-120b" };
   }
 
   log("Draft: all tiers exhausted");
@@ -1363,9 +1367,20 @@ function createServer() {
         const key           = chatGuid || normalized;
 
         // Replace existing pending for same chat (debounce rapid messages)
+        // ISSUE-8 fix: also remove old draft from ghost-pending-drafts.json so it doesn't auto-send stale context
         if (pendingMessages.has(key)) {
           clearTimeout(pendingMessages.get(key).timeoutId);
           log(`Debounced pending for ${key}`);
+          // Remove the stale draft from persistent pending and notify Discord
+          const staleDrafts = loadPendingDrafts();
+          const staleEntry  = staleDrafts.find(d => d.contact === normalized || d.chatGuid === key);
+          if (staleEntry) {
+            savePendingDrafts(staleDrafts.filter(d => d.draftId !== staleEntry.draftId));
+            discordPost(GHOST_CHANNEL, {
+              content: `⚠️ Draft superseded for **${contactName}** — new message arrived, regenerating. Old draft discarded.`,
+            }).catch(() => {});
+            log(`Removed stale draft ${staleEntry.draftId} for ${contactName} (superseded)`);
+          }
         }
 
         const timeoutId = setTimeout(() => checkAndDraft(key), DRAFT_DELAY_MS);
@@ -1513,7 +1528,9 @@ async function learnContact(contact, allChats) {
   for (const chat of candidateChats) {
     log(`Trying chatGuid: ${chat.guid}`);
     try {
-      const data = await mcporterCallSync("bb_get_chat_messages", { chat_guid: chat.guid, limit: 200, sort: "DESC" });
+      // Use higher limit for family_close contacts (high message frequency)
+      const msgLimit = (contact.category === "family_close") ? 750 : 500;
+      const data = await mcporterCallSync("bb_get_chat_messages", { chat_guid: chat.guid, limit: msgLimit, sort: "DESC" });
       const msgs = extractBBList(data);
       if (msgs.length > 0) { messages = msgs; chatGuid = chat.guid; break; }
       log(`  → 0 messages, trying next`);
