@@ -68,7 +68,8 @@ const OWNER_PHONE_NORMALIZED = "12673479614";
 
 // Timing
 const DRAFT_DELAY_MS          = 5  * 60 * 1000;  // wait 5 min before drafting
-const AUTO_SEND_WINDOW_MS     = 5  * 60 * 1000;  // auto-send after 5 min review window
+const AUTO_SEND_WINDOW_MS     = 0;                // AUTO-SEND DISABLED — Klein approves manually via button
+
 const REACT_CHECK_INTERVAL_MS = 60 * 1000;       // reaction check every 60s
 const QUIET_HOUR_START        = 23;
 const QUIET_HOUR_END          = 8;
@@ -447,6 +448,13 @@ function isLikelySpam(phone, text) {
     "suspicious login", "verify your identity", "confirm your information",
     "congratulations you", "you have been chosen", "winner selected",
     "discounted rate", "special offer expires", "call immediately",
+    // Discount/promo spam
+    "% off", "percent off", "promo code", "discount code", "coupon code",
+    "found a code", "checkout code", "use code", "save now", "deal expires",
+    "flash sale", "limited offer", "while supplies last", "exclusive deal",
+    "shop now", "order now", "buy now", "get yours", "claim now",
+    "reward points", "loyalty points", "gift card", "store credit",
+    "free shipping", "no fees", "no interest", "apply now", "sign up now",
   ];
   const matchedKw = spamWords.find(kw => t.includes(kw));
   if (matchedKw) {
@@ -1044,6 +1052,12 @@ async function checkAndDraft(key) {
 
   log(`checkAndDraft: ${contactName} (${key})`);
 
+  // Quiet hours guard — don't draft outside 8am–11pm ET (uses existing isQuietHours)
+  if (isQuietHours(contact)) {
+    log(`checkAndDraft: quiet hours — skipping draft for ${contactName}`);
+    return;
+  }
+
   // BUG-2 guard: if chatGuid looks like a raw phone number (no semicolons),
   // resolve the real iMessage guid before proceeding.
   if (chatGuid && !chatGuid.includes(";")) {
@@ -1093,15 +1107,27 @@ async function checkAndDraft(key) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function bbSendMessage(chatGuid, message) {
+  // Primary: mcporter → BB MCP (SSH tunnel)
   try {
     const argsJson = JSON.stringify({ chat_guid: chatGuid, message });
     const stdout   = await spawnAsync("mcporter", [
       "call", "bluebubbles.bb_send_message", "--args", argsJson,
-    ], { timeout: 30000 });
+    ], { timeout: 20000 });
     const resp = tryParseJson(stdout);
-    return resp?.status === 200;
+    if (resp?.status === 200) return true;
+    log(`bbSendMessage MCP returned non-200: ${JSON.stringify(resp?.error || resp?.status)}`);
   } catch (err) {
-    log(`bbSendMessage failed: ${err.message.slice(0, 100)}`);
+    log(`bbSendMessage MCP failed (${err.message.slice(0, 80)}); trying direct BB...`);
+  }
+
+  // Fallback: direct BB HTTP API
+  try {
+    const result = await bbPost(`chat/${encodeURIComponent(chatGuid)}/message`, { message, method: "apple-script" });
+    if (result?.status === 200) { log(`bbSendMessage direct BB ok`); return true; }
+    log(`bbSendMessage direct BB returned: ${result?.status}`);
+    return false;
+  } catch (err) {
+    log(`bbSendMessage direct BB error: ${err.message.slice(0, 80)}`);
     return false;
   }
 }
@@ -1255,12 +1281,7 @@ async function doReactionCheck() {
         continue;
       }
 
-      if (age >= AUTO_SEND_WINDOW_MS) {
-        log(`⏱ Auto-send: ${contactName}`);
-        const ok = await executeSend(draft, "auto-send");
-        if (!ok) keep.push(draft);
-        continue;
-      }
+      // Auto-send is disabled — drafts stay pending until Klein clicks "Send Now" or "Cancel"
 
       keep.push(draft);
     }
