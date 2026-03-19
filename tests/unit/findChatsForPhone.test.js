@@ -26,14 +26,26 @@ describe("findChatsForPhone — scoring / priority", () => {
     expect(result[0].guid).toBe(`iMessage;-;+${PHONE}`);
   });
 
-  test("iMessageLite;-; scores same tier as iMessage;-;", () => {
+  test("SMS;-; beats iMessageLite;-; (iMessageLite returns 405 on send)", () => {
     const chats = [
-      makeChat(`SMS;-;+${PHONE}`, [{ address: `+${PHONE}` }]),
       makeChat(`iMessageLite;-;+${PHONE}`, [{ address: `+${PHONE}` }]),
+      makeChat(`SMS;-;+${PHONE}`, [{ address: `+${PHONE}` }]),
     ];
     const result = findChatsForPhone(`+${PHONE}`, chats);
-    // iMessageLite should beat SMS (score 0 vs 1)
-    expect(result[0].guid).toBe(`iMessageLite;-;+${PHONE}`);
+    // SMS must win — iMessageLite returns 405 Method Not Allowed on BB send endpoint
+    expect(result[0].guid).toBe(`SMS;-;+${PHONE}`);
+  });
+
+  test("iMessage;-; beats SMS;-; beats iMessageLite;-; (priority order)", () => {
+    const chats = [
+      makeChat(`iMessageLite;-;+${PHONE}`, [{ address: `+${PHONE}` }]),
+      makeChat(`SMS;-;+${PHONE}`,          [{ address: `+${PHONE}` }]),
+      makeChat(`iMessage;-;+${PHONE}`,     [{ address: `+${PHONE}` }]),
+    ];
+    const result = findChatsForPhone(`+${PHONE}`, chats);
+    expect(result[0].guid).toBe(`iMessage;-;+${PHONE}`);
+    expect(result[1].guid).toBe(`SMS;-;+${PHONE}`);
+    expect(result[2].guid).toBe(`iMessageLite;-;+${PHONE}`);
   });
 
   test("direct SMS beats group iMessage", () => {
