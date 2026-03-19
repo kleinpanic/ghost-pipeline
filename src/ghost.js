@@ -1341,7 +1341,7 @@ const OC_GATEWAY_PORT         = 18789;  // loopback TLS, confirmed
  * gateway.tools.allow includes "sessions_send" so this is permitted.
  * Returns { text, model } or null on timeout/failure.
  */
-async function tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, timeoutMs = 15000) {
+async function tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, timeoutMs = 25000) {
   if (!OC_GATEWAY_TOKEN) { log("Ghost agent: no gateway token — skipping"); return null; }
 
   const prompt = [
