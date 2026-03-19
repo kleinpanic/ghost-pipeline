@@ -49,6 +49,7 @@ const CONTACTS_MEMORY_DIR = path.join(GHOST_DIR, "memory", "contacts");
 const LOCK_FILE           = path.join(DATA_DIR, "ghost-reaction-check.lock");
 const SPAM_LOG_FILE       = path.join(DATA_DIR, "ghost-spam-log.json");
 const SPAM_RATELIMIT_FILE = path.join(DATA_DIR, "ghost-spam-ratelimit.json");
+const FEEDBACK_FILE       = path.join(DATA_DIR, "ghost-feedback.json");
 
 // Secrets
 const BB_PASSWORD        = readSecret(path.join(HOME, ".config", "bluebubbles", "password"));
@@ -842,6 +843,152 @@ async function checkSparkAvailable() {
   });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  FEEDBACK LOOP
+// ═══════════════════════════════════════════════════════════════════════════
+
+function logFeedback(draft, decision) {
+  try {
+    const { draftId, contact, contactName, draftText, draftModel, postedAt } = draft;
+    const { numToCategory } = loadContactsMap();
+    const phone = normalizePhone(contact || "");
+    const contactCategory = numToCategory[phone] || "unknown";
+
+    const arrivedDate = postedAt ? new Date(postedAt) : new Date();
+    const entry = {
+      draftId,
+      contact: phone,
+      contactName: contactName || "",
+      contactCategory,
+      theirMessage: (draft.messageText || "").slice(0, 200),
+      draftText: draftText || "",
+      draftModel: draftModel || "",
+      decision,
+      decisionTimestamp: new Date().toISOString(),
+      arrivedHour: arrivedDate.getHours(),
+      arrivedDayOfWeek: arrivedDate.getDay(),
+    };
+
+    const entries = loadJson(FEEDBACK_FILE, []);
+    entries.push(entry);
+    // Cap at 500 entries
+    if (entries.length > 500) entries.splice(0, entries.length - 500);
+    saveJson(FEEDBACK_FILE, entries);
+  } catch (err) {
+    log(`logFeedback error: ${err.message}`);
+  }
+}
+
+function recentFeedbackSummary(limit = 20) {
+  try {
+    const entries = loadJson(FEEDBACK_FILE, []);
+    if (!entries.length) return "";
+
+    const recent = entries.slice(-limit);
+
+    // Group by contact
+    const byContact = {};
+    for (const e of recent) {
+      if (!e.contactName) continue;
+      if (!byContact[e.contactName]) byContact[e.contactName] = { sent: 0, cancelled: 0, category: e.contactCategory };
+      if (e.decision === "sent") byContact[e.contactName].sent++;
+      else if (e.decision === "cancelled") byContact[e.contactName].cancelled++;
+    }
+
+    const notes = [];
+
+    for (const [name, stats] of Object.entries(byContact)) {
+      const total = stats.sent + stats.cancelled;
+      if (total < 2) continue;
+      if (stats.cancelled > stats.sent) {
+        notes.push(`- Klein often cancels drafts for ${name} (${stats.category}) — draft more carefully`);
+      } else if (total >= 3 && stats.sent / total >= 0.8) {
+        notes.push(`- Style is working for ${name}`);
+      }
+    }
+
+    // Late-hour cancel pattern
+    const lateHourCancels = recent.filter(e => e.decision === "cancelled" && (e.arrivedHour >= 22 || e.arrivedHour < 8));
+    if (lateHourCancels.length >= 3) {
+      notes.push(`- Klein frequently cancels late-night drafts (${lateHourCancels.length} recent) — be more cautious during late hours`);
+    }
+
+    if (!notes.length) return "";
+    return `\n\n---\n## RECENT DRAFT FEEDBACK PATTERNS\n${notes.join("\n")}`;
+  } catch (err) {
+    log(`recentFeedbackSummary error: ${err.message}`);
+    return "";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GHOST AGENT IPC QUEUE TIER
+// ═══════════════════════════════════════════════════════════════════════════
+
+const GHOST_DRAFT_QUEUE_FILE   = path.join(DATA_DIR, "ghost-draft-queue.json");
+const GHOST_DRAFT_RESULTS_FILE = path.join(DATA_DIR, "ghost-draft-results.json");
+
+function uuidv4() {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+function isGhostAgentActive() {
+  try {
+    const results = loadJson(GHOST_DRAFT_RESULTS_FILE, []);
+    if (!results.length) return false;
+    const last = results[results.length - 1];
+    if (!last.completedAt) return false;
+    const age = Date.now() - new Date(last.completedAt).getTime();
+    return age < 5 * 60 * 1000; // within 5 minutes
+  } catch {
+    return false;
+  }
+}
+
+async function tryGhostAgentViaQueue(contactName, contactPhone, systemPrompt, userContent, timeoutMs = 15000) {
+  if (!isGhostAgentActive()) return null;
+
+  const reqId = uuidv4();
+  const request = {
+    reqId,
+    contactName,
+    contactPhone,
+    systemPrompt,
+    userContent,
+    requestedAt: new Date().toISOString(),
+    status: "pending",
+  };
+
+  // Write request to queue
+  const queue = loadJson(GHOST_DRAFT_QUEUE_FILE, []);
+  queue.push(request);
+  saveJson(GHOST_DRAFT_QUEUE_FILE, queue);
+
+  // Poll for result
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      const results = loadJson(GHOST_DRAFT_RESULTS_FILE, []);
+      const result = results.find(r => r.reqId === reqId && r.status === "done");
+      if (result) {
+        return { text: result.text, model: "ghost-agent" };
+      }
+    } catch {}
+  }
+
+  // Timeout — remove from queue
+  log(`tryGhostAgentViaQueue: timeout waiting for reqId ${reqId}`);
+  try {
+    const q = loadJson(GHOST_DRAFT_QUEUE_FILE, []);
+    saveJson(GHOST_DRAFT_QUEUE_FILE, q.filter(e => e.reqId !== reqId));
+  } catch {}
+  return null;
+}
+
 async function generateDraft(systemPrompt, userContent, { contactName, contactPhone, messageText, historyLines } = {}) {
   // ── Tier 1: Spark vllm fast — local, low-latency (when available)
   if (await checkSparkAvailable()) {
@@ -851,6 +998,10 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
   } else {
     log("Draft: Spark offline — skipping local tiers");
   }
+
+  // ── Tier 1.5: Ghost agent session (file-based IPC queue)
+  const ghostDraft = await tryGhostAgentViaQueue(contactName, contactPhone, systemPrompt, userContent);
+  if (ghostDraft) { log("Draft tier 1.5: ghost agent session"); return ghostDraft; }
 
   // ── Tier 2: OR claude-haiku-4.5 — fast, reliable, cheap primary cloud tier
   log("Draft tier 2: OR claude-haiku-4.5...");
@@ -915,6 +1066,10 @@ function buildSystemPrompt(contactName, contactPhone) {
 - Current semester: Spring 2026.`;
 
   prompt += `\n\n---\nDraft a reply to ${contactName} as Klein. Max 1-2 short texts. No emojis unless genuinely funny. No greeting openers. Output ONLY the reply text — nothing else.`;
+
+  const feedbackSummary = recentFeedbackSummary();
+  if (feedbackSummary) prompt += feedbackSummary;
+
   return prompt;
 }
 
@@ -1225,6 +1380,7 @@ async function executeSend(draft, reason) {
 
   if (ok) {
     await discordPost(GHOST_CHANNEL, { content: `✅ Sent to **${contactName}**: "${draftText}"` });
+    logFeedback(draft, "sent");
     return true;
   } else {
     const retries = (draft.retries || 0) + 1;
@@ -1318,6 +1474,7 @@ async function doReactionCheck() {
       if (action === "cancel") {
         log(`❌ Cancel: ${contactName} (${draftId})`);
         await discordPost(GHOST_CHANNEL, { content: `❌ Cancelled draft for **${contactName}**.` });
+        logFeedback(draft, "cancelled");
         continue;
       }
 
