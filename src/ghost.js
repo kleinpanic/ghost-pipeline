@@ -29,6 +29,9 @@ const path   = require("path");
 const crypto = require("crypto");
 const { spawnSync, spawn } = require("child_process");
 
+// sqlite-vec embedding DB (lazy-initialized on first use)
+let _memoriesDb = null;
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -51,10 +54,57 @@ const SPAM_LOG_FILE       = path.join(DATA_DIR, "ghost-spam-log.json");
 const SPAM_RATELIMIT_FILE = path.join(DATA_DIR, "ghost-spam-ratelimit.json");
 const FEEDBACK_FILE       = path.join(DATA_DIR, "ghost-feedback.json");
 
+// Embeddings + memories DB
+const GHOST_MEMORIES_DB   = path.join(DATA_DIR, "ghost-memories.db");
+const GHOST_CONV_STATE_FILE = path.join(DATA_DIR, "ghost-conv-state.json");
+
+// ── Embedding provider ───────────────────────────────────────────────────
+const EMBED_PROVIDER = "google";
+const EMBED_MODEL    = "text-embedding-004";
+const EMBED_DIMS     = 768;
+
+// ── Variable cooldown constants ──────────────────────────────────────────
+const COOLDOWN_STRANGER_MIN_MS   = 3.5 * 60 * 1000;
+const COOLDOWN_STRANGER_MAX_MS   = 7.5 * 60 * 1000;
+const COOLDOWN_ACTIVE_MIN_MS     = 1.5 * 60 * 1000;
+const COOLDOWN_ACTIVE_MAX_MS     = 3.5 * 60 * 1000;
+const ACTIVE_EXCHANGE_THRESHOLD  = 3;
+const ACTIVE_TIMEOUT_MS          = 5  * 60 * 1000;
+
+// ── Content safety patterns (checked on every draft before returning) ────
+const NEVER_SAY = [
+  /\bn[\-*]+w+er\b/i,
+  /\bf[\-*]+ck\s+you\b/i,
+  /\bkill\s+yourself\b/i,
+  /\byou\s+(should\s+)?die\b/i,
+  /\bi\s+(will\s+)?find\s+you\b/i,
+  /\byour\s+(address|location|home)/i,
+  /\bsocial\s+security\b/i,
+  /\bcredit\s+card\b/i,
+  /\bpassword\b/i,
+  /\bsend\s+me\s+money\b/i,
+  /\bwire\s+transfer\b/i,
+];
+
 // Secrets
 const BB_PASSWORD        = readSecret(path.join(HOME, ".config", "bluebubbles", "password"));
 const OPENROUTER_API_KEY = readSecret(path.join(HOME, ".config", "openrouter", "api-key"));
 const DISCORD_BOT_TOKEN  = readSecret(path.join(HOME, ".config", "discord", "bot-token"));
+
+// GEMINI_API_KEY — loaded from env or .env file
+function loadEnvFile(filename) {
+  try {
+    const envPath = path.isAbsolute(filename) ? filename : path.join(HOME, ".openclaw", filename);
+    const raw = fs.readFileSync(envPath, "utf8");
+    const result = {};
+    for (const line of raw.split("\n")) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.+?)\s*$/);
+      if (m) result[m[1]] = m[2].replace(/^["']|["']$/g, "");
+    }
+    return result;
+  } catch { return {}; }
+}
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || loadEnvFile(".env").GEMINI_API_KEY || "";
 
 // Network
 const PORT    = 18790;
@@ -261,6 +311,248 @@ function parseIncomingEvent(body, contentType) {
   }
 
   throw new SyntaxError("Unable to parse BlueBubbles payload as JSON event");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  EMBEDDINGS + MEMORY DB  (sqlite-vec + Google text-embedding-004)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function getMemoriesDb() {
+  if (_memoriesDb) return _memoriesDb;
+  try {
+    const Database  = require("better-sqlite3");
+    const sqliteVec = require("sqlite-vec");
+    const db = new Database(GHOST_MEMORIES_DB);
+    sqliteVec.load(db);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS contact_memories (
+        id        INTEGER PRIMARY KEY,
+        phone     TEXT    NOT NULL,
+        ts        INTEGER NOT NULL,
+        role      TEXT    NOT NULL,
+        text      TEXT    NOT NULL,
+        embedding BLOB
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_contact_memories_unique
+        ON contact_memories(phone, ts, role);
+      CREATE INDEX IF NOT EXISTS idx_contact_memories_phone
+        ON contact_memories(phone);
+    `);
+    _memoriesDb = db;
+    return db;
+  } catch (err) {
+    log(`getMemoriesDb: failed to open — ${err.message.slice(0, 80)}`);
+    return null;
+  }
+}
+
+/**
+ * Call Google text-embedding-004 to get a 768-dim Float32Array.
+ * Returns null on failure (graceful degradation).
+ */
+async function embedText(text) {
+  if (!GEMINI_API_KEY) return null;
+  try {
+    const body = JSON.stringify({
+      model:   "models/text-embedding-004",
+      content: { parts: [{ text }] },
+    });
+    const result = await new Promise((resolve, reject) => {
+      const url  = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`;
+      const opts = {
+        hostname: "generativelanguage.googleapis.com",
+        path:     `/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`,
+        method:   "POST",
+        headers:  { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      };
+      const req = https.request(opts, (res) => {
+        let data = "";
+        res.on("data", c => { data += c; });
+        res.on("end", () => {
+          try {
+            const parsed = JSON.parse(data);
+            const values = parsed?.embedding?.values;
+            if (Array.isArray(values) && values.length === EMBED_DIMS) {
+              resolve(new Float32Array(values));
+            } else {
+              reject(new Error(`unexpected embed response: ${JSON.stringify(parsed).slice(0, 100)}`));
+            }
+          } catch (e) { reject(e); }
+        });
+      });
+      req.on("error", reject);
+      req.setTimeout(10000, () => { req.destroy(); reject(new Error("embed timeout")); });
+      req.write(body);
+      req.end();
+    });
+    return result;
+  } catch (err) {
+    log(`embedText error: ${err.message.slice(0, 80)}`);
+    return null;
+  }
+}
+
+/**
+ * Insert a message row and asynchronously attach an embedding.
+ * Non-blocking — caller does NOT await.
+ */
+function indexMessage(phone, ts, role, text) {
+  if (!text || text.trim().length < 3) return;
+  const n = normalizePhone(phone);
+  const db = getMemoriesDb();
+  if (!db) return;
+  try {
+    // Insert without embedding first (fast path)
+    db.prepare(`
+      INSERT OR IGNORE INTO contact_memories (phone, ts, role, text, embedding)
+      VALUES (?, ?, ?, ?, NULL)
+    `).run(n, ts, role, text.trim());
+
+    // Asynchronously embed and update
+    embedText(text.trim()).then(vec => {
+      if (!vec) return;
+      try {
+        const blob = Buffer.from(vec.buffer);
+        db.prepare(`UPDATE contact_memories SET embedding = ? WHERE phone = ? AND ts = ? AND role = ?`)
+          .run(blob, n, ts, role);
+      } catch {}
+    }).catch(() => {});
+  } catch (err) {
+    // unique constraint violation = duplicate, that's ok
+    if (!err.message.includes("UNIQUE")) log(`indexMessage error: ${err.message.slice(0,60)}`);
+  }
+}
+
+/**
+ * Find the top-K most relevant messages for a given phone using cosine similarity.
+ * Gracefully returns [] if embeddings are unavailable.
+ */
+async function queryRelevantMemory(incomingText, phone, topK = 5) {
+  const db = getMemoriesDb();
+  if (!db) return [];
+  const queryVec = await embedText(incomingText);
+  if (!queryVec) return [];
+  const n = normalizePhone(phone);
+  try {
+    const rows = db.prepare(`
+      SELECT text, role, ts, vec_distance_cosine(embedding, ?) AS distance
+      FROM contact_memories
+      WHERE phone = ? AND embedding IS NOT NULL
+      ORDER BY distance ASC
+      LIMIT ?
+    `).all(Buffer.from(queryVec.buffer), n, topK);
+    return rows.map(r => ({ text: r.text, role: r.role, ts: r.ts }));
+  } catch (err) {
+    log(`queryRelevantMemory error: ${err.message.slice(0,80)}`);
+    return [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CONVERSATION STATE MACHINE  (variable cooldown: stranger vs. active)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function loadConvState() {
+  return loadJson(GHOST_CONV_STATE_FILE, {});
+}
+
+function saveConvState(state) {
+  saveJson(GHOST_CONV_STATE_FILE, state);
+}
+
+function randomCooldown(minMs, maxMs) {
+  return Math.floor(Math.random() * (maxMs - minMs) + minMs);
+}
+
+/**
+ * Returns the cooldown in ms before auto-sending to this phone.
+ * - 'active' mode (≥3 ghost sends): 1.5–3.5 min
+ * - 'stranger' mode: 3.5–7.5 min
+ */
+function getCooldownMs(phone) {
+  const n     = normalizePhone(phone);
+  const state = loadConvState();
+  const entry = state[n];
+  if (entry && entry.mode === "active") {
+    // Check if active mode timed out (5min silence since last ghost send)
+    const lastSend = entry.lastGhostSendAt ? new Date(entry.lastGhostSendAt).getTime() : 0;
+    if (Date.now() - lastSend > ACTIVE_TIMEOUT_MS) {
+      // timed out — treat as stranger
+      return randomCooldown(COOLDOWN_STRANGER_MIN_MS, COOLDOWN_STRANGER_MAX_MS);
+    }
+    return randomCooldown(COOLDOWN_ACTIVE_MIN_MS, COOLDOWN_ACTIVE_MAX_MS);
+  }
+  return randomCooldown(COOLDOWN_STRANGER_MIN_MS, COOLDOWN_STRANGER_MAX_MS);
+}
+
+/** Called when ghost successfully sends to a contact. */
+function onGhostSend(phone) {
+  const n     = normalizePhone(phone);
+  const state = loadConvState();
+  const entry = state[n] || { mode: "stranger", exchangeCount: 0 };
+  entry.exchangeCount   = (entry.exchangeCount || 0) + 1;
+  entry.lastGhostSendAt = new Date().toISOString();
+  if (entry.exchangeCount >= ACTIVE_EXCHANGE_THRESHOLD) entry.mode = "active";
+  state[n] = entry;
+  saveConvState(state);
+}
+
+/** Called when a contact sends us a message. */
+function onContactMessage(phone) {
+  const n     = normalizePhone(phone);
+  const state = loadConvState();
+  const entry = state[n] || { mode: "stranger", exchangeCount: 0 };
+  entry.lastContactMsgAt = new Date().toISOString();
+  // If active but ghost has been silent > ACTIVE_TIMEOUT_MS, reset to stranger
+  if (entry.mode === "active") {
+    const lastSend = entry.lastGhostSendAt ? new Date(entry.lastGhostSendAt).getTime() : 0;
+    if (Date.now() - lastSend > ACTIVE_TIMEOUT_MS) {
+      entry.mode          = "stranger";
+      entry.exchangeCount = 0;
+    }
+  }
+  state[n] = entry;
+  saveConvState(state);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PROMPT INJECTION SCANNER
+// ═══════════════════════════════════════════════════════════════════════════
+
+const INJECTION_PATTERNS = [
+  { re: /ignore\s+(all\s+)?previous\s+instructions/i,                label: "ignore previous instructions" },
+  { re: /you\s+are\s+(now\s+)?(an?\s+)?(?:ai|bot|assistant|language model|llm)/i, label: "you are an AI" },
+  { re: /reveal\s+(your\s+)?(system\s+)?prompt/i,                    label: "reveal prompt" },
+  { re: /repeat\s+(back\s+)?(everything|your instructions|your prompt)/i, label: "repeat instructions" },
+  { re: /disregard\s+(your\s+)?(previous|prior|all)/i,               label: "disregard previous" },
+  { re: /new\s+instructions?:/i,                                     label: "new instructions" },
+  { re: /\[system\]/i,                                               label: "[system] tag" },
+  { re: /as\s+an?\s+(ai|language model|llm)/i,                       label: "as an AI" },
+  { re: /your\s+true\s+(identity|purpose|role)/i,                    label: "true identity" },
+  { re: /print\s+(your\s+)?(instructions?|prompt|rules)/i,           label: "print instructions" },
+  { re: /what\s+(are|were)\s+your\s+(instructions?|rules|guidelines)/i, label: "what are your instructions" },
+];
+
+/**
+ * Returns { safe: true } or { safe: false, reason: string }
+ */
+function scanForInjection(messageText) {
+  if (!messageText) return { safe: true };
+  for (const { re, label } of INJECTION_PATTERNS) {
+    if (re.test(messageText)) {
+      return { safe: false, reason: `prompt injection detected: ${label}` };
+    }
+  }
+  return { safe: true };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CONTENT SAFETY FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+function passesContentSafety(draftText) {
+  if (!draftText) return true;
+  return !NEVER_SAY.some(pattern => pattern.test(draftText));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1130,63 +1422,83 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
   const available = await probeAvailableModels();
   log(`Draft: probed [${available.join(", ")}] — trying ${available[0] || "none"}...`);
 
+  // Helper: check content safety then return or log+skip
+  const safeReturn = (text, model) => {
+    if (!text) return null;
+    const trimmed = text.trim();
+    if (!passesContentSafety(trimmed)) {
+      log(`Draft failed content safety [${model}] — trying next model`);
+      return null;
+    }
+    return { text: trimmed, model };
+  };
+
   for (const modelKey of available) {
     switch (modelKey) {
       case "ghost-agent": {
         const result = await tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, 15000);
-        if (result) return result;
+        if (result) {
+          if (passesContentSafety(result.text)) return result;
+          log("Draft failed content safety [ghost-agent] — trying next model");
+        }
         break;
       }
       case "spark-fast": {
         log("Draft: Spark gpt-oss-20b...");
         const t = await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent);
-        if (t) return { text: t.trim(), model: "spark-20b" };
-        log("Draft: Spark fast returned null — invalidating cache");
-        invalidateSparkCache();
+        const r = safeReturn(t, "spark-20b");
+        if (r) return r;
+        if (!t) { log("Draft: Spark fast returned null — invalidating cache"); invalidateSparkCache(); }
         break;
       }
       case "claude-haiku": {
         log("Draft: OR claude-haiku-4.5...");
         const t = await tryOpenRouter("anthropic/claude-haiku-4.5", systemPrompt, userContent, 25000);
-        if (t) return { text: t.trim(), model: "claude-haiku" };
+        const r = safeReturn(t, "claude-haiku");
+        if (r) return r;
         break;
       }
       case "gemini-flash": {
         log("Draft: OR gemini-flash...");
         const t = await tryOpenRouter("google/gemini-3-flash-preview", systemPrompt, userContent, 25000);
-        if (t) return { text: t.trim(), model: "gemini-flash" };
+        const r = safeReturn(t, "gemini-flash");
+        if (r) return r;
         break;
       }
       case "gemma-27b": {
         log("Draft: OR gemma-3-27b-it:free...");
         const t = await tryOpenRouter("google/gemma-3-27b-it:free", systemPrompt, userContent, 20000);
-        if (t) return { text: t.trim(), model: "gemma-27b" };
+        const r = safeReturn(t, "gemma-27b");
+        if (r) return r;
         break;
       }
       case "llama-70b": {
         log("Draft: OR llama-3.3-70b-instruct:free...");
         const t = await tryOpenRouter("meta-llama/llama-3.3-70b-instruct:free", systemPrompt, userContent, 20000);
-        if (t) return { text: t.trim(), model: "llama-70b" };
+        const r = safeReturn(t, "llama-70b");
+        if (r) return r;
         break;
       }
       case "mistral-small": {
         log("Draft: OR mistral-small-3.1-24b-instruct:free...");
         const t = await tryOpenRouter("mistralai/mistral-small-3.1-24b-instruct:free", systemPrompt, userContent, 20000);
-        if (t) return { text: t.trim(), model: "mistral-small" };
+        const r = safeReturn(t, "mistral-small");
+        if (r) return r;
         break;
       }
       case "spark-strong": {
         log("Draft: Spark gpt-oss-120b (last resort)...");
         const t = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
-        if (t) return { text: t.trim(), model: "spark-120b" };
-        invalidateSparkCache();
+        const r = safeReturn(t, "spark-120b");
+        if (r) return r;
+        if (!t) invalidateSparkCache();
         break;
       }
     }
   }
 
-  log("Draft: all probed models exhausted");
-  return null;
+  log("Draft: all probed models exhausted (or all failed content safety)");
+  return { text: null, model: "safety-blocked" };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1203,7 +1515,7 @@ function loadContactMemory(phone) {
   return "";
 }
 
-function buildSystemPrompt(contactName, contactPhone) {
+async function buildSystemPrompt(contactName, contactPhone, triggerMessage = "") {
   const soul    = readFileSafe(SOUL_FILE).trim();
   const voice   = readFileSafe(VOICE_PROFILE_FILE).trim();
   const contact = loadContactMemory(contactPhone);
@@ -1220,6 +1532,15 @@ function buildSystemPrompt(contactName, contactPhone) {
   prompt += `\n\n---\n${categoryTone}`;
   if (contact) {
     prompt += `\n\n---\n## ABOUT ${contactName.toUpperCase()}\n${contact}`;
+  }
+
+  // Embedding-based relevant memory injection (replaces flat contact memory file)
+  if (triggerMessage) {
+    const relevant = await queryRelevantMemory(triggerMessage, contactPhone, 5);
+    if (relevant.length > 0) {
+      prompt += `\n\n---\n## RECENT RELEVANT CONTEXT\n`;
+      prompt += relevant.map(m => `  [${m.role}]: ${m.text}`).join("\n");
+    }
   }
 
   prompt += `\n\n---\n## KLEIN'S CONTEXT (use for reference, don't mention directly)
@@ -1325,15 +1646,20 @@ async function postDraftToDiscord(draftResult, meta) {
   if (history) content += `\n${history}\n`;
   content += `\n**Them:** ${messageText || "(no text)"}\n`;
 
-  if (draftResult) {
+  const isSafetyBlocked = draftResult && draftResult.model === "safety-blocked";
+  const hasUsableDraft  = draftResult && draftResult.text && !isSafetyBlocked;
+
+  if (hasUsableDraft) {
     content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Auto-sends in 5 min — ✅ send now · ❌ cancel_`;
+  } else if (isSafetyBlocked) {
+    content += `\n⚠️ All draft tiers failed content safety — reply manually.`;
   } else {
     content += `\n⚠️ Draft generation failed — reply manually.`;
   }
 
   const result = await discordPost(GHOST_CHANNEL, {
     content,
-    components: draftResult ? [{
+    components: hasUsableDraft ? [{
       type: 1,
       components: [
         { type: 2, label: "✅ Send Now", style: 3, custom_id: `occomp:cid=GHOST_SEND:${draftId}`   },
@@ -1342,7 +1668,7 @@ async function postDraftToDiscord(draftResult, meta) {
     }] : [],
   });
 
-  if (result?.id && draftResult) {
+  if (result?.id && hasUsableDraft) {
     const drafts = loadPendingDrafts();
     drafts.push({
       messageId:   result.id,
@@ -1386,8 +1712,9 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
 
   // Track so we can auto-repost before the 15-min Discord interaction token expires
   if (result?.id) {
+    const nowTs = Date.now();
     pendingUnknownAlerts.set(phone, {
-      messageId: result.id, postedAt: Date.now(),
+      messageId: result.id, postedAt: nowTs, alertedAt: nowTs,
       phone, messageText, contactName, source, enrichment,
     });
   }
@@ -1412,6 +1739,26 @@ async function refreshUnknownAlerts() {
   }
 }
 
+/**
+ * sweepStaleUnknownAlerts — auto-deny unknown contacts that haven't been approved in 4 waking hours.
+ * Called every 30 minutes via setInterval in cmdServe().
+ */
+async function sweepStaleUnknownAlerts() {
+  if (!pendingUnknownAlerts.size) return;
+  const WAKING_HOURS_MS = 4 * 60 * 60 * 1000;
+  const now = Date.now();
+  const stale = [...pendingUnknownAlerts.entries()].filter(([, e]) => now - e.alertedAt > WAKING_HOURS_MS);
+  for (const [phone, entry] of stale) {
+    const n = normalizePhone(phone);
+    log(`Unknown contact ${n} timed out — auto-denying`);
+    addToDenylist(n);
+    pendingUnknownAlerts.delete(phone);
+    discordPost(GHOST_CHANNEL, {
+      content: `🚫 Auto-denied \`+${n}\` (no approval after 4h). Use \`ghost-approve +${n}\` to override.`,
+    }).catch(() => {});
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 0 — PREFLIGHT
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1429,6 +1776,19 @@ async function refreshUnknownAlerts() {
  */
 async function runPreflight(contact, messageText, chatGuid, eventData) {
   const normalized = normalizePhone(contact);
+
+  // 0. Prompt injection scan — must come before any processing of message content
+  const injCheck = scanForInjection(messageText);
+  if (!injCheck.safe) {
+    const { numToAlias, numToName } = loadContactsMap();
+    const contactName = numToAlias[normalized] || numToName[normalized] || `+${normalized}`;
+    log(`INJECTION ATTEMPT from ${contactName} (${normalized}): ${injCheck.reason}`);
+    // Fire-and-forget Discord alert
+    discordPost(GHOST_CHANNEL, {
+      content: `⚠️ Prompt injection attempt from **${contactName}** (\`+${normalized}\`): ${injCheck.reason}`,
+    }).catch(() => {});
+    return { ok: false, reason: "injection" };
+  }
 
   // 1. requiresReply — skip no-op acks, emoji-only, tapbacks, sensitive content
   if (!requiresReply(messageText)) {
@@ -1549,8 +1909,16 @@ async function checkAndDraft(key) {
   // Phase 3: live BB context — last 20 messages fetched at draft time
   const contextMessages = await fetchRecentMessages(chatGuid, 20);
 
+  // Index fetched messages into embedding DB (non-blocking)
+  for (const m of contextMessages) {
+    if (m.text?.trim()) {
+      const role = (m.isFromMe === true || m.from === "me") ? "me" : "them";
+      indexMessage(contact, m.dateCreated || Date.now(), role, m.text.trim());
+    }
+  }
+
   // Build prompt + generate via full failover chain
-  const systemPrompt = buildSystemPrompt(contactName, contact);
+  const systemPrompt = await buildSystemPrompt(contactName, contact, messageText);
   const userContent  = buildUserContent(contactName, messageText, contextMessages, arrivedAt);
   const historyLines = contextMessages
     .filter(m => m.text?.trim())
@@ -1651,6 +2019,10 @@ async function executeSend(draft, reason) {
   if (ok) {
     await discordPost(GHOST_CHANNEL, { content: `✅ Sent to **${contactName}**: "${draftText}"` });
     logFeedback(draft, "sent");
+    // Index outgoing message into embedding DB (non-blocking)
+    indexMessage(contact, Date.now(), "me", draftText);
+    // Update conversation state machine
+    onGhostSend(contact);
     return true;
   } else {
     const retries = (draft.retries || 0) + 1;
@@ -1898,15 +2270,21 @@ function createServer() {
           }
         }
 
+        // Update conversation state machine — contact sent us a message
+        onContactMessage(contact);
+        // Index incoming message into embedding DB (non-blocking)
+        indexMessage(contact, arrivedAt, "them", messageText);
+
+        const cooldownMs = getCooldownMs(contact);
         const timeoutId = setTimeout(() => checkAndDraft(key), DRAFT_DELAY_MS);
-        pendingMessages.set(key, { contact, contactName, messageText, chatGuid: chatGuid || key, arrivedAt, timeoutId, contextMessages: preflight.context.messages });
-        log(`Draft queued for ${contactName} — fires in ${DRAFT_DELAY_MS / 60000}min`);
+        pendingMessages.set(key, { contact, contactName, messageText, chatGuid: chatGuid || key, arrivedAt, timeoutId, contextMessages: preflight.context.messages, autoSendMs: cooldownMs });
+        log(`Draft queued for ${contactName} — fires in ${DRAFT_DELAY_MS / 60000}min (cooldown: ${Math.round(cooldownMs/1000)}s)`);
 
         return send(200, {
           ok: true, action: "draft_scheduled",
           contactName, chatGuid: key,
           draftFiresAt: new Date(arrivedAt + DRAFT_DELAY_MS).toISOString(),
-          autoSendAt:   new Date(arrivedAt + DRAFT_DELAY_MS + AUTO_SEND_WINDOW_MS).toISOString(),
+          autoSendAt:   new Date(arrivedAt + DRAFT_DELAY_MS + cooldownMs).toISOString(),
         });
 
       } catch (err) {
@@ -2356,6 +2734,11 @@ function cmdServe() {
     refreshUnknownAlerts().catch(err => log(`Unknown alert refresh error: ${err.message}`));
   }, UNKNOWN_REFRESH_MS);
 
+  // Sweep stale unknown contacts every 30 min — auto-deny after 4 waking hours
+  setInterval(() => {
+    sweepStaleUnknownAlerts().catch(err => log(`Sweep stale unknown alerts error: ${err.message}`));
+  }, 30 * 60 * 1000);
+
   process.on("SIGTERM", () => {
     log("SIGTERM — shutting down...");
     for (const [key, entry] of pendingMessages) {
@@ -2521,5 +2904,22 @@ if (require.main !== module) {
     isGroupChatGuid,
     findChatsForPhone,
     findChatGuidForPhone,
+    // New exports for testing
+    scanForInjection,
+    passesContentSafety,
+    getCooldownMs,
+    randomCooldown,
+    onGhostSend,
+    onContactMessage,
+    loadConvState,
+    saveConvState,
+    NEVER_SAY,
+    INJECTION_PATTERNS,
+    COOLDOWN_STRANGER_MIN_MS,
+    COOLDOWN_STRANGER_MAX_MS,
+    COOLDOWN_ACTIVE_MIN_MS,
+    COOLDOWN_ACTIVE_MAX_MS,
+    ACTIVE_EXCHANGE_THRESHOLD,
+    ACTIVE_TIMEOUT_MS,
   };
 }
