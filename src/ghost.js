@@ -68,8 +68,8 @@ const GHOST_CHANNEL = "1474492563418517515";
 const OWNER_PHONE_NORMALIZED = "12673479614";
 
 // Timing
-const DRAFT_DELAY_MS          = 5  * 60 * 1000;  // wait 5 min before drafting
-const AUTO_SEND_WINDOW_MS     = 0;                // AUTO-SEND DISABLED — Klein approves manually via button
+const DRAFT_DELAY_MS          = 30 * 1000;        // generate draft 30s after message (debounce)
+const AUTO_SEND_WINDOW_MS     = 5  * 60 * 1000;  // auto-send 5 min after draft posts (if no Cancel)
 
 const REACT_CHECK_INTERVAL_MS = 60 * 1000;       // reaction check every 60s
 const QUIET_HOUR_START        = 23;
@@ -1199,7 +1199,7 @@ async function postDraftToDiscord(draftResult, meta) {
   content += `\n**Them:** ${messageText || "(no text)"}\n`;
 
   if (draftResult) {
-    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n`;
+    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Auto-sends in 5 min — ✅ send now · ❌ cancel_`;
   } else {
     content += `\n⚠️ Draft generation failed — reply manually.`;
   }
@@ -1538,7 +1538,7 @@ async function doReactionCheck() {
         continue;
       }
 
-      // Auto-send is disabled — drafts stay pending until Klein clicks "Send Now" or "Cancel"
+      // No button action yet — will auto-send when AUTO_SEND_WINDOW_MS elapses
 
       keep.push(draft);
     }
@@ -1726,7 +1726,7 @@ function createServer() {
           ok: true, action: "draft_scheduled",
           contactName, chatGuid: key,
           draftFiresAt: new Date(arrivedAt + DRAFT_DELAY_MS).toISOString(),
-          autoSendAt:   null,  // auto-send disabled — use 'gs <id>' in Discord to send
+          autoSendAt:   new Date(arrivedAt + DRAFT_DELAY_MS + AUTO_SEND_WINDOW_MS).toISOString(),
         });
 
       } catch (err) {
