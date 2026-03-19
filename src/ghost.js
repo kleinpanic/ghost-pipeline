@@ -991,21 +991,12 @@ async function postDraftToDiscord(draftResult, meta) {
   content += `\n**Them:** ${messageText || "(no text)"}\n`;
 
   if (draftResult) {
-    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Auto-sends in 5 min · id: \`${draftId}\`_`;
+    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Reply \`gs ${draftId}\` to send · \`gc ${draftId}\` to cancel_`;
   } else {
     content += `\n⚠️ Draft generation failed — reply manually.`;
   }
 
-  const result = await discordPost(GHOST_CHANNEL, {
-    content,
-    components: draftResult ? [{
-      type: 1,
-      components: [
-        { type: 2, label: "✅ Send Now", style: 3, custom_id: `GHOST_SEND:${draftId}`   },
-        { type: 2, label: "❌ Cancel",   style: 4, custom_id: `GHOST_CANCEL:${draftId}` },
-      ],
-    }] : [],
-  });
+  const result = await discordPost(GHOST_CHANNEL, { content });
 
   if (result?.id && draftResult) {
     const drafts = loadPendingDrafts();
@@ -1516,7 +1507,7 @@ function createServer() {
           ok: true, action: "draft_scheduled",
           contactName, chatGuid: key,
           draftFiresAt: new Date(arrivedAt + DRAFT_DELAY_MS).toISOString(),
-          autoSendAt:   new Date(arrivedAt + DRAFT_DELAY_MS + AUTO_SEND_WINDOW_MS).toISOString(),
+          autoSendAt:   null,  // auto-send disabled — use 'gs <id>' in Discord to send
         });
 
       } catch (err) {
