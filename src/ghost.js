@@ -364,31 +364,71 @@ function addToDenylist(phone) {
  */
 function requiresReply(messageText) {
   if (!messageText || !messageText.trim()) return false;
-  const t = messageText.trim().toLowerCase();
+  const raw = messageText.trim();
+  const t   = raw.toLowerCase().replace(/[!?.]+$/, "").trim(); // strip trailing punctuation for matching
 
-  // Emoji-only
-  if (/^[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}\s]+$/u.test(t)) return false;
+  // ── Emoji-only ──────────────────────────────────────────────────────────
+  if (/^[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}\s]+$/u.test(raw)) return false;
 
-  // One-word / very short acks — exact match
+  // ── iMessage tapback reactions ───────────────────────────────────────────
+  if (/^(liked|loved|disliked|emphasized|questioned|laughed at) ".{0,80}"$/.test(t)) return false;
+
+  // ── Exact ack set (strip trailing punctuation before matching) ───────────
   const noReplyExact = new Set([
-    "ok","okay","k","kk","kkk","got it","gotcha","gotchu","noted",
-    "👍","👍🏻","👍🏼","👍🏽","👍🏾","👍🏿","✓","✔","✔️","☑️",
-    "lol","lmao","lmfao","haha","hahaha","hehe","😂","😭","💀",
-    "yep","yup","yea","yeah","ye","yes","no","nah","nope","sure",
-    "cool","nice","great","perfect","alright","aight","bet","fs",
-    "sounds good","makes sense","true","facts","word","fr","ik",
-    "thanks","thx","ty","thank you","np","no problem","of course",
-    "omg","wow","damn","bruh","bro","dude","lmk","will do",
-    "on my way","omw","be there soon","almost there","5 min","10 min",
-    "👌","👌🏻","🙏","🙏🏻","❤️","♥️","🫶","🫡",
+    // affirmatives / acks
+    "ok","okay","k","kk","kkk","okie","okie dokie",
+    "got it","gotcha","gotchu","noted","copy","roger","10-4",
+    "yep","yup","yea","yeah","ye","yes","no","nah","nope","nope nope",
+    "sure","of course","absolutely","definitely","for sure","fs","ofc",
+    "alright","aight","ight","aite","bet","bet bet","say less","say no more",
+    "will do","on it","done","handled","taken care of","all good","we good",
+    // gratitude
+    "thanks","thx","ty","thnx","thank you","thank u","thanks a lot",
+    "thanks so much","thank you so much","thanks!","ty!","thx!",
+    "much appreciated","appreciate it","appreciate that","appreciate you",
+    "no worries","no problem","np","nw","no prob","don't worry about it",
+    // conversational closers
+    "lol","lmao","lmfao","haha","hahaha","hehe","lmaooo","💀",
+    "true","facts","word","fr","ik","i know","same","mood","real","valid",
+    "omg","wow","damn","crazy","wild","nice","cool","great","perfect",
+    "sounds good","makes sense","that makes sense","fair enough","fair",
+    "talk later","ttyl","ttys","talk soon","speak soon","talk later",
+    "bye","byee","byeee","later","laters","cya","see ya","see you","see you later",
+    "good night","gnight","gn","night","good morning","gm","morning",
+    "on my way","omw","be there soon","almost there","5 min","10 min","be right there","brt",
+    "brb","back","im back","i'm back",
+    // emoji acks
+    "👍","👍🏻","👍🏼","👍🏽","👍🏾","👍🏿","👌","👌🏻",
+    "✓","✔","✔️","☑️","🫡","🙏","🙏🏻","❤️","♥️","🫶",
+    "😂","😭","💀","🤣","😅","🥹","🤙","🤙🏻",
   ]);
   if (noReplyExact.has(t)) return false;
 
-  // Very short and ends with acknowledgement pattern
-  if (t.length <= 12 && /^(ok|k|sure|yep|yup|got it|noted|thx|ty|np|bet|lol|lmao|😂|💀|👍)[\s!.]*$/i.test(t)) return false;
+  // ── Short fuzzy acks (≤20 chars after stripping punct) ──────────────────
+  if (t.length <= 20) {
+    // gratitude + filler combos: "thanks man", "ty bro", "thanks dude", etc.
+    if (/^(thanks?|thank you|ty|thx)\b/.test(t)) return false;
+    // ok/got it + filler: "ok sounds good", "got it thanks", "ok will do"
+    if (/^(ok|okay|k|got it|will do|sounds good)\b/.test(t)) return false;
+    // closers with emojis or words: "bye!", "later man", "gn bro"
+    if (/^(bye|later|cya|gn|ttyl|see ya|good night|good morning)\b/.test(t)) return false;
+    // pure affirmation variations: "yeah for sure", "yep sounds good"
+    if (/^(yeah|yep|yup|yea|nah|nope)\b/.test(t)) return false;
+  }
 
-  // Purely a reaction to a previous message (likes/dislikes are sent as events too)
-  if (/^(liked|loved|disliked|emphasized|questioned|laughed at) ".{0,60}"$/.test(t)) return false;
+  // ── Sensitive content — ghost should stay out of these ─────────────────
+  // Klein needs to handle these personally; ghost drafting here would be inappropriate.
+  const sensitivePatterns = [
+    /\b(died?|death|passed away|passing|funeral|condolen|grief|grieving|mourn)\b/i,
+    /\b(cancer|diagnos|terminal|hospice|hospital|surgery|emergency|ambulance|911)\b/i,
+    /\b(suicide|self.harm|hurt (my)?self|kill (my)?self|want to die)\b/i,
+    /\b(break(ing)? up|broke up|we('re| are) over|it'?s over between)\b/i,
+    /\b(cheating|cheated on|affair|infidelity)\b/i,
+    /\b(fired|laid off|lost (my )?job)\b/i,
+    /\b(arrested|in jail|in prison|bail|lawyer up)\b/i,
+    /\b(i love you|love you|i('m| am) in love)\b/i,  // too personal for ghost
+  ];
+  if (sensitivePatterns.some(p => p.test(raw))) return false;
 
   return true;
 }
