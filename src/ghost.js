@@ -826,6 +826,11 @@ async function tryGhostAgent(contactName, contactPhone, messageText, historyLine
 // Cache Spark availability for 5 min to avoid retrying a dead node on every draft
 let sparkAvailable = null;
 let sparkLastCheck = 0;
+function invalidateSparkCache() {
+  sparkAvailable = false;
+  sparkLastCheck = Date.now(); // re-check in 5min, not immediately
+}
+
 async function checkSparkAvailable() {
   const now = Date.now();
   if (sparkAvailable !== null && now - sparkLastCheck < 5 * 60 * 1000) return sparkAvailable;
@@ -990,11 +995,17 @@ async function tryGhostAgentViaQueue(contactName, contactPhone, systemPrompt, us
 }
 
 async function generateDraft(systemPrompt, userContent, { contactName, contactPhone, messageText, historyLines } = {}) {
+  let sparkWasAvailable = false;
+
   // ── Tier 1: Spark vllm fast — local, low-latency (when available)
   if (await checkSparkAvailable()) {
+    sparkWasAvailable = true;
     log("Draft tier 1: Spark gpt-oss-20b...");
     const t1 = await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent);
     if (t1) return { text: t1.trim(), model: "spark-20b" };
+    log("Draft: Spark fast returned null — invalidating cache");
+    invalidateSparkCache();
+    sparkWasAvailable = false;
   } else {
     log("Draft: Spark offline — skipping local tiers");
   }
@@ -1013,11 +1024,23 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
   const t3 = await tryOpenRouter("google/gemini-3-flash-preview", systemPrompt, userContent, 25000);
   if (t3) return { text: t3.trim(), model: "gemini-flash" };
 
-  // ── Tier 4: Spark strong — last local resort (when available)
-  if (await checkSparkAvailable()) {
-    log("Draft tier 4: Spark gpt-oss-120b (last resort)...");
-    const t4 = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
-    if (t4) return { text: t4.trim(), model: "spark-120b" };
+  // ── Tier 4: OR free models — last cloud resort before Spark strong
+  log("Draft tier 4: OR free fallbacks...");
+  for (const freeModel of [
+    "google/gemma-3-27b-it:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+  ]) {
+    const tf = await tryOpenRouter(freeModel, systemPrompt, userContent, 20000);
+    if (tf) return { text: tf.trim(), model: freeModel.split("/").pop().replace(":free", "") };
+  }
+
+  // ── Tier 5: Spark strong — only if Spark was working this session
+  if (sparkWasAvailable || await checkSparkAvailable()) {
+    log("Draft tier 5: Spark gpt-oss-120b (last resort)...");
+    const t5 = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
+    if (t5) return { text: t5.trim(), model: "spark-120b" };
+    invalidateSparkCache();
   }
 
   log("Draft: all tiers exhausted");
@@ -1073,15 +1096,30 @@ function buildSystemPrompt(contactName, contactPhone) {
   return prompt;
 }
 
-function buildUserContent(contactName, messageText, recentMessages) {
-  const history = recentMessages
-    .filter(m => m.text?.trim())
-    .slice()
-    .reverse()
+function buildUserContent(contactName, messageText, recentMessages, triggerArrivedAt = 0) {
+  // recentMessages arrives DESC (newest first) from BB.
+  // 1. Exclude the trigger message itself and anything after it (dateCreated >= arrivedAt).
+  //    This prevents "oh" from appearing twice and avoids post-trigger clutter.
+  // 2. Keep only the 8 messages BEFORE the trigger — closest context wins.
+  // 3. Reverse to chronological order (oldest → newest) for the model to read naturally.
+  const HISTORY_LIMIT = 8;
+  const beforeTrigger = recentMessages
+    .filter(m => {
+      if (!m.text?.trim()) return false;
+      // If we have a timestamp, exclude everything at or after the trigger
+      if (triggerArrivedAt && m.dateCreated && m.dateCreated >= triggerArrivedAt) return false;
+      // Also exclude messages whose text matches the trigger (belt+suspenders)
+      if (m.text?.trim() === messageText?.trim()) return false;
+      return true;
+    })
+    .slice(0, HISTORY_LIMIT)   // take 8 most recent pre-trigger messages (still DESC order)
+    .reverse();                 // flip to chronological (oldest → newest)
+
+  const history = beforeTrigger
     .map(m => `${(m.isFromMe === true || m.from === "me") ? "Klein" : contactName}: ${m.text.trim().slice(0, 200)}`)
     .join("\n");
 
-  return `Recent conversation:\n${history || "(no prior messages)"}\n\nNew message from ${contactName}:\n"${messageText}"\n\nReply as Klein:`;
+  return `Recent conversation (oldest → newest):\n${history || "(no prior messages)"}\n\nLatest message from ${contactName}:\n"${messageText}"\n\nReply as Klein:`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1281,7 +1319,7 @@ async function checkAndDraft(key) {
 
   // Build prompt + generate via full failover chain
   const systemPrompt = buildSystemPrompt(contactName, contact);
-  const userContent  = buildUserContent(contactName, messageText, contextMessages);
+  const userContent  = buildUserContent(contactName, messageText, contextMessages, arrivedAt);
   const historyLines = contextMessages
     .filter(m => m.text?.trim())
     .slice().reverse()
