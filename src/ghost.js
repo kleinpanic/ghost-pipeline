@@ -1107,6 +1107,13 @@ async function checkAndDraft(key) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function bbSendMessage(chatGuid, message) {
+  // iMessageLite guids return 405 on send — swap to SMS equivalent immediately
+  if (chatGuid && chatGuid.startsWith("iMessageLite;-;")) {
+    const smsGuid = chatGuid.replace("iMessageLite;-;", "SMS;-;");
+    log(`bbSendMessage: iMessageLite → swapping to ${smsGuid}`);
+    chatGuid = smsGuid;
+  }
+
   // Primary: mcporter → BB MCP (SSH tunnel)
   try {
     const argsJson = JSON.stringify({ chat_guid: chatGuid, message });
@@ -1543,14 +1550,15 @@ function findChatsForPhone(phone, allChats) {
     if (matched) hits.push(chat);
   }
 
-  // Score: direct 1-on-1 iMessage/iMessageLite > direct SMS/RCS > group > other
+  // Score: iMessage;-; > SMS;-;/RCS;-; > iMessageLite;-; (405s on send) > group > other
   const score = (c) => {
     const g = c.guid || "";
     const is1on1 = (c.participants || []).length <= 1;
-    if (g.startsWith("iMessage;-;") || g.startsWith("iMessageLite;-;")) return is1on1 ? 0 : 2;
-    if (g.startsWith("SMS;-;") || g.startsWith("RCS;-;"))               return is1on1 ? 1 : 3;
-    if (g.includes(";+;"))                                               return 4;
-    return 5;
+    if (g.startsWith("iMessage;-;"))     return is1on1 ? 0 : 3;
+    if (g.startsWith("SMS;-;") || g.startsWith("RCS;-;")) return is1on1 ? 1 : 4;
+    if (g.startsWith("iMessageLite;-;")) return is1on1 ? 2 : 5; // last resort — BB returns 405 on send
+    if (g.includes(";+;"))               return 6;
+    return 7;
   };
   hits.sort((a, b) => score(a) - score(b));
   return hits;
