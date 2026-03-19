@@ -12,8 +12,8 @@ describe("loadAllowlist — 5-field format parsing", () => {
     contacts = loadAllowlist();
   });
 
-  test("returns 9 contacts", () => {
-    expect(contacts.length).toBe(9);
+  test("returns 10 contacts", () => {
+    expect(contacts.length).toBe(10);
   });
 
   test("Brenda parses as family_close with alias Brenda", () => {
@@ -41,6 +41,13 @@ describe("loadAllowlist — 5-field format parsing", () => {
     const c = contacts.find(c => c.phone === "14344227737");
     expect(c).toBeDefined();
     expect(c.alias).toBe("Sam J");
+  });
+
+  test("Jacob parses as acquaintance", () => {
+    const c = contacts.find(c => c.phone === "15402939803");
+    expect(c).toBeDefined();
+    expect(c.category).toBe("acquaintance");
+    expect(c.alias).toBe("Jacob");
   });
 
   test("no contact has alias 'family_close' or 'close_friend' (category not leaking into alias)", () => {

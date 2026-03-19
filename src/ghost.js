@@ -551,6 +551,27 @@ function bbRequest(endpoint, params = {}) {
   });
 }
 
+function bbPost(endpoint, body = {}) {
+  return new Promise((resolve) => {
+    const qs      = new URLSearchParams({ password: BB_PASSWORD }).toString();
+    const payload = JSON.stringify(body);
+    const options = {
+      host: BB_HOST, port: BB_PORT,
+      path: `/api/v1/${endpoint}?${qs}`, method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
+    };
+    const req = http.request(options, (res) => {
+      let data = "";
+      res.on("data", c => { data += c; });
+      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    });
+    req.on("error", err => { log(`BB POST error (${endpoint}): ${err.message}`); resolve(null); });
+    req.setTimeout(10000, () => { req.destroy(); resolve(null); });
+    req.write(payload);
+    req.end();
+  });
+}
+
 async function fetchRecentMessages(chatGuid, limit = 20) {
   // Primary path: non-blocking MCP call (mcporterCallAsync — does NOT block event loop)
   try {
@@ -568,13 +589,24 @@ async function fetchRecentMessages(chatGuid, limit = 20) {
 async function resolveChatGuid(phone) {
   // When webhook events omit chatGuid, resolve the real "iMessage;-;+E164" guid
   // via direct BB HTTP (fast, no MCP tunnel dependency).
+  // Paginates ALL chats in batches of 300 — with 1595+ chats the target thread
+  // is often not in the first page, causing false "could not resolve" failures.
   try {
     const normalized = normalizePhone(phone);
-    const data = await bbRequest("chat", { limit: 100, offset: 0 });
-    const allChats   = extractBBList(data);
+    let allChats = [];
+    let offset   = 0;
+    while (true) {
+      const data  = await bbPost("chat/query", { limit: 300, offset, sort: "lastmessage", withLastMessage: false });
+      const batch = extractBBList(data);
+      if (!batch.length) break;
+      allChats.push(...batch);
+      if (batch.length < 300) break;
+      offset += 300;
+    }
     const guid = findChatGuidForPhone(`+${normalized}`, allChats) ||
                  findChatGuidForPhone(normalized, allChats);
-    if (guid) log(`Resolved chatGuid for +${normalized}: ${guid}`);
+    if (guid) log(`Resolved chatGuid for +${normalized}: ${guid} (scanned ${allChats.length} chats)`);
+    else log(`resolveChatGuid: no match for +${normalized} in ${allChats.length} chats`);
     return guid || null;
   } catch (err) {
     log(`resolveChatGuid failed for ${phone}: ${err.message?.slice(0, 60)}`);
@@ -583,27 +615,8 @@ async function resolveChatGuid(phone) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  MODEL GENERATION  (Gemini CLI → OR gemma-27b → OR gemma-12b)
+//  MODEL GENERATION  (OR claude-haiku → OR gemini-flash → Spark fallback)
 // ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Try Gemini CLI. For multi-line output (learning) pass multiline=true.
- * Returns text or null.
- */
-async function tryGeminiCli(prompt, { timeoutMs = 30000 } = {}) {
-  try {
-    const stdout = await spawnAsync("gemini", ["-p", prompt], { timeout: timeoutMs });
-    const text   = stdout.trim();
-    if (!text) return null;
-    // Strip known preamble lines from Gemini CLI output
-    const lines    = text.split("\n");
-    const filtered = lines.filter(l => !l.match(/^(Using model:|Model:|\s*$)/));
-    return filtered.join("\n").trim() || null;
-  } catch (err) {
-    log(`Gemini CLI unavailable: ${err.message.slice(0, 80)}`);
-    return null;
-  }
-}
 
 /** Try OpenRouter with a specific model. Returns text or null. */
 function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
@@ -636,13 +649,21 @@ function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
         try {
           const parsed = JSON.parse(data);
           const text   = (parsed?.choices?.[0]?.message?.content || "").trim();
-          if (text) { log(`OR [${model.split("/").pop()}] draft ok`); resolve(text); }
-          else { log(`OR [${model.split("/").pop()}] empty response`); resolve(null); }
+          if (text) {
+            log(`OR [${model.split("/").pop()}] draft ok`);
+            resolve(text);
+          } else {
+            // Log actual error if present (e.g. 429 rate limit, provider error)
+            const errMsg = parsed?.error?.message || parsed?.error || "empty response";
+            const errCode = parsed?.error?.code ? ` (code ${parsed.error.code})` : "";
+            log(`OR [${model.split("/").pop()}] failed: ${String(errMsg).slice(0, 120)}${errCode}`);
+            resolve(null);
+          }
         } catch (e) { log(`OR parse error: ${e.message}`); resolve(null); }
       });
     });
     req.on("error", err => { log(`OR error: ${err.message}`); resolve(null); });
-    req.setTimeout(timeoutMs, () => { req.destroy(); resolve(null); });
+    req.setTimeout(timeoutMs, () => { req.destroy(); log(`OR [${model.split("/").pop()}] timeout`); resolve(null); });
     req.write(body);
     req.end();
   });
@@ -745,13 +766,11 @@ async function tryGhostAgent(contactName, contactPhone, messageText, historyLine
 // ── Full draft generation chain ──────────────────────────────────────────────
 
 /**
- * Generate a draft reply using the full model failover chain.
- *   1. Ghost as OpenClaw agent (full workspace + best model)
- *   2. Spark vllm fast  (local, low-latency)
- *   3. Spark vllm strong (local, higher quality)
- *   4. Gemini CLI        (OAuth, strong reasoning)
- *   5. OR gemma-27b      (free tier)
- *   6. OR gemma-12b      (last resort)
+ * Generate a draft reply using the model failover chain.
+ *   1. Spark vllm fast    (local DGX, low-latency — skipped when offline)
+ *   2. OR claude-haiku-4.5 (fast, reliable, cheap — primary cloud tier)
+ *   3. OR gemini-flash     (fast, reliable backup)
+ *   4. Spark vllm strong  (local DGX last resort — skipped when offline)
  *
  * Returns { text, model } or null.
  */
@@ -776,43 +795,30 @@ async function checkSparkAvailable() {
 }
 
 async function generateDraft(systemPrompt, userContent, { contactName, contactPhone, messageText, historyLines } = {}) {
-  // ── Tier 1: Spark vllm fast — local, low-latency, good for simple acks
+  // ── Tier 1: Spark vllm fast — local, low-latency (when available)
   if (await checkSparkAvailable()) {
     log("Draft tier 1: Spark gpt-oss-20b...");
     const t1 = await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent);
     if (t1) return { text: t1.trim(), model: "spark-20b" };
   } else {
-    log("Draft: Spark offline — skipping tiers 1-2");
+    log("Draft: Spark offline — skipping local tiers");
   }
 
-  // ── Tier 2: Ghost Agent — full Klein context (SOUL.md + voice + contact memory + Claude chain)
-  // Moved up from last: 90s latency is fine within the 5-min draft window; quality beats local models.
-  if (contactName && messageText) {
-    log("Draft tier 2: Ghost agent (full context)...");
-    const t2 = await tryGhostAgent(contactName, contactPhone, messageText, historyLines);
-    if (t2) return { text: t2, model: "ghost-agent" };
-  }
+  // ── Tier 2: OR claude-haiku-4.5 — fast, reliable, cheap primary cloud tier
+  log("Draft tier 2: OR claude-haiku-4.5...");
+  const t2 = await tryOpenRouter("anthropic/claude-haiku-4.5", systemPrompt, userContent, 25000);
+  if (t2) return { text: t2.trim(), model: "claude-haiku" };
 
-  // ── Tier 3: Gemini CLI (fast, OAuth, strong)
-  log("Draft tier 3: Gemini CLI...");
-  const t3 = await tryGeminiCli(`${systemPrompt}\n\n---\n${userContent}`);
-  if (t3) return { text: t3.trim(), model: "gemini-cli" };
+  // ── Tier 3: OR gemini-flash — reliable backup
+  log("Draft tier 3: OR gemini-flash...");
+  const t3 = await tryOpenRouter("google/gemini-3-flash-preview", systemPrompt, userContent, 25000);
+  if (t3) return { text: t3.trim(), model: "gemini-flash" };
 
-  // ── Tier 4: OR gemma-27b free
-  log("Draft tier 4: OR gemma-27b...");
-  const t4 = await tryOpenRouter("google/gemma-3-27b-it:free", systemPrompt, userContent);
-  if (t4) return { text: t4.trim(), model: "gemma-27b" };
-
-  // ── Tier 5: OR gemma-12b free
-  log("Draft tier 5: OR gemma-12b...");
-  const t5 = await tryOpenRouter("google/gemma-3-12b-it:free", systemPrompt, userContent);
-  if (t5) return { text: t5.trim(), model: "gemma-12b" };
-
-  // ── Tier 6: Spark strong — last local resort if all cloud fails
+  // ── Tier 4: Spark strong — last local resort (when available)
   if (await checkSparkAvailable()) {
-    log("Draft tier 6: Spark gpt-oss-120b (last resort)...");
-    const t6 = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
-    if (t6) return { text: t6.trim(), model: "spark-120b" };
+    log("Draft tier 4: Spark gpt-oss-120b (last resort)...");
+    const t4 = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
+    if (t4) return { text: t4.trim(), model: "spark-120b" };
   }
 
   log("Draft: all tiers exhausted");
@@ -895,6 +901,21 @@ async function discordPost(channelId, payload) {
   }
 }
 
+async function discordDelete(channelId, messageId) {
+  try {
+    await spawnAsync("curl", [
+      "-s", "-X", "DELETE",
+      `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`,
+      "-H", `Authorization: Bot ${DISCORD_BOT_TOKEN}`,
+    ], { timeout: 8000 });
+  } catch (err) {
+    log(`Discord delete error: ${err.message}`);
+  }
+}
+
+// In-memory map of unanswered unknown-contact alerts: phone → { messageId, postedAt, phone, messageText, contactName, source, enrichment }
+const pendingUnknownAlerts = new Map();
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  PENDING DRAFTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -969,7 +990,7 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
   if (enrichment?.emails?.length) content += `📧 ${enrichment.emails.slice(0,2).join(", ")}\n`;
   content += `💬 "${(messageText || "").slice(0, 200)}"`;
 
-  await discordPost(GHOST_CHANNEL, {
+  const result = await discordPost(GHOST_CHANNEL, {
     content,
     components: [{
       type: 1,
@@ -979,6 +1000,33 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
       ],
     }],
   });
+
+  // Track so we can auto-repost before the 15-min Discord interaction token expires
+  if (result?.id) {
+    pendingUnknownAlerts.set(phone, {
+      messageId: result.id, postedAt: Date.now(),
+      phone, messageText, contactName, source, enrichment,
+    });
+  }
+}
+
+// Refresh unknown-contact alerts before Discord's 15-min interaction token expires.
+// Runs every 12 min; deletes stale message + reposts fresh one for any unanswered alert.
+async function refreshUnknownAlerts() {
+  if (!pendingUnknownAlerts.size) return;
+  const REFRESH_MS = 12 * 60 * 1000; // 12 minutes
+  const now = Date.now();
+  // Snapshot stale entries BEFORE iterating — prevents re-visiting newly added entries
+  const stale = [...pendingUnknownAlerts.entries()].filter(([, e]) => now - e.postedAt >= REFRESH_MS);
+  for (const [phone, entry] of stale) {
+    log(`Refreshing unknown-contact alert for +${normalizePhone(phone)} (token age >${REFRESH_MS / 60000}m)`);
+    if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId);
+    pendingUnknownAlerts.delete(phone);
+    // Repost fresh — re-adds to the map with a new postedAt
+    await postUnknownAlert(phone, entry.messageText, entry.contactName, {
+      source: entry.source, enrichment: entry.enrichment,
+    });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1151,6 +1199,9 @@ async function doReactionCheck() {
     }
 
     // Contact management — enrich from Apple Contacts on approve
+    // Clear any pending unknown-alert refresh entries for acted-on phones
+    for (const phone of [...approveQ, ...denyQ]) pendingUnknownAlerts.delete(phone);
+
     for (const phone of approveQ) {
       let name = "Unknown";
       let source = "manual";
@@ -1288,6 +1339,12 @@ function createServer() {
 
         if (!["new-message", "message-send", "message-receive"].includes(eventType)) {
           return send(200, { ok: true, action: "ignored", type: eventType });
+        }
+
+        // Drop group chats
+        if (isGroupChatGuid(chatGuid, eventData)) {
+          log(`Group chat — skipping (chatGuid: ${chatGuid || "none"})`);
+          return send(200, { ok: true, action: "ignored", reason: "group_chat" });
         }
 
         const normalized = normalizePhone(contact);
@@ -1438,6 +1495,16 @@ function extractBBList(data) {
   return [];
 }
 
+/**
+ * Returns true if the chatGuid (or event participants) indicate a group chat.
+ * Direct messages use ";-;" separator across all protocols (iMessage, SMS, iMessageLite, RCS).
+ * Group chats use ";+;" separator (e.g. "iMessage;+;chat123456789").
+ */
+function isGroupChatGuid(chatGuid, eventData = {}) {
+  if (chatGuid) return chatGuid.includes(";+;");
+  return Array.isArray(eventData.participants) && eventData.participants.length > 1;
+}
+
 function findChatsForPhone(phone, allChats) {
   const n    = normalizePhone(phone);
   const hits = [];
@@ -1455,15 +1522,14 @@ function findChatsForPhone(phone, allChats) {
     if (matched) hits.push(chat);
   }
 
-  // Score: direct 1-on-1 iMessage > direct SMS > group iMessage > group SMS > other
+  // Score: direct 1-on-1 iMessage/iMessageLite > direct SMS/RCS > group > other
   const score = (c) => {
     const g = c.guid || "";
     const is1on1 = (c.participants || []).length <= 1;
-    if (g.startsWith("iMessage;-;"))       return is1on1 ? 0 : 2;
-    if (g.startsWith("SMS;-;"))            return is1on1 ? 1 : 3;
-    if (g.startsWith("iMessage;+;"))       return 4;
-    if (g.startsWith("SMS;+;"))            return 5;
-    return 6;
+    if (g.startsWith("iMessage;-;") || g.startsWith("iMessageLite;-;")) return is1on1 ? 0 : 2;
+    if (g.startsWith("SMS;-;") || g.startsWith("RCS;-;"))               return is1on1 ? 1 : 3;
+    if (g.includes(";+;"))                                               return 4;
+    return 5;
   };
   hits.sort((a, b) => score(a) - score(b));
   return hits;
@@ -1825,6 +1891,12 @@ function cmdServe() {
     doReactionCheck().catch(err => log(`Reaction check error: ${err.message}`));
   }, REACT_CHECK_INTERVAL_MS);
 
+  // Auto-refresh unknown-contact alerts every 12 min so buttons never go stale
+  const UNKNOWN_REFRESH_MS = 12 * 60 * 1000;
+  setInterval(() => {
+    refreshUnknownAlerts().catch(err => log(`Unknown alert refresh error: ${err.message}`));
+  }, UNKNOWN_REFRESH_MS);
+
   process.on("SIGTERM", () => {
     log("SIGTERM — shutting down...");
     for (const [key, entry] of pendingMessages) {
@@ -1834,6 +1906,87 @@ function cmdServe() {
     pendingMessages.clear();
     server.close(() => { log("Server closed."); process.exit(0); });
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RETRIGGER CLI
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function cmdRetrigger(args) {
+  const scan = args.includes("--scan");
+
+  if (scan) {
+    // Fetch recent BB chats, find messages from unknowns, alert for each
+    console.log("Scanning recent BB messages for unknown contacts...");
+    let allChats = [];
+    let offset = 0;
+    while (true) {
+      const data  = await bbPost("chat/query", { limit: 300, offset, sort: "lastmessage", withLastMessage: false });
+      const batch = extractBBList(data);
+      if (!batch.length) break;
+      allChats.push(...batch);
+      if (batch.length < 300) break;
+      offset += 300;
+    }
+    console.log(`Scanned ${allChats.length} chats`);
+
+    // Look at direct (non-group) chats only — iMessage;-; pattern
+    const directChats = allChats.filter(c =>
+      typeof c.guid === "string" && c.guid.startsWith("iMessage;-;+")
+    );
+
+    let found = 0;
+    for (const chat of directChats) {
+      const phone = chat.guid.replace("iMessage;-;", "");
+      const norm  = normalizePhone(phone);
+      if (isAllowed(norm) || isDenied(norm)) continue;
+
+      // Fetch most recent message from this chat
+      let lastMsg = "(no recent message)";
+      try {
+        const data = await bbRequest(`chat/${encodeURIComponent(chat.guid)}/message`, { limit: 1, sort: "DESC" });
+        const msgs = extractBBList(data);
+        if (msgs.length) lastMsg = msgs[0].text || lastMsg;
+      } catch {}
+
+      console.log(`  Alerting for unknown: ${phone}`);
+      await postUnknownAlert(phone, lastMsg, chat.displayName || phone, { source: "unknown" });
+      found++;
+      await new Promise(r => setTimeout(r, 500)); // small delay between posts
+    }
+    console.log(`Done — fired ${found} alert(s)`);
+    return;
+  }
+
+  // Single phone mode: ghost retrigger +15551234567
+  const phone = args.find(a => a.startsWith("+") || /^\d{10,}$/.test(a));
+  if (!phone) {
+    console.error("Usage: ghost retrigger <+phone>  OR  ghost retrigger --scan");
+    process.exit(1);
+  }
+
+  const norm = normalizePhone(phone);
+  if (isAllowed(norm)) {
+    console.log(`+${norm} is already in the allowlist — no alert needed.`);
+    return;
+  }
+  if (isDenied(norm)) {
+    console.log(`+${norm} is in the denylist — remove it first if you want to re-evaluate.`);
+    return;
+  }
+
+  // Fetch their most recent message for context
+  let lastMsg = "(no recent message)";
+  try {
+    const chatGuid = `iMessage;-;+${norm}`;
+    const data = await bbRequest(`chat/${encodeURIComponent(chatGuid)}/message`, { limit: 1, sort: "DESC" });
+    const msgs = extractBBList(data);
+    if (msgs.length) lastMsg = msgs[0].text || lastMsg;
+  } catch {}
+
+  console.log(`Firing unknown-contact alert for +${norm}...`);
+  await postUnknownAlert(`+${norm}`, lastMsg, `+${norm}`, { source: "unknown" });
+  console.log("Alert posted to Discord.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1870,9 +2023,14 @@ switch (cmd) {
   case "schedule":
     cmdSchedule();
     break;
+  case "retrigger":
+    cmdRetrigger(cmdArgs)
+      .then(() => process.exit(0))
+      .catch(err => { console.error(err.message); process.exit(1); });
+    break;
   default:
     console.error(`Unknown command: ${cmd}`);
-    console.log("Usage: ghost [serve|react|learn|status|pause|resume|schedule]");
+    console.log("Usage: ghost [serve|react|learn|status|pause|resume|schedule|retrigger]");
     console.log("");
     console.log("  serve                  webhook server + embedded reaction loop");
     console.log("  react                  one-shot reaction check");
@@ -1882,6 +2040,8 @@ switch (cmd) {
     console.log("  pause [--hours N]      pause ghost");
     console.log("  resume                 resume ghost");
     console.log("  schedule               print nightly learn cron line            (Phase 5)");
+    console.log("  retrigger <+phone>     re-fire an unknown-contact alert (fresh Approve/Deny buttons)");
+    console.log("  retrigger --scan       scan recent BB messages and alert for any unknowns");
     process.exit(1);
 }
 } // end require.main === module guard
@@ -1899,5 +2059,8 @@ if (require.main !== module) {
     isDenied,
     isLikelySpam,
     isAllowed,
+    isGroupChatGuid,
+    findChatsForPhone,
+    findChatGuidForPhone,
   };
 }
