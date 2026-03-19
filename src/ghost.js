@@ -930,68 +930,81 @@ function recentFeedbackSummary(limit = 20) {
 //  GHOST AGENT IPC QUEUE TIER
 // ═══════════════════════════════════════════════════════════════════════════
 
-const GHOST_DRAFT_QUEUE_FILE   = path.join(DATA_DIR, "ghost-draft-queue.json");
-const GHOST_DRAFT_RESULTS_FILE = path.join(DATA_DIR, "ghost-draft-results.json");
+const GHOST_AGENT_SESSION_KEY = "agent:ghost:main";
+const OC_GATEWAY_PORT         = 18789;  // loopback TLS, confirmed
 
-function uuidv4() {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
-    const r = Math.random() * 16 | 0;
-    return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+/**
+ * Call the ghost agent session via OC gateway /tools/invoke HTTPS endpoint.
+ * gateway.tools.allow includes "sessions_send" so this is permitted.
+ * Returns { text, model } or null on timeout/failure.
+ */
+async function tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, timeoutMs = 15000) {
+  if (!OC_GATEWAY_TOKEN) { log("Ghost agent: no gateway token — skipping"); return null; }
+
+  const prompt = [
+    `You are drafting a reply for Klein. Use his texting style from your SOUL.md.`,
+    `Contact: ${contactName}`,
+    systemPrompt ? `\nContext:\n${systemPrompt}` : "",
+    `\n${userContent}`,
+    `\nOutput ONLY the reply text — nothing else. Max 1-2 short texts.`,
+  ].join("\n");
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      tool:       "sessions_send",
+      args: {
+        sessionKey:     GHOST_AGENT_SESSION_KEY,
+        message:        prompt,
+        timeoutSeconds: Math.floor(timeoutMs / 1000) - 2,
+      },
+    });
+
+    const req = https.request({
+      hostname: "127.0.0.1",
+      port:     OC_GATEWAY_PORT,
+      path:     "/tools/invoke",
+      method:   "POST",
+      rejectUnauthorized: false,   // self-signed local cert
+      headers: {
+        "Authorization": `Bearer ${OC_GATEWAY_TOKEN}`,
+        "Content-Type":  "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", c => { data += c; });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          // Extract text from OC tool result envelope
+          const inner = parsed?.result?.details ?? parsed?.result;
+          const rawText = (typeof inner === "string" ? inner
+            : inner?.text ?? inner?.message ?? inner?.content?.[0]?.text ?? "");
+          // Strip any JSON wrapper the agent might have added
+          let text = rawText.trim();
+          try {
+            const j = JSON.parse(text);
+            text = j.text ?? j.reply ?? j.message ?? text;
+          } catch {}
+          if (text && !parsed?.error) {
+            log(`Ghost agent session draft ok: "${text.slice(0,40)}"`);
+            resolve({ text: text.trim(), model: "ghost-agent" });
+          } else {
+            log(`Ghost agent session: empty/error response — ${JSON.stringify(parsed).slice(0,100)}`);
+            resolve(null);
+          }
+        } catch (e) {
+          log(`Ghost agent session parse error: ${e.message}`);
+          resolve(null);
+        }
+      });
+    });
+
+    req.setTimeout(timeoutMs, () => { req.destroy(); log("Ghost agent session: timeout"); resolve(null); });
+    req.on("error", (e) => { log(`Ghost agent session error: ${e.message}`); resolve(null); });
+    req.write(body);
+    req.end();
   });
-}
-
-function isGhostAgentActive() {
-  try {
-    const results = loadJson(GHOST_DRAFT_RESULTS_FILE, []);
-    if (!results.length) return false;
-    const last = results[results.length - 1];
-    if (!last.completedAt) return false;
-    const age = Date.now() - new Date(last.completedAt).getTime();
-    return age < 5 * 60 * 1000; // within 5 minutes
-  } catch {
-    return false;
-  }
-}
-
-async function tryGhostAgentViaQueue(contactName, contactPhone, systemPrompt, userContent, timeoutMs = 15000) {
-  if (!isGhostAgentActive()) return null;
-
-  const reqId = uuidv4();
-  const request = {
-    reqId,
-    contactName,
-    contactPhone,
-    systemPrompt,
-    userContent,
-    requestedAt: new Date().toISOString(),
-    status: "pending",
-  };
-
-  // Write request to queue
-  const queue = loadJson(GHOST_DRAFT_QUEUE_FILE, []);
-  queue.push(request);
-  saveJson(GHOST_DRAFT_QUEUE_FILE, queue);
-
-  // Poll for result
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 500));
-    try {
-      const results = loadJson(GHOST_DRAFT_RESULTS_FILE, []);
-      const result = results.find(r => r.reqId === reqId && r.status === "done");
-      if (result) {
-        return { text: result.text, model: "ghost-agent" };
-      }
-    } catch {}
-  }
-
-  // Timeout — remove from queue
-  log(`tryGhostAgentViaQueue: timeout waiting for reqId ${reqId}`);
-  try {
-    const q = loadJson(GHOST_DRAFT_QUEUE_FILE, []);
-    saveJson(GHOST_DRAFT_QUEUE_FILE, q.filter(e => e.reqId !== reqId));
-  } catch {}
-  return null;
 }
 
 async function generateDraft(systemPrompt, userContent, { contactName, contactPhone, messageText, historyLines } = {}) {
@@ -1010,9 +1023,10 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
     log("Draft: Spark offline — skipping local tiers");
   }
 
-  // ── Tier 1.5: Ghost agent session (file-based IPC queue)
-  const ghostDraft = await tryGhostAgentViaQueue(contactName, contactPhone, systemPrompt, userContent);
-  if (ghostDraft) { log("Draft tier 1.5: ghost agent session"); return ghostDraft; }
+  // ── Tier 1.5: Ghost agent session (direct HTTPS to OC gateway)
+  log("Draft tier 1.5: ghost agent session...");
+  const ghostDraft = await tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, 15000);
+  if (ghostDraft) return ghostDraft;
 
   // ── Tier 2: OR claude-haiku-4.5 — fast, reliable, cheap primary cloud tier
   log("Draft tier 2: OR claude-haiku-4.5...");
