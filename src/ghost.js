@@ -60,8 +60,8 @@ const GHOST_CONV_STATE_FILE = path.join(DATA_DIR, "ghost-conv-state.json");
 
 // ── Embedding provider ───────────────────────────────────────────────────
 const EMBED_PROVIDER = "google";
-const EMBED_MODEL    = "text-embedding-004";
-const EMBED_DIMS     = 768;
+const EMBED_MODEL    = "gemini-embedding-001";  // free, 3072 dims (text-embedding-004 not on this key)
+const EMBED_DIMS     = 3072;
 
 // ── Variable cooldown constants ──────────────────────────────────────────
 const COOLDOWN_STRANGER_MIN_MS   = 3.5 * 60 * 1000;
@@ -354,14 +354,14 @@ async function embedText(text) {
   if (!GEMINI_API_KEY) return null;
   try {
     const body = JSON.stringify({
-      model:   "models/text-embedding-004",
+      model:   "models/gemini-embedding-001",
       content: { parts: [{ text }] },
     });
     const result = await new Promise((resolve, reject) => {
-      const url  = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`;
+      const url  = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${GEMINI_API_KEY}`;
       const opts = {
         hostname: "generativelanguage.googleapis.com",
-        path:     `/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`,
+        path:     `/v1beta/models/gemini-embedding-001:embedContent?key=${GEMINI_API_KEY}`,
         method:   "POST",
         headers:  { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
       };
@@ -1204,10 +1204,18 @@ async function probeAvailableModels() {
         req.end();
       });
 
-      // result may be wrapped in { result: [...] } or a direct array
-      const sessions = Array.isArray(sessionData?.result)
-        ? sessionData.result
-        : (Array.isArray(sessionData) ? sessionData : []);
+      // sessions_list response format: { ok, result: { content: [{ type:"text", text: JSON({sessions:[]}) }] } }
+      let sessions = [];
+      try {
+        const textContent = sessionData?.result?.content?.[0]?.text;
+        if (textContent) {
+          sessions = JSON.parse(textContent).sessions || [];
+        } else if (Array.isArray(sessionData?.result)) {
+          sessions = sessionData.result;
+        } else if (Array.isArray(sessionData)) {
+          sessions = sessionData;
+        }
+      } catch { sessions = []; }
 
       const ghostSession = sessions.find(
         s => (s.key || s.sessionKey || s.id || "") === GHOST_AGENT_SESSION_KEY
