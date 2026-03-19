@@ -978,8 +978,9 @@ async function tryGhostAgentSession(contactName, messageText, systemPrompt, user
           const parsed = JSON.parse(data);
           // Extract text from OC tool result envelope
           const inner = parsed?.result?.details ?? parsed?.result;
+          // sessions_send with timeout returns details.reply as the agent's response
           const rawText = (typeof inner === "string" ? inner
-            : inner?.text ?? inner?.message ?? inner?.content?.[0]?.text ?? "");
+            : inner?.reply ?? inner?.text ?? inner?.message ?? inner?.content?.[0]?.text ?? "");
           // Strip any JSON wrapper the agent might have added
           let text = rawText.trim();
           try {
