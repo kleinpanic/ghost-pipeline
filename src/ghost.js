@@ -692,6 +692,7 @@ function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
       },
     };
     const req = https.request(options, (res) => {
+      const statusCode = res.statusCode;
       let data = "";
       res.on("data", c => { data += c; });
       res.on("end", () => {
@@ -706,6 +707,11 @@ function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
             const errMsg = parsed?.error?.message || parsed?.error || "empty response";
             const errCode = parsed?.error?.code ? ` (code ${parsed.error.code})` : "";
             log(`OR [${model.split("/").pop()}] failed: ${String(errMsg).slice(0, 120)}${errCode}`);
+            // Detect 429 / rate limit → cool down this model in OR_COOLDOWN_MAP
+            const isRateLimit = statusCode === 429 ||
+              parsed?.error?.code === 429 ||
+              /rate.?limit/i.test(String(errMsg));
+            if (isRateLimit) markOrModelCooling(model, 60000);
             resolve(null);
           }
         } catch (e) { log(`OR parse error: ${e.message}`); resolve(null); }
@@ -831,6 +837,15 @@ function invalidateSparkCache() {
   sparkLastCheck = Date.now(); // re-check in 5min, not immediately
 }
 
+// ── In-memory OpenRouter cooldown map ─────────────────────────────────────
+// Tracks models that returned 429/rate-limit; prevents retrying until cooldown expires
+const OR_COOLDOWN_MAP = new Map(); // modelId (full OR path) → cooldownUntilMs
+
+function markOrModelCooling(modelId, ms = 60000) {
+  OR_COOLDOWN_MAP.set(modelId, Date.now() + ms);
+  log(`OR cooldown: ${modelId.split("/").pop()} cooling for ${ms / 1000}s`);
+}
+
 async function checkSparkAvailable() {
   const now = Date.now();
   if (sparkAvailable !== null && now - sparkLastCheck < 5 * 60 * 1000) return sparkAvailable;
@@ -846,6 +861,102 @@ async function checkSparkAvailable() {
     req.setTimeout(2000, () => { req.destroy(); sparkAvailable = false; resolve(false); });
     req.end();
   });
+}
+
+// ── OR model probe list (key → full OR model id) ─────────────────────────
+const OR_MODEL_PROBE_LIST = [
+  { key: "claude-haiku",  model: "anthropic/claude-haiku-4.5" },
+  { key: "gemini-flash",  model: "google/gemini-3-flash-preview" },
+  { key: "gemma-27b",     model: "google/gemma-3-27b-it:free" },
+  { key: "llama-70b",     model: "meta-llama/llama-3.3-70b-instruct:free" },
+  { key: "mistral-small", model: "mistralai/mistral-small-3.1-24b-instruct:free" },
+];
+
+/**
+ * Phase 0.5 — Model Preflight
+ * Probes which models are usable RIGHT NOW and returns them in priority order:
+ *   ghost-agent → spark-fast → [OR models not on cooldown] → spark-strong
+ *
+ * Checks:
+ * - Ghost agent session: must be active within last 30 min (via OC gateway sessions_list)
+ * - Spark: uses checkSparkAvailable() (5-min cache)
+ * - OR models: skipped if OR_COOLDOWN_MAP has a future cooldownUntilMs entry
+ */
+async function probeAvailableModels() {
+  const available = [];
+
+  // 1. Ghost agent session — check via OC gateway sessions_list
+  if (OC_GATEWAY_TOKEN) {
+    try {
+      const body = JSON.stringify({ tool: "sessions_list", args: {} });
+      const sessionData = await new Promise((resolve) => {
+        const req = https.request({
+          hostname: "127.0.0.1",
+          port:     OC_GATEWAY_PORT,
+          path:     "/tools/invoke",
+          method:   "POST",
+          rejectUnauthorized: false,
+          headers: {
+            "Authorization":  `Bearer ${OC_GATEWAY_TOKEN}`,
+            "Content-Type":   "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
+        }, (res) => {
+          let data = "";
+          res.on("data", c => { data += c; });
+          res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+        });
+        req.setTimeout(3000, () => { req.destroy(); resolve(null); });
+        req.on("error", () => resolve(null));
+        req.write(body);
+        req.end();
+      });
+
+      // result may be wrapped in { result: [...] } or a direct array
+      const sessions = Array.isArray(sessionData?.result)
+        ? sessionData.result
+        : (Array.isArray(sessionData) ? sessionData : []);
+
+      const ghostSession = sessions.find(
+        s => (s.key || s.sessionKey || s.id || "") === GHOST_AGENT_SESSION_KEY
+      );
+
+      if (ghostSession) {
+        const updatedAt = ghostSession.updatedAt ? new Date(ghostSession.updatedAt).getTime() : 0;
+        const ageMin    = (Date.now() - updatedAt) / 60000;
+        if (ageMin <= 30) {
+          available.push("ghost-agent");
+          log(`probeAvailableModels: ghost-agent active (age ${ageMin.toFixed(1)}min)`);
+        } else {
+          log(`probeAvailableModels: ghost-agent stale (age ${ageMin.toFixed(1)}min > 30min)`);
+        }
+      } else {
+        log("probeAvailableModels: ghost-agent session not found");
+      }
+    } catch (err) {
+      log(`probeAvailableModels: ghost-agent probe failed (${(err.message || "").slice(0, 60)})`);
+    }
+  }
+
+  // 2. Spark fast
+  const sparkOk = await checkSparkAvailable();
+  if (sparkOk) available.push("spark-fast");
+
+  // 3. OR models — skip any currently cooling
+  const now = Date.now();
+  for (const { key, model } of OR_MODEL_PROBE_LIST) {
+    const coolUntil = OR_COOLDOWN_MAP.get(model);
+    if (!coolUntil || now > coolUntil) {
+      available.push(key);
+    } else {
+      log(`probeAvailableModels: ${key} cooling (${Math.ceil((coolUntil - now) / 1000)}s remaining)`);
+    }
+  }
+
+  // 4. Spark strong — last resort
+  if (sparkOk) available.push("spark-strong");
+
+  return available;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1008,57 +1119,73 @@ async function tryGhostAgentSession(contactName, messageText, systemPrompt, user
   });
 }
 
+/**
+ * Phase 1 — Draft Generation
+ * Calls probeAvailableModels() first to get an ordered list of what's usable right now,
+ * then iterates through them until one succeeds. First success wins.
+ *
+ * Log format: 'Draft: probed [ghost-agent, claude-haiku, gemini-flash] — trying ghost-agent...'
+ */
 async function generateDraft(systemPrompt, userContent, { contactName, contactPhone, messageText, historyLines } = {}) {
-  let sparkWasAvailable = false;
+  const available = await probeAvailableModels();
+  log(`Draft: probed [${available.join(", ")}] — trying ${available[0] || "none"}...`);
 
-  // ── Tier 1: Spark vllm fast — local, low-latency (when available)
-  if (await checkSparkAvailable()) {
-    sparkWasAvailable = true;
-    log("Draft tier 1: Spark gpt-oss-20b...");
-    const t1 = await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent);
-    if (t1) return { text: t1.trim(), model: "spark-20b" };
-    log("Draft: Spark fast returned null — invalidating cache");
-    invalidateSparkCache();
-    sparkWasAvailable = false;
-  } else {
-    log("Draft: Spark offline — skipping local tiers");
+  for (const modelKey of available) {
+    switch (modelKey) {
+      case "ghost-agent": {
+        const result = await tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, 15000);
+        if (result) return result;
+        break;
+      }
+      case "spark-fast": {
+        log("Draft: Spark gpt-oss-20b...");
+        const t = await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent);
+        if (t) return { text: t.trim(), model: "spark-20b" };
+        log("Draft: Spark fast returned null — invalidating cache");
+        invalidateSparkCache();
+        break;
+      }
+      case "claude-haiku": {
+        log("Draft: OR claude-haiku-4.5...");
+        const t = await tryOpenRouter("anthropic/claude-haiku-4.5", systemPrompt, userContent, 25000);
+        if (t) return { text: t.trim(), model: "claude-haiku" };
+        break;
+      }
+      case "gemini-flash": {
+        log("Draft: OR gemini-flash...");
+        const t = await tryOpenRouter("google/gemini-3-flash-preview", systemPrompt, userContent, 25000);
+        if (t) return { text: t.trim(), model: "gemini-flash" };
+        break;
+      }
+      case "gemma-27b": {
+        log("Draft: OR gemma-3-27b-it:free...");
+        const t = await tryOpenRouter("google/gemma-3-27b-it:free", systemPrompt, userContent, 20000);
+        if (t) return { text: t.trim(), model: "gemma-27b" };
+        break;
+      }
+      case "llama-70b": {
+        log("Draft: OR llama-3.3-70b-instruct:free...");
+        const t = await tryOpenRouter("meta-llama/llama-3.3-70b-instruct:free", systemPrompt, userContent, 20000);
+        if (t) return { text: t.trim(), model: "llama-70b" };
+        break;
+      }
+      case "mistral-small": {
+        log("Draft: OR mistral-small-3.1-24b-instruct:free...");
+        const t = await tryOpenRouter("mistralai/mistral-small-3.1-24b-instruct:free", systemPrompt, userContent, 20000);
+        if (t) return { text: t.trim(), model: "mistral-small" };
+        break;
+      }
+      case "spark-strong": {
+        log("Draft: Spark gpt-oss-120b (last resort)...");
+        const t = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
+        if (t) return { text: t.trim(), model: "spark-120b" };
+        invalidateSparkCache();
+        break;
+      }
+    }
   }
 
-  // ── Tier 1.5: Ghost agent session (direct HTTPS to OC gateway)
-  log("Draft tier 1.5: ghost agent session...");
-  const ghostDraft = await tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, 15000);
-  if (ghostDraft) return ghostDraft;
-
-  // ── Tier 2: OR claude-haiku-4.5 — fast, reliable, cheap primary cloud tier
-  log("Draft tier 2: OR claude-haiku-4.5...");
-  const t2 = await tryOpenRouter("anthropic/claude-haiku-4.5", systemPrompt, userContent, 25000);
-  if (t2) return { text: t2.trim(), model: "claude-haiku" };
-
-  // ── Tier 3: OR gemini-flash — reliable backup
-  log("Draft tier 3: OR gemini-flash...");
-  const t3 = await tryOpenRouter("google/gemini-3-flash-preview", systemPrompt, userContent, 25000);
-  if (t3) return { text: t3.trim(), model: "gemini-flash" };
-
-  // ── Tier 4: OR free models — last cloud resort before Spark strong
-  log("Draft tier 4: OR free fallbacks...");
-  for (const freeModel of [
-    "google/gemma-3-27b-it:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-  ]) {
-    const tf = await tryOpenRouter(freeModel, systemPrompt, userContent, 20000);
-    if (tf) return { text: tf.trim(), model: freeModel.split("/").pop().replace(":free", "") };
-  }
-
-  // ── Tier 5: Spark strong — only if Spark was working this session
-  if (sparkWasAvailable || await checkSparkAvailable()) {
-    log("Draft tier 5: Spark gpt-oss-120b (last resort)...");
-    const t5 = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
-    if (t5) return { text: t5.trim(), model: "spark-120b" };
-    invalidateSparkCache();
-  }
-
-  log("Draft: all tiers exhausted");
+  log("Draft: all probed models exhausted");
   return null;
 }
 
@@ -1286,10 +1413,100 @@ async function refreshUnknownAlerts() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  PHASE 0 — PREFLIGHT
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * runPreflight(contact, messageText, chatGuid, eventData)
+ *
+ * Consolidates all Phase 0 checks. Short-circuits on first failure.
+ * Unknown contact flow (check 4) triggers postUnknownAlert as a side effect.
+ * On success, pre-fetches 10 recent messages and returns contact context.
+ *
+ * Returns:
+ *   { ok: true,  context: { messages, contactName, category } }
+ *   { ok: false, reason: string, ...extra }
+ */
+async function runPreflight(contact, messageText, chatGuid, eventData) {
+  const normalized = normalizePhone(contact);
+
+  // 1. requiresReply — skip no-op acks, emoji-only, tapbacks, sensitive content
+  if (!requiresReply(messageText)) {
+    return { ok: false, reason: "no_reply_needed" };
+  }
+
+  // 2. isLikelySpam — keyword, url, short-code, rate-limit checks
+  if (isLikelySpam(normalized, messageText)) {
+    return { ok: false, reason: "spam" };
+  }
+
+  // 3. isDenied — explicit denylist
+  if (isDenied(contact)) {
+    return { ok: false, reason: "denied" };
+  }
+
+  // 4. isAllowed check + unknown contact flow
+  if (!isAllowed(contact)) {
+    // Apple Contacts enrichment (best-effort, 3s timeout)
+    let appleContactName = null;
+    let appleEnrichment  = null;
+    let alertSource      = "unknown";
+    try {
+      const cqResult = await Promise.race([
+        mcporterCallAsync("bb_contact_query", { addresses: [`+${normalized}`] }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
+      ]);
+      const cqData = cqResult?.data?.[0] || cqResult?.data || null;
+      if (cqData) {
+        appleContactName = cqData.displayName ||
+          [`${cqData.firstName || ""}`, `${cqData.lastName || ""}`].filter(Boolean).join(" ").trim() ||
+          null;
+        if (appleContactName) {
+          alertSource    = "apple_contacts";
+          appleEnrichment = {
+            emails:   (cqData.emails || []).map(e => e.address).filter(Boolean),
+            birthday: cqData.birthday || null,
+          };
+          log(`runPreflight: Apple Contacts match for +${normalized}: "${appleContactName}"`);
+        }
+      }
+    } catch (err) {
+      log(`runPreflight: Apple Contacts lookup failed for +${normalized}: ${(err.message || "").slice(0, 60)}`);
+    }
+    const { numToAlias } = loadContactsMap();
+    const displayName = appleContactName || numToAlias[normalized] || `+${normalized}`;
+    // Fire-and-forget — alert Klein without blocking the webhook response
+    postUnknownAlert(normalized, messageText, displayName, {
+      source:     alertSource,
+      enrichment: appleEnrichment,
+    }).catch(() => {});
+    return { ok: false, reason: "unknown_contact", resolvedName: displayName, source: alertSource };
+  }
+
+  // 5. isGroupChatGuid — skip group threads
+  if (isGroupChatGuid(chatGuid, eventData)) {
+    return { ok: false, reason: "group_chat" };
+  }
+
+  // 6. isQuietHours — per-contact-category quiet window
+  if (isQuietHours(contact)) {
+    return { ok: false, reason: "quiet_hours" };
+  }
+
+  // 7. fetchRecentMessages — build context upfront, attach to pending entry
+  const messages = chatGuid ? await fetchRecentMessages(chatGuid, 10) : [];
+  const { numToName, numToAlias, numToCategory } = loadContactsMap();
+  const contactName = numToAlias[normalized] || numToName[normalized] || `+${normalized}`;
+  const category    = numToCategory[normalized] || "friend";
+
+  return { ok: true, context: { messages, contactName, category } };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  CORE DRAFT LOGIC
 // ═══════════════════════════════════════════════════════════════════════════
 
-// In-memory map: key (chatGuid|phone) → { contact, contactName, messageText, chatGuid, arrivedAt, timeoutId }
+// In-memory map: key (chatGuid|phone) → { contact, contactName, messageText, chatGuid, arrivedAt, timeoutId, contextMessages }
 const pendingMessages = new Map();
 
 async function checkAndDraft(key) {
@@ -1640,64 +1857,27 @@ function createServer() {
         }
 
         if (!contact || !normalized) return send(200, { ok: true, action: "drop", reason: "no_contact" });
-        if (isDenied(contact)) { log(`Denied: ${normalized}`); return send(200, { ok: true, action: "drop", reason: "denylist" }); }
 
         const messageText = extractMessageText(eventData);
 
-        if (!isAllowed(contact)) {
-          if (isLikelySpam(normalized, messageText)) {
-            addToDenylist(normalized);
-            log(`Auto-denied spam: ${normalized}`);
+        // Phase 0: Preflight — requiresReply, spam, denied, allowed, group, quiet hours, fetch context
+        const preflight = await runPreflight(contact, messageText, chatGuid, eventData);
+        if (!preflight.ok) {
+          log(`Preflight skip: ${preflight.reason} for ${normalized}`);
+          if (preflight.reason === "unknown_contact") {
+            return send(200, { ok: true, action: "unknown_contact_alert", resolvedName: preflight.resolvedName, source: preflight.source });
+          }
+          if (preflight.reason === "spam") {
+            // Auto-deny known spam callers that slipped through (short-codes, etc.)
+            if (!isAllowed(contact)) { addToDenylist(normalized); log(`Auto-denied spam: ${normalized}`); }
             return send(200, { ok: true, action: "drop", reason: "auto_deny_spam" });
           }
-
-          // Try Apple Contacts enrichment before firing the unknown alert
-          let appleContactName = null;
-          let appleEnrichment  = null;
-          let alertSource      = "unknown";
-          try {
-            // BUG-4 fix: use mcporterCallAsync (spawnAsync) instead of spawnSync to avoid blocking event loop
-            const cqResult = await Promise.race([
-              mcporterCallAsync("bb_contact_query", { addresses: [`+${normalized}`] }),
-              new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
-            ]);
-            const cqData = cqResult?.data?.[0] || cqResult?.data || null;
-            if (cqData) {
-              appleContactName = cqData.displayName ||
-                [`${cqData.firstName || ""}`, `${cqData.lastName || ""}`].filter(Boolean).join(" ").trim() ||
-                null;
-              if (appleContactName) {
-                alertSource     = "apple_contacts";
-                appleEnrichment = {
-                  emails:   (cqData.emails || []).map(e => e.address).filter(Boolean),
-                  birthday: cqData.birthday || null,
-                };
-                log(`Apple Contacts match for +${normalized}: "${appleContactName}"`);
-              }
-            }
-          } catch (err) {
-            log(`Apple Contacts lookup failed for +${normalized}: ${(err.message || "").slice(0, 60)}`);
-          }
-
-          const { numToAlias } = loadContactsMap();
-          const displayName = appleContactName || numToAlias[normalized] || `+${normalized}`;
-          postUnknownAlert(normalized, messageText, displayName, {
-            source:      alertSource,
-            enrichment:  appleEnrichment,
-          }).catch(() => {});
-          return send(200, { ok: true, action: "unknown_contact_alert", resolvedName: displayName, source: alertSource });
+          return send(200, { ok: true, action: preflight.reason });
         }
 
-        if (isQuietHours(normalized)) { log(`Quiet hours — skipping ${normalized}`); return send(200, { ok: true, action: "quiet_hours" }); }
-        if (isPaused())     { log(`Paused — skipping ${normalized}`);       return send(200, { ok: true, action: "paused"      }); }
+        if (isPaused()) { log(`Paused — skipping ${normalized}`); return send(200, { ok: true, action: "paused" }); }
 
-        if (!requiresReply(messageText)) {
-          log(`No-reply message from ${normalized}: "${messageText.slice(0, 40)}" — skipping draft`);
-          return send(200, { ok: true, action: "no_reply_needed", message: messageText.slice(0, 40) });
-        }
-
-        const { numToName, numToAlias } = loadContactsMap();
-        const contactName = numToAlias[normalized] || numToName[normalized] || `+${normalized}`;
+        const { contactName } = preflight.context;
         const arrivedAt     = Date.now();
         const key           = chatGuid || normalized;
 
@@ -1719,7 +1899,7 @@ function createServer() {
         }
 
         const timeoutId = setTimeout(() => checkAndDraft(key), DRAFT_DELAY_MS);
-        pendingMessages.set(key, { contact, contactName, messageText, chatGuid: chatGuid || key, arrivedAt, timeoutId });
+        pendingMessages.set(key, { contact, contactName, messageText, chatGuid: chatGuid || key, arrivedAt, timeoutId, contextMessages: preflight.context.messages });
         log(`Draft queued for ${contactName} — fires in ${DRAFT_DELAY_MS / 60000}min`);
 
         return send(200, {
