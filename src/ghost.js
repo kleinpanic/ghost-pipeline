@@ -991,12 +991,21 @@ async function postDraftToDiscord(draftResult, meta) {
   content += `\n**Them:** ${messageText || "(no text)"}\n`;
 
   if (draftResult) {
-    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Reply \`gs ${draftId}\` to send · \`gc ${draftId}\` to cancel_`;
+    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n`;
   } else {
     content += `\n⚠️ Draft generation failed — reply manually.`;
   }
 
-  const result = await discordPost(GHOST_CHANNEL, { content });
+  const result = await discordPost(GHOST_CHANNEL, {
+    content,
+    components: draftResult ? [{
+      type: 1,
+      components: [
+        { type: 2, label: "✅ Send Now", style: 3, custom_id: `occomp:cid=GHOST_SEND:${draftId}`   },
+        { type: 2, label: "❌ Cancel",   style: 4, custom_id: `occomp:cid=GHOST_CANCEL:${draftId}` },
+      ],
+    }] : [],
+  });
 
   if (result?.id && draftResult) {
     const drafts = loadPendingDrafts();
@@ -1034,8 +1043,8 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
     components: [{
       type: 1,
       components: [
-        { type: 2, style: 3, label: "Approve", custom_id: `approve_${phone}` },
-        { type: 2, style: 4, label: "Deny",    custom_id: `deny_${phone}`    },
+        { type: 2, style: 3, label: "Approve", custom_id: `occomp:cid=approve_${phone}` },
+        { type: 2, style: 4, label: "Deny",    custom_id: `occomp:cid=deny_${phone}`    },
       ],
     }],
   });
