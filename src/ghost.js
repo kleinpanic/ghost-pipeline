@@ -1444,11 +1444,9 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
   for (const modelKey of available) {
     switch (modelKey) {
       case "ghost-agent": {
-        const result = await tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, 15000);
-        if (result) {
-          if (passesContentSafety(result.text)) return result;
-          log("Draft failed content safety [ghost-agent] — trying next model");
-        }
+        // ghost-agent tier disabled — consistently times out (~14s); haiku with same SOUL context is equivalent and 15x faster
+        // Re-enable when ghost agent session is tuned for low-latency draft responses
+        log("Draft tier ghost-agent: skipped (disabled — use haiku)");
         break;
       }
       case "spark-fast": {
@@ -1639,7 +1637,7 @@ function loadPendingDrafts() {
 function savePendingDrafts(drafts) { saveJson(PENDING_DRAFTS_FILE, drafts); }
 
 async function postDraftToDiscord(draftResult, meta) {
-  const { chatGuid, contact, contactName, messageText, arrivedAt, contextMessages } = meta;
+  const { chatGuid, contact, contactName, messageText, arrivedAt, contextMessages, autoSendMs } = meta;
   const draftId    = crypto.randomBytes(4).toString("hex");
   const phone      = `+${normalizePhone(contact)}`;
   const safeName   = contactName.replace(/[*_`]/g, "\\$&");
@@ -1658,7 +1656,8 @@ async function postDraftToDiscord(draftResult, meta) {
   const hasUsableDraft  = draftResult && draftResult.text && !isSafetyBlocked;
 
   if (hasUsableDraft) {
-    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Auto-sends in 5 min — ✅ send now · ❌ cancel_`;
+    const cooldownMin = Math.round((autoSendMs || AUTO_SEND_WINDOW_MS) / 60000 * 10) / 10;
+    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Auto-sends in ${cooldownMin} min — ✅ send now · ❌ cancel_`;
   } else if (isSafetyBlocked) {
     content += `\n⚠️ All draft tiers failed content safety — reply manually.`;
   } else {
@@ -1880,7 +1879,7 @@ const pendingMessages = new Map();
 async function checkAndDraft(key) {
   const entry = pendingMessages.get(key);
   if (!entry) return;
-  let { contact, contactName, messageText, chatGuid, arrivedAt } = entry;
+  let { contact, contactName, messageText, chatGuid, arrivedAt, autoSendMs } = entry;
   pendingMessages.delete(key);
 
   log(`checkAndDraft: ${contactName} (${key})`);
@@ -1939,7 +1938,7 @@ async function checkAndDraft(key) {
   });
 
   await postDraftToDiscord(draftResult, {
-    chatGuid, contact, contactName, messageText, arrivedAt, contextMessages,
+    chatGuid, contact, contactName, messageText, arrivedAt, contextMessages, autoSendMs,
   });
 }
 
