@@ -1773,8 +1773,8 @@ async function postDraftToDiscord(draftResult, meta) {
           blocks: [{
             type:    "actions",
             buttons: [
-              { label: "✅ Send Now", style: "success" },
-              { label: "❌ Cancel",   style: "danger"  },
+              { label: `✅ Send · ${draftId}`, style: "success" },
+              { label: `❌ Cancel · ${draftId}`, style: "danger"  },
             ],
           }],
         },
