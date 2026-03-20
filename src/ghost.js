@@ -1619,6 +1619,8 @@ async function buildSystemPrompt(contactName, contactPhone, triggerMessage = "")
 
   prompt += `\n\n---\nDraft a reply to ${contactName} as Klein. Max 1-2 short texts. No emojis unless genuinely funny. No greeting openers. Output ONLY the reply text — nothing else.`;
 
+  prompt += `\n\nIf the message requires specific personal knowledge not visible in context (specific plans, events, or facts), respond with EXACTLY: [CANNOT_ANSWER: brief reason max 12 words]`;
+
   const feedbackSummary = recentFeedbackSummary();
   if (feedbackSummary) prompt += feedbackSummary;
 
@@ -1655,6 +1657,12 @@ function buildUserContent(contactName, messageText, recentMessages, triggerArriv
 // ═══════════════════════════════════════════════════════════════════════════
 //  DISCORD
 // ═══════════════════════════════════════════════════════════════════════════
+
+async function postCannotAnswerAlert(contactName, messageText, reason) {
+  const safeName = contactName.replace(/[*_`]/g, "\\$&");
+  const content  = `❓ **Cannot answer** — ${safeName}\n> "${(messageText || "").slice(0, 200)}"\n_Reason: ${reason}_`;
+  await discordPost(GHOST_CHANNEL, { content });
+}
 
 async function discordPost(channelId, payload) {
   try {
@@ -1703,27 +1711,51 @@ async function postDraftToDiscord(draftResult, meta) {
   const phone      = `+${normalizePhone(contact)}`;
   const safeName   = contactName.replace(/[*_`]/g, "\\$&");
 
-  const history = (contextMessages || [])
-    .filter(m => m.text?.trim())
-    .slice(0, 5).reverse()
-    .map(m => `> ${(m.isFromMe === true || m.from === "me") ? "Klein" : contactName}: ${m.text.trim().slice(0, 120)}`)
-    .join("\n");
+  // Determine conv mode (STRANGER vs ACTIVE) from conv state
+  const convStateAll  = loadConvState();
+  const convEntry     = convStateAll[normalizePhone(contact)] || {};
+  const isActiveConv  = convEntry.mode === "active" &&
+    convEntry.lastGhostSendAt &&
+    (Date.now() - new Date(convEntry.lastGhostSendAt).getTime()) <= ACTIVE_TIMEOUT_MS;
+  const convMode      = isActiveConv ? "ACTIVE" : "STRANGER";
 
-  let content = `📱 **${safeName}** (${phone})\n`;
-  if (history) content += `\n${history}\n`;
-  content += `\n**Them:** ${messageText || "(no text)"}\n`;
+  // Service type
+  const service = (chatGuid || "").startsWith("SMS") ? "SMS" : "iMessage";
+
+  // ── Build content ────────────────────────────────────────────────────────
+  let content = `📱 **${safeName}** · ${phone} · ${service}\n`;
+  content += `${"—".repeat(32)}\n`;
+
+  // Their message
+  content += `\n**Their message**\n> ${(messageText || "(no text)").slice(0, 300)}\n`;
+
+  // Context (last 4 messages, chronological)
+  const ctxMsgs = (contextMessages || [])
+    .filter(m => m.text?.trim())
+    .slice(0, 4)
+    .reverse();
+  content += `\n**Context** (${ctxMsgs.length})\n`;
+  for (const m of ctxMsgs) {
+    const label = (m.isFromMe === true || m.from === "me") ? "You" : contactName;
+    content += `> **${label}**: ${m.text.trim().slice(0, 120)}\n`;
+  }
 
   const isSafetyBlocked = draftResult && draftResult.model === "safety-blocked";
   const hasUsableDraft  = draftResult && draftResult.text && !isSafetyBlocked;
 
   if (hasUsableDraft) {
     const cooldownMin = Math.round((autoSendMs || AUTO_SEND_WINDOW_MS) / 60000 * 10) / 10;
-    content += `\n📝 **Draft** · via ${draftResult.model}:\n> ${draftResult.text}\n\n_Auto-sends in ${cooldownMin} min — ✅ send now · ❌ cancel_`;
+    const draftLines  = draftResult.text.split("\n").map(l => `> ${l}`).join("\n");
+    content += `\n**Draft** · _${draftResult.model}_ · ${convMode}\n${draftLines}\n`;
+    content += `\n⏱️ Auto-sends in ${cooldownMin} min · \`${draftId}\``;
   } else if (isSafetyBlocked) {
     content += `\n⚠️ All draft tiers failed content safety — reply manually.`;
   } else {
     content += `\n⚠️ Draft generation failed — reply manually.`;
   }
+
+  // Hard cap at 1900 chars
+  if (content.length > 1900) content = content.slice(0, 1897) + "…";
 
   let messageId = null;
 
@@ -2113,6 +2145,15 @@ async function checkAndDraft(key) {
   const draftResult = await generateDraft(systemPrompt, userContent, {
     contactName, contactPhone: contact, messageText, historyLines,
   });
+
+  // Cannot-answer gate: if model returned [CANNOT_ANSWER: ...], alert and abort
+  if (draftResult && draftResult.text && draftResult.text.trimStart().startsWith("[CANNOT_ANSWER:")) {
+    const match  = draftResult.text.match(/^\[CANNOT_ANSWER:\s*(.*?)\]/s);
+    const reason = match ? match[1].trim() : "unknown reason";
+    log(`[ghost] Cannot-answer gate: ${contactName} asked something I cannot answer`);
+    await postCannotAnswerAlert(contactName, messageText, reason);
+    return;
+  }
 
   await postDraftToDiscord(draftResult, {
     chatGuid, contact, contactName, messageText, arrivedAt, contextMessages, autoSendMs,
@@ -3159,5 +3200,8 @@ if (require.main !== module) {
     GHOST_CHANNEL,
     DRAFT_DELAY_MS,
     KLEIN_DISCORD_USER_ID,
+    postCannotAnswerAlert,
+    buildSystemPrompt,
+    postDraftToDiscord,
   };
 }
