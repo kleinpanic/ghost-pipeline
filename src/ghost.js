@@ -118,6 +118,7 @@ const GHOST_CHANNEL = "1474492563418517515";
 
 // Identity
 const OWNER_PHONE_NORMALIZED = "12673479614";
+const KLEIN_DISCORD_USER_ID  = process.env.KLEIN_DISCORD_USER_ID || "";
 
 // Timing
 const DRAFT_DELAY_MS          = 30 * 1000;        // generate draft 30s after message (debounce)
@@ -2380,6 +2381,10 @@ function createServer() {
       try {
         const { draftId, action, userId } = JSON.parse(await readBody());
         if (!draftId || !action) return send(400, { ok: false, error: "draftId and action required" });
+        // Optional userId check — enforced only when KLEIN_DISCORD_USER_ID env var is set
+        if (KLEIN_DISCORD_USER_ID && userId && userId !== KLEIN_DISCORD_USER_ID) {
+          return send(403, { ok: false, error: "unauthorized" });
+        }
         const drafts   = loadPendingDrafts();
         const draftIdx = drafts.findIndex(d => d.draftId === draftId);
         if (draftIdx === -1) return send(404, { ok: false, error: "draft not found" });
@@ -3138,5 +3143,21 @@ if (require.main !== module) {
     loadButtonRegistry,
     saveButtonRegistry,
     BUTTON_REGISTRY_FILE,
+    // Integration test exports
+    createServer,
+    runPreflight,
+    logFeedback,
+    doReactionCheck,
+    sweepStaleUnknownAlerts,
+    pendingUnknownAlerts,
+    pendingMessages,
+    loadPendingDrafts,
+    savePendingDrafts,
+    checkAndDraft,
+    DATA_DIR,
+    GHOST_DIR,
+    GHOST_CHANNEL,
+    DRAFT_DELAY_MS,
+    KLEIN_DISCORD_USER_ID,
   };
 }
