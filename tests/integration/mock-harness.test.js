@@ -349,7 +349,14 @@ afterAll(async () => {
 
 beforeEach(() => {
   resetState();
-  jest.useRealTimers();
+  // Pin Date.now() to 2pm ET (14:00) to avoid quiet-hours gate (23:00–08:00).
+  // doNotFake preserves all real timers so setTimeout/setInterval in ghost.js still work.
+  const twopm = new Date();
+  twopm.setHours(14, 0, 0, 0);
+  jest.useFakeTimers({
+    now: twopm.getTime(),
+    doNotFake: ["nextTick", "setImmediate", "Promise", "setTimeout", "setInterval", "clearTimeout", "clearInterval"],
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
