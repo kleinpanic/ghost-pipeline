@@ -2201,8 +2201,8 @@ async function bbSendMessage(chatGuid, message) {
 async function kleinRepliedSince(chatGuid, sinceIso) {
   // Collision guard before auto-send: check BB for any message from owner since draft was posted
   try {
-    const sinceMs  = new Date(sinceIso).getTime() - 10000; // 10s buffer
-    const argsJson = JSON.stringify({ chat_guid: chatGuid, limit: 10, sort: "DESC" });
+    const sinceMs  = new Date(sinceIso).getTime() - 30000; // 30s buffer (was 10s)
+    const argsJson = JSON.stringify({ chat_guid: chatGuid, limit: 30, sort: "DESC" });
     const stdout   = await spawnAsync("mcporter", [
       "call", "bluebubbles.bb_get_chat_messages", "--args", argsJson,
     ], { timeout: 15000 });
@@ -2330,8 +2330,10 @@ async function doReactionCheck() {
 
     const now  = Date.now();
     const keep = [];
+    const alreadySentThisCycle = new Set();
 
-    for (const draft of drafts) {
+    const sortedDrafts = [...drafts].sort((a, b) => new Date(b.arrivedAt || 0) - new Date(a.arrivedAt || 0));
+    for (const draft of sortedDrafts) {
       const { draftId, contactName, postedAt } = draft;
       const age     = now - new Date(postedAt || now).getTime();
       const expired = age > 24 * 60 * 60 * 1000;
@@ -2357,6 +2359,11 @@ async function doReactionCheck() {
       // No button action yet — check if auto-send window has elapsed
       const autoSendMs = draft.autoSendMs || AUTO_SEND_WINDOW_MS;
       if (autoSendMs > 0 && age >= autoSendMs) {
+        if (alreadySentThisCycle.has(draft.chatGuid)) {
+          log(`Auto-send: skipping older draft for ${contactName} (newer draft already sent this cycle)`);
+          logFeedback(draft, "superseded");
+          continue;
+        }
         if (isQuietHours(draft.contact || draft.chatGuid)) {
           log(`Auto-send: quiet hours — deferring draft for ${contactName}`);
           keep.push(draft);
@@ -2370,6 +2377,7 @@ async function doReactionCheck() {
         }
         log(`Auto-send: ${contactName} (${draftId}, age ${Math.round(age / 60000)}min)`);
         const ok = await executeSend(draft, "auto-send");
+        if (ok) alreadySentThisCycle.add(draft.chatGuid);
         if (!ok) keep.push(draft);
         continue;
       }
@@ -2987,10 +2995,29 @@ function purgeStaleDrafts() {
   } catch {}
 }
 
+async function pruneStaleDraftsOnStartup() {
+  const drafts = loadPendingDrafts();
+  if (!drafts.length) return;
+  const keep = [];
+  for (const draft of drafts) {
+    const alreadyReplied = await kleinRepliedSince(draft.chatGuid, draft.postedAt);
+    if (alreadyReplied) {
+      log(`Startup: Klein already replied to ${draft.contactName} — discarding stale draft ${draft.draftId}`);
+    } else {
+      keep.push(draft);
+    }
+  }
+  savePendingDrafts(keep);
+  if (keep.length < drafts.length) {
+    log(`Startup: pruned ${drafts.length - keep.length} stale draft(s) where Klein already replied`);
+  }
+}
+
 function cmdServe() {
   // Clear any stale lock from a prior crash before starting reaction check loop
   try { fs.unlinkSync(LOCK_FILE); } catch {}
   purgeStaleDrafts();
+  pruneStaleDraftsOnStartup().catch(err => log(`Startup preflight error: ${err.message}`));
   const server = createServer();
   server.listen(PORT, "0.0.0.0", () => {
     log(`Ghost v3 listening on :${PORT}`);
