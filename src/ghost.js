@@ -1749,9 +1749,16 @@ async function postDraftToDiscord(draftResult, meta) {
 
       // Parse messageId from OC response envelope
       try {
-        const textContent = ocResp?.result?.content?.[0]?.text;
-        const inner       = JSON.parse(textContent || "{}");
-        messageId         = inner?.result?.messageId || null;
+        // Prefer details.result.messageId (avoids JSON control-char parse issues in content text)
+        messageId = ocResp?.result?.details?.result?.messageId
+          || ocResp?.details?.result?.messageId
+          || null;
+        if (!messageId) {
+          try {
+            const textContent = ocResp?.result?.content?.[0]?.text;
+            messageId = JSON.parse(textContent || "{}")?.result?.messageId || null;
+          } catch {}
+        }
       } catch {}
 
       if (messageId) {
@@ -1764,7 +1771,17 @@ async function postDraftToDiscord(draftResult, meta) {
             "-H", `Authorization: Bot ${DISCORD_BOT_TOKEN}`,
           ], { timeout: 8000 });
           const dmsg     = tryParseJson(dmStdout);
-          const buttons  = (dmsg?.components?.[0]?.components || []);
+          // Discord Components v2 (flags:32768): buttons are inside a container (type 17)
+          // → action row (type 1) nested within. Flatten all type-2 components across all levels.
+          const flattenButtons = (comps) => {
+            const out = [];
+            for (const c of (comps || [])) {
+              if (c.type === 2) out.push(c);
+              if (c.components) out.push(...flattenButtons(c.components));
+            }
+            return out;
+          };
+          const buttons  = flattenButtons(dmsg?.components || []);
           const registry = loadButtonRegistry();
           for (const btn of buttons) {
             const cid = (btn.custom_id || "");
@@ -1915,8 +1932,18 @@ async function sweepStaleUnknownAlerts() {
  *   { ok: true,  context: { messages, contactName, category } }
  *   { ok: false, reason: string, ...extra }
  */
+const MAX_MESSAGE_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours — BB replays old msgs on reconnect
+
 async function runPreflight(contact, messageText, chatGuid, eventData) {
   const normalized = normalizePhone(contact);
+
+  // -1. Age gate — skip messages older than 2 hours (BB replays stale msgs on reconnect)
+  const msgDateCreated = eventData?.dateCreated ?? eventData?.date_created ?? 0;
+  const msgAgeMs = msgDateCreated ? (Date.now() - normalizeTs(msgDateCreated)) : 0;
+  if (msgDateCreated && msgAgeMs > MAX_MESSAGE_AGE_MS) {
+    log(`Message from +${normalized} is ${Math.round(msgAgeMs / 60000)}min old — skipping (age gate)`);
+    return { ok: false, reason: "message_too_old" };
+  }
 
   // 0. Prompt injection scan — must come before any processing of message content
   const injCheck = scanForInjection(messageText);
