@@ -1455,7 +1455,8 @@ async function tryGhostAgentSession(contactName, messageText, systemPrompt, user
 function ocGatewayPost(tool, args, timeoutMs = 15000) {
   return new Promise((resolve) => {
     if (!OC_GATEWAY_TOKEN) { resolve(null); return; }
-    const body = JSON.stringify({ tool, args });
+    // Route component clicks to ghost agent session (not main agent)
+    const body = JSON.stringify({ tool, args, sessionKey: GHOST_AGENT_SESSION_KEY });
     const req = https.request({
       hostname: "127.0.0.1",
       port:     OC_GATEWAY_PORT,
@@ -2353,7 +2354,25 @@ async function doReactionCheck() {
         continue;
       }
 
-      // No button action yet — will auto-send when AUTO_SEND_WINDOW_MS elapses
+      // No button action yet — check if auto-send window has elapsed
+      const autoSendMs = draft.autoSendMs || AUTO_SEND_WINDOW_MS;
+      if (autoSendMs > 0 && age >= autoSendMs) {
+        if (isQuietHours(draft.contact || draft.chatGuid)) {
+          log(`Auto-send: quiet hours — deferring draft for ${contactName}`);
+          keep.push(draft);
+          continue;
+        }
+        if (await kleinRepliedSince(draft.chatGuid, draft.postedAt)) {
+          log(`Auto-send: Klein already replied to ${contactName} — cancelling draft`);
+          logFeedback(draft, "auto-cancelled-collision");
+          await discordPost(GHOST_CHANNEL, { content: `↩️ Auto-cancelled: **${contactName}** already replied to manually.` });
+          continue;
+        }
+        log(`Auto-send: ${contactName} (${draftId}, age ${Math.round(age / 60000)}min)`);
+        const ok = await executeSend(draft, "auto-send");
+        if (!ok) keep.push(draft);
+        continue;
+      }
 
       keep.push(draft);
     }
