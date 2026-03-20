@@ -44,7 +44,9 @@ const DATA_DIR  = path.join(HOME, ".openclaw", "data");
 const CONTACTS_FILE       = path.join(GHOST_DIR, "governance", "CONTACTS.md");
 const DENYLIST_FILE       = path.join(DATA_DIR, "ghost-denylist.json");
 const PENDING_DRAFTS_FILE = path.join(DATA_DIR, "ghost-pending-drafts.json");
-const BUTTON_ACTIONS_FILE = path.join(DATA_DIR, "ghost-button-actions.json");
+const BUTTON_ACTIONS_FILE   = path.join(DATA_DIR, "ghost-button-actions.json");
+// Separate registry for OC-managed button shortIds (object format, keyed by shortId)
+const BUTTON_REGISTRY_FILE  = path.join(DATA_DIR, "ghost-button-registry.json");
 const PAUSE_FILE          = path.join(DATA_DIR, "ghost-paused.json");
 const SOUL_FILE           = path.join(GHOST_DIR, "SOUL.md");
 const VOICE_PROFILE_FILE  = path.join(GHOST_DIR, "memory", "voice-profile.md");
@@ -200,6 +202,31 @@ function saveJson(filePath, data) {
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] [ghost] ${msg}`);
+}
+
+/**
+ * Normalize a BB timestamp to milliseconds.
+ * BB direct HTTP timestamps are often in seconds (10-digit); MCP timestamps are in ms (13-digit).
+ * BUG-2: comparisons against Date.now() were silently failing for second-based timestamps.
+ */
+function normalizeTs(ts) {
+  if (!ts) return 0;
+  return ts > 9_999_999_999 ? ts : ts * 1000;
+}
+
+// Button registry helpers
+function loadButtonRegistry() {
+  const d = loadJson(BUTTON_REGISTRY_FILE, {});
+  return (d && typeof d === "object" && !Array.isArray(d)) ? d : {};
+}
+function saveButtonRegistry(registry) {
+  // Trim entries older than 24h on every write
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const trimmed = {};
+  for (const [k, v] of Object.entries(registry)) {
+    if (!v.postedAt || new Date(v.postedAt).getTime() > cutoff) trimmed[k] = v;
+  }
+  saveJson(BUTTON_REGISTRY_FILE, trimmed);
 }
 
 function normalizePhone(input) {
@@ -1420,6 +1447,38 @@ async function tryGhostAgentSession(contactName, messageText, systemPrompt, user
 }
 
 /**
+ * Post a message via the OpenClaw gateway tools/invoke endpoint.
+ * Used for posting draft buttons so OC registers the components (prevents 30-min expiry).
+ * Returns the parsed JSON response or null on failure.
+ */
+function ocGatewayPost(tool, args, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    if (!OC_GATEWAY_TOKEN) { resolve(null); return; }
+    const body = JSON.stringify({ tool, args });
+    const req = https.request({
+      hostname: "127.0.0.1",
+      port:     OC_GATEWAY_PORT,
+      path:     "/tools/invoke",
+      method:   "POST",
+      rejectUnauthorized: false,
+      headers: {
+        "Authorization":  `Bearer ${OC_GATEWAY_TOKEN}`,
+        "Content-Type":   "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", c => { data += c; });
+      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    });
+    req.setTimeout(timeoutMs, () => { req.destroy(); resolve(null); });
+    req.on("error", () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
  * Phase 1 — Draft Generation
  * Calls probeAvailableModels() first to get an ordered list of what's usable right now,
  * then iterates through them until one succeeds. First success wins.
@@ -1576,7 +1635,8 @@ function buildUserContent(contactName, messageText, recentMessages, triggerArriv
     .filter(m => {
       if (!m.text?.trim()) return false;
       // If we have a timestamp, exclude everything at or after the trigger
-      if (triggerArrivedAt && m.dateCreated && m.dateCreated >= triggerArrivedAt) return false;
+      // normalizeTs: BB may return seconds (10-digit) or ms (13-digit) — normalize both to ms
+      if (triggerArrivedAt && m.dateCreated && normalizeTs(m.dateCreated) >= triggerArrivedAt) return false;
       // Also exclude messages whose text matches the trigger (belt+suspenders)
       if (m.text?.trim() === messageText?.trim()) return false;
       return true;
@@ -1664,21 +1724,95 @@ async function postDraftToDiscord(draftResult, meta) {
     content += `\n⚠️ Draft generation failed — reply manually.`;
   }
 
-  const result = await discordPost(GHOST_CHANNEL, {
-    content,
-    components: hasUsableDraft ? [{
-      type: 1,
-      components: [
-        { type: 2, label: "✅ Send Now", style: 3, custom_id: `occomp:cid=GHOST_SEND:${draftId}`   },
-        { type: 2, label: "❌ Cancel",   style: 4, custom_id: `occomp:cid=GHOST_CANCEL:${draftId}` },
-      ],
-    }] : [],
-  });
+  let messageId = null;
 
-  if (result?.id && hasUsableDraft) {
+  if (hasUsableDraft && OC_GATEWAY_TOKEN) {
+    // BUG-1 FIX: post via OC gateway so component registration persists (no 30-min TTL).
+    // discordPost() bypasses OC → buttons expire. OC gateway registers them as reusable.
+    try {
+      const ocResp = await ocGatewayPost("message", {
+        action:     "send",
+        channel:    "discord",
+        target:     `channel:${GHOST_CHANNEL}`,
+        message:    content,
+        components: {
+          reusable: true,
+          blocks: [{
+            type:    "actions",
+            buttons: [
+              { label: "✅ Send Now", style: "success" },
+              { label: "❌ Cancel",   style: "danger"  },
+            ],
+          }],
+        },
+      });
+
+      // Parse messageId from OC response envelope
+      try {
+        const textContent = ocResp?.result?.content?.[0]?.text;
+        const inner       = JSON.parse(textContent || "{}");
+        messageId         = inner?.result?.messageId || null;
+      } catch {}
+
+      if (messageId) {
+        // GET the Discord message to find the OC-generated component custom_ids
+        // Format: occomp:cid=<shortId>   Map label → action
+        try {
+          const dmStdout = await spawnAsync("curl", [
+            "-s",
+            `https://discord.com/api/v10/channels/${GHOST_CHANNEL}/messages/${messageId}`,
+            "-H", `Authorization: Bot ${DISCORD_BOT_TOKEN}`,
+          ], { timeout: 8000 });
+          const dmsg     = tryParseJson(dmStdout);
+          const buttons  = (dmsg?.components?.[0]?.components || []);
+          const registry = loadButtonRegistry();
+          for (const btn of buttons) {
+            const cid = (btn.custom_id || "");
+            if (!cid.startsWith("occomp:cid=")) continue;
+            const shortId = cid.replace("occomp:cid=", "");
+            const label   = (btn.label || "").toLowerCase();
+            const action  = label.includes("send") ? "send" : "cancel";
+            registry[shortId] = {
+              draftId,
+              action,
+              contactName,
+              chatGuid: chatGuid || "",
+              contact:  contact  || "",
+              postedAt: new Date().toISOString(),
+            };
+          }
+          saveButtonRegistry(registry);
+          log(`Button registry updated for draft ${draftId} (shortIds: ${Object.keys(registry).slice(-2).join(", ")})`);
+        } catch (err) {
+          log(`postDraftToDiscord: failed to fetch Discord msg for shortId extraction — ${err.message.slice(0, 80)}`);
+        }
+      } else {
+        log("postDraftToDiscord: OC gateway returned no messageId — falling back to discordPost");
+      }
+    } catch (err) {
+      log(`postDraftToDiscord: OC gateway error (${err.message.slice(0, 80)}) — falling back`);
+    }
+  }
+
+  // Fallback: raw Discord API (no-draft case, or if OC gateway failed)
+  if (!messageId) {
+    const result = await discordPost(GHOST_CHANNEL, {
+      content,
+      components: hasUsableDraft ? [{
+        type: 1,
+        components: [
+          { type: 2, label: "✅ Send Now", style: 3, custom_id: `occomp:cid=GHOST_SEND:${draftId}`   },
+          { type: 2, label: "❌ Cancel",   style: 4, custom_id: `occomp:cid=GHOST_CANCEL:${draftId}` },
+        ],
+      }] : [],
+    });
+    messageId = result?.id || null;
+  }
+
+  if (messageId && hasUsableDraft) {
     const drafts = loadPendingDrafts();
     drafts.push({
-      messageId:   result.id,
+      messageId,
       draftId,
       chatGuid:    chatGuid || "",
       contact:     contact  || "",
@@ -1866,6 +2000,20 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
   const contactName = numToAlias[normalized] || numToName[normalized] || `+${normalized}`;
   const category    = numToCategory[normalized] || "friend";
 
+  // 8. Klein recently active gate — if Klein replied in the last 10 min, skip drafting.
+  //    This prevents ghost from drafting into an active conversation Klein is handling.
+  const arrivedAt  = Date.now();
+  const tenMinAgo  = arrivedAt - 10 * 60 * 1000;
+  const kleinRecentlyActive = messages.some(m =>
+    (m.isFromMe === true || m.from === "me") &&
+    normalizeTs(m.dateCreated) > tenMinAgo &&
+    normalizeTs(m.dateCreated) < arrivedAt
+  );
+  if (kleinRecentlyActive) {
+    log(`Klein recently active in chat with ${contactName} — skipping draft`);
+    return { ok: false, reason: "klein_recently_active" };
+  }
+
   return { ok: true, context: { messages, contactName, category } };
 }
 
@@ -1907,8 +2055,9 @@ async function checkAndDraft(key) {
   }
 
   // Collision check — did Klein reply during the window?
+  // normalizeTs: BB timestamps may be in seconds or ms; compare consistently in ms.
   const recent = await fetchRecentMessages(chatGuid, 10);
-  if (recent.some(m => (m.isFromMe === true || m.from === "me") && (m.dateCreated || 0) > arrivedAt)) {
+  if (recent.some(m => (m.isFromMe === true || m.from === "me") && normalizeTs(m.dateCreated || 0) > arrivedAt)) {
     log(`Klein already replied to ${contactName} — skipping draft`);
     return;
   }
@@ -1990,7 +2139,8 @@ async function kleinRepliedSince(chatGuid, sinceIso) {
     const data     = tryParseJson(stdout);
     const messages = Array.isArray(data?.data) ? data.data : [];
     // BB direct HTTP uses isFromMe:true; mcporter/MCP uses from:"me"
-    return messages.some(m => (m.isFromMe === true || m.from === "me") && (m.dateCreated || 0) > sinceMs);
+    // normalizeTs: BB timestamps may be in seconds or ms; compare consistently in ms.
+    return messages.some(m => (m.isFromMe === true || m.from === "me") && normalizeTs(m.dateCreated || 0) > sinceMs);
   } catch (err) {
     log(`kleinRepliedSince check failed (blocking send): ${err.message.slice(0, 80)}`);
     return true; // Can't verify → don't send
@@ -2195,6 +2345,34 @@ function createServer() {
         if (!phone) throw new Error("phone required");
         addToDenylist(phone);
         return send(200, { ok: true, action: "denied", phone });
+      } catch (e) { return send(400, { ok: false, error: e.message }); }
+    }
+
+    // POST /action — triggered by pre-message hook for button clicks (both OC and legacy)
+    if (req.method === "POST" && req.url === "/action") {
+      try {
+        const { draftId, action, userId } = JSON.parse(await readBody());
+        if (!draftId || !action) return send(400, { ok: false, error: "draftId and action required" });
+        const drafts   = loadPendingDrafts();
+        const draftIdx = drafts.findIndex(d => d.draftId === draftId);
+        if (draftIdx === -1) return send(404, { ok: false, error: "draft not found" });
+        const draft = drafts[draftIdx];
+        if (action === "cancel") {
+          logFeedback(draft, "cancelled");
+          drafts.splice(draftIdx, 1);
+          savePendingDrafts(drafts);
+          await discordPost(GHOST_CHANNEL, { content: `❌ Cancelled draft for **${draft.contactName}**.` });
+          return send(200, { ok: true, action: "cancelled" });
+        }
+        if (action === "send") {
+          const ok = await executeSend(draft, "button:send");
+          if (ok) {
+            const updated = loadPendingDrafts().filter(d => d.draftId !== draftId);
+            savePendingDrafts(updated);
+          }
+          return send(200, { ok: true, action: ok ? "sent" : "send_failed" });
+        }
+        return send(400, { ok: false, error: `unknown action: ${action}` });
       } catch (e) { return send(400, { ok: false, error: e.message }); }
     }
 
@@ -2928,5 +3106,10 @@ if (require.main !== module) {
     COOLDOWN_ACTIVE_MAX_MS,
     ACTIVE_EXCHANGE_THRESHOLD,
     ACTIVE_TIMEOUT_MS,
+    // Bug-fix exports
+    normalizeTs,
+    loadButtonRegistry,
+    saveButtonRegistry,
+    BUTTON_REGISTRY_FILE,
   };
 }
