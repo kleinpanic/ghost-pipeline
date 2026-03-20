@@ -2218,7 +2218,7 @@ async function kleinRepliedSince(chatGuid, sinceIso) {
 }
 
 async function executeSend(draft, reason) {
-  const { contactName, chatGuid, draftText, postedAt, contact } = draft;
+  const { contactName, chatGuid, draftText, arrivedAt, postedAt, contact } = draft;
 
   if (!draftText) {
     log(`[${reason}] Empty draft for ${contactName} — skipping`);
@@ -2233,8 +2233,10 @@ async function executeSend(draft, reason) {
     return false;
   }
 
-  // Late collision check
-  if (postedAt && await kleinRepliedSince(chatGuid, postedAt)) {
+  // Late collision check — use arrivedAt (when contact's message arrived) so we catch
+  // cases where Klein replied manually BEFORE ghost even generated the draft.
+  const collisionAnchor = arrivedAt || postedAt;
+  if (collisionAnchor && await kleinRepliedSince(chatGuid, collisionAnchor)) {
     log(`[${reason}] Klein already replied to ${contactName} — skipping`);
     await discordPost(GHOST_CHANNEL, { content: `ℹ️ Skipped **${contactName}** — Klein already replied.` });
     return true;
@@ -2369,7 +2371,7 @@ async function doReactionCheck() {
           keep.push(draft);
           continue;
         }
-        if (await kleinRepliedSince(draft.chatGuid, draft.postedAt)) {
+        if (await kleinRepliedSince(draft.chatGuid, draft.arrivedAt || draft.postedAt)) {
           log(`Auto-send: Klein already replied to ${contactName} — cancelling draft`);
           logFeedback(draft, "auto-cancelled-collision");
           await discordPost(GHOST_CHANNEL, { content: `↩️ Auto-cancelled: **${contactName}** already replied to manually.` });
@@ -3000,7 +3002,7 @@ async function pruneStaleDraftsOnStartup() {
   if (!drafts.length) return;
   const keep = [];
   for (const draft of drafts) {
-    const alreadyReplied = await kleinRepliedSince(draft.chatGuid, draft.postedAt);
+    const alreadyReplied = await kleinRepliedSince(draft.chatGuid, draft.arrivedAt || draft.postedAt);
     if (alreadyReplied) {
       log(`Startup: Klein already replied to ${draft.contactName} — discarding stale draft ${draft.draftId}`);
     } else {
