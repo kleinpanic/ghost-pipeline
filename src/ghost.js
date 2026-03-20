@@ -74,6 +74,7 @@ const ACTIVE_EXCHANGE_THRESHOLD  = 3;
 const ACTIVE_TIMEOUT_MS          = 5  * 60 * 1000;
 
 // ── Content safety patterns (checked on every draft before returning) ────
+const CJK_PATTERN = /[\u3400-\u9fff\uf900-\ufaff]/;  // CJK characters — never send Chinese/Japanese/Korean
 const NEVER_SAY = [
   /\bn[\-*]+w+er\b/i,
   /\bf[\-*]+ck\s+you\b/i,
@@ -86,6 +87,7 @@ const NEVER_SAY = [
   /\bpassword\b/i,
   /\bsend\s+me\s+money\b/i,
   /\bwire\s+transfer\b/i,
+  CJK_PATTERN,  // CJK characters — never send Chinese/Japanese/Korean
 ];
 
 // Secrets
@@ -578,9 +580,17 @@ function scanForInjection(messageText) {
 //  CONTENT SAFETY FILTER
 // ═══════════════════════════════════════════════════════════════════════════
 
-function passesContentSafety(draftText) {
+function passesContentSafety(draftText, tier = "unknown") {
   if (!draftText) return true;
-  return !NEVER_SAY.some(pattern => pattern.test(draftText));
+  for (const pattern of NEVER_SAY) {
+    if (pattern.test(draftText)) {
+      if (pattern === CJK_PATTERN) {
+        log(`[${tier}] CJK characters detected in draft — rejecting`);
+      }
+      return false;
+    }
+  }
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1183,13 +1193,12 @@ async function checkSparkAvailable() {
   });
 }
 
-// ── OR model probe list (key → full OR model id) ─────────────────────────
-const OR_MODEL_PROBE_LIST = [
-  { key: "claude-haiku",  model: "anthropic/claude-haiku-4.5" },
-  { key: "gemini-flash",  model: "google/gemini-3-flash-preview" },
-  { key: "gemma-27b",     model: "google/gemma-3-27b-it:free" },
-  { key: "llama-70b",     model: "meta-llama/llama-3.3-70b-instruct:free" },
-  { key: "mistral-small", model: "mistralai/mistral-small-3.1-24b-instruct:free" },
+// Ghost draft model waterfall — edit here to switch primary
+const GHOST_DRAFT_MODELS = [
+  { id: "openai/gpt-oss-120b",                  label: "gpt-oss-120b"     },  // primary: $0.039/M
+  { id: "google/gemini-3.1-flash-lite-preview",  label: "gemini-flash-lite" }, // $0.25/M
+  { id: "google/gemini-3-flash-preview",         label: "gemini-flash"     },  // $0.50/M
+  { id: "anthropic/claude-haiku-4.5",            label: "claude-haiku"     },  // $0.80/M fallback
 ];
 
 /**
@@ -1272,12 +1281,12 @@ async function probeAvailableModels() {
 
   // 3. OR models — skip any currently cooling
   const now = Date.now();
-  for (const { key, model } of OR_MODEL_PROBE_LIST) {
-    const coolUntil = OR_COOLDOWN_MAP.get(model);
+  for (const entry of GHOST_DRAFT_MODELS) {
+    const coolUntil = OR_COOLDOWN_MAP.get(entry.id);
     if (!coolUntil || now > coolUntil) {
-      available.push(key);
+      available.push(entry.label);
     } else {
-      log(`probeAvailableModels: ${key} cooling (${Math.ceil((coolUntil - now) / 1000)}s remaining)`);
+      log(`probeAvailableModels: ${entry.label} cooling (${Math.ceil((coolUntil - now) / 1000)}s remaining)`);
     }
   }
 
@@ -1495,7 +1504,7 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
   const safeReturn = (text, model) => {
     if (!text) return null;
     const trimmed = text.trim();
-    if (!passesContentSafety(trimmed)) {
+    if (!passesContentSafety(trimmed, model)) {
       log(`Draft failed content safety [${model}] — trying next model`);
       return null;
     }
@@ -1518,39 +1527,15 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
         if (!t) { log("Draft: Spark fast returned null — invalidating cache"); invalidateSparkCache(); }
         break;
       }
-      case "claude-haiku": {
-        log("Draft: OR claude-haiku-4.5...");
-        const t = await tryOpenRouter("anthropic/claude-haiku-4.5", systemPrompt, userContent, 25000);
-        const r = safeReturn(t, "claude-haiku");
-        if (r) return r;
-        break;
-      }
-      case "gemini-flash": {
-        log("Draft: OR gemini-flash...");
-        const t = await tryOpenRouter("google/gemini-3-flash-preview", systemPrompt, userContent, 25000);
-        const r = safeReturn(t, "gemini-flash");
-        if (r) return r;
-        break;
-      }
-      case "gemma-27b": {
-        log("Draft: OR gemma-3-27b-it:free...");
-        const t = await tryOpenRouter("google/gemma-3-27b-it:free", systemPrompt, userContent, 20000);
-        const r = safeReturn(t, "gemma-27b");
-        if (r) return r;
-        break;
-      }
-      case "llama-70b": {
-        log("Draft: OR llama-3.3-70b-instruct:free...");
-        const t = await tryOpenRouter("meta-llama/llama-3.3-70b-instruct:free", systemPrompt, userContent, 20000);
-        const r = safeReturn(t, "llama-70b");
-        if (r) return r;
-        break;
-      }
-      case "mistral-small": {
-        log("Draft: OR mistral-small-3.1-24b-instruct:free...");
-        const t = await tryOpenRouter("mistralai/mistral-small-3.1-24b-instruct:free", systemPrompt, userContent, 20000);
-        const r = safeReturn(t, "mistral-small");
-        if (r) return r;
+      default: {
+        // OR model — look up in GHOST_DRAFT_MODELS by label
+        const orEntry = GHOST_DRAFT_MODELS.find(e => e.label === modelKey);
+        if (orEntry) {
+          log(`Draft: OR ${orEntry.label}...`);
+          const t = await tryOpenRouter(orEntry.id, systemPrompt, userContent, 25000);
+          const r = safeReturn(t, orEntry.label);
+          if (r) return r;
+        }
         break;
       }
       case "spark-strong": {
@@ -1619,6 +1604,8 @@ async function buildSystemPrompt(contactName, contactPhone, triggerMessage = "")
 - Current semester: Spring 2026.`;
 
   prompt += `\n\n---\nDraft a reply to ${contactName} as Klein. Max 1-2 short texts. No emojis unless genuinely funny. No greeting openers. Output ONLY the reply text — nothing else.`;
+
+  prompt += `\n\nAlways respond in American English only. Never use Chinese, Japanese, or Korean characters under any circumstances.`;
 
   prompt += `\n\nIf the message requires specific personal knowledge not visible in context (specific plans, events, or facts), respond with EXACTLY: [CANNOT_ANSWER: brief reason max 12 words]`;
 
@@ -3251,5 +3238,7 @@ if (require.main !== module) {
     postCannotAnswerAlert,
     buildSystemPrompt,
     postDraftToDiscord,
+    indexMessage,
+    embedText,
   };
 }
