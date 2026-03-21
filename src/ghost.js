@@ -2116,21 +2116,21 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
   let messageId = null;
   if (OC_GATEWAY_TOKEN) {
     try {
-      // Use OC native callback_data buttons — these route through the normal
-      // message pipeline (ghost agent session) so the pre-message hook fires.
-      // The v2 components API (reusable: true) routes through InteractionEventListener
-      // which never creates an agent session, so handler.js never runs.
       const ocResp = await ocGatewayPost("message", {
         action:  "send",
         channel: "discord",
         target:  `channel:${GHOST_CHANNEL}`,
         message: content,
-        buttons: [
-          [
-            { text: "✅ Approve", callback_data: `GHOST_APPROVE:${n}`, style: "success" },
-            { text: "❌ Deny",    callback_data: `GHOST_DENY:${n}`,    style: "danger"  },
-          ],
-        ],
+        components: {
+          reusable: true,
+          blocks: [{
+            type:    "actions",
+            buttons: [
+              { label: `✅ Approve · ${n}`, style: "success" },
+              { label: `❌ Deny · ${n}`,    style: "danger"  },
+            ],
+          }],
+        },
       });
       messageId = ocResp?.result?.details?.result?.messageId
         || ocResp?.details?.result?.messageId
