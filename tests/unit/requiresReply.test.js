@@ -124,6 +124,33 @@ describe("requiresReply — no reply needed (→ false)", () => {
   });
 });
 
+// ── URL-only messages (no text content for ghost to reply to) ───────────────
+describe("requiresReply — URL-only / attachment-only (→ false)", () => {
+  test.each([
+    ["https://youtu.be/abc123"],
+    ["https://example.com/some/link"],
+    ["http://bit.ly/xyz"],
+    ["[attachment: photo.jpg]"],
+    ["[image]"],
+    ["[attachment]"],
+  ])('URL/attachment-only "%s" → false', (msg) => {
+    expect(requiresReply(msg)).toBe(false);
+  });
+});
+
+// ── SSH / credentials / technical access requests ────────────────────────────
+describe("requiresReply — SSH/credentials/technical access (→ false, ghost stays out)", () => {
+  test.each([
+    ["lemme get the ssh access"],
+    ["can i get ssh access to your server"],
+    ["let me use your VPS creds"],
+    ["could i have your api key"],
+    ["could I get access to the server"],
+  ])('technical access request "%s" → false', (msg) => {
+    expect(requiresReply(msg)).toBe(false);
+  });
+});
+
 describe("requiresReply — reply needed (→ true)", () => {
   test.each([
     // questions

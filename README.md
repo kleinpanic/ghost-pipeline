@@ -5,7 +5,40 @@ Klein's iMessage auto-reply agent. Reads incoming texts via BlueBubbles webhook,
 ## Architecture
 
 ```
-BlueBubbles (collins) ──webhook──▶ ghost.js :18790
+┌─────────────────────────────────────────────────────────────┐
+│  ghost-pipeline (this repo)                                  │
+│  ~/codeWS/JavaScript/ghost-pipeline/src/ghost.js             │
+│  ← symlinked from ~/.openclaw/hooks/ghost.js                 │
+│                                                              │
+│  Webhook server (port 18790):                                │
+│    POST /bluebubbles/message-sent  ← BB webhook              │
+│    POST /action                    ← send/cancel draft       │
+│    POST /approve-contact           ← approve unknown         │
+└───────────┬─────────────────────────────┬────────────────────┘
+            │                             │
+            ▼                             ▼
+┌───────────────────────┐  ┌─────────────────────────────────┐
+│  BlueBubbles MCP      │  │  OC pre-message hook             │
+│  ~/code/bluebubbles-  │  │  ~/.openclaw/hooks/pre-message/  │
+│  mcp (on Collins)     │  │  handler.js                      │
+│  SSH fwd: 18800→18801 │  │  Routes Discord button clicks    │
+│  20 iMessage tools    │  │  to ghost HTTP /action endpoint  │
+│  via mcporter         │  │  (also: autonomous intent        │
+└───────────────────────┘  │   detection — unrelated to ghost)│
+                           └─────────────────────────────────┘
+```
+
+### Dependencies
+- **BlueBubbles server** on a macOS host (configured via `BB_HOST`/`BB_PORT` in `.env`)
+- **BB MCP server** forwarded via SSH tunnel (configured in `.env`)
+- **OpenClaw pre-message hook** (handler.js) bridges Discord button clicks → ghost /action
+- **OpenRouter API** for draft generation (model waterfall)
+- **Discord** channel for draft review (configured via `GHOST_CHANNEL_ID` in `.env`)
+
+## Architecture
+
+```
+BlueBubbles on macOS host ──webhook──▶ ghost.js :18790
                                        │
                               allowlist + quiet hours check
                                        │
@@ -85,8 +118,8 @@ text Klein's mom at 1:25am (MCP returns `from:"me"` not `isFromMe:true`).
 
 ## Known Limits
 
-- **BlueBubbles required**: must be running on `collins` (10.0.0.196:1234)
-- **MCP tunnel dependency**: SSH LocalForward `broklein:18800 → collins:18791` must be up for MCP path; falls back to direct BB HTTP if tunnel is down
+- **BlueBubbles required**: must be running on `collins` (BB_HOST:BB_PORT (see .env))
+- **MCP tunnel dependency**: SSH LocalForward `localhost:18800 → macOS-host:18791` must be up for MCP path; falls back to direct BB HTTP if tunnel is down
 - **PinePhone (Emmet)**: BlueBubbles iMessage delivery to PinePhone numbers is intermittent
 - **No group chat replies**: ghost only handles 1-on-1 iMessage threads; group chats are skipped
 - **Apple Contacts enrichment**: requires `mcporter` + `bb_contact_query` — degrades gracefully if unavailable

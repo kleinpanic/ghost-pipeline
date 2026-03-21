@@ -60,6 +60,17 @@ const FEEDBACK_FILE       = path.join(DATA_DIR, "ghost-feedback.json");
 const GHOST_MEMORIES_DB   = path.join(DATA_DIR, "ghost-memories.db");
 const GHOST_CONV_STATE_FILE = path.join(DATA_DIR, "ghost-conv-state.json");
 
+// ── In-memory race-condition guards ─────────────────────────────────────────
+// Prevents /action cancel from racing with doReactionCheck auto-send
+const cancelledDraftIds = new Set();
+const cancelledDraftTtl = new Map(); // draftId → expiryMs
+
+// Prevents outgoing-message webhook from racing with doReactionCheck auto-send
+const kleinRepliedRecentlyChats = new Map(); // chatGuid|phone → lastReplyMs
+
+// Per-phone alert counter — caps unknown-contact spam at 3 alerts, then auto-deny
+const unknownAlertCounts = new Map(); // normalized phone → count
+
 // ── Embedding provider ───────────────────────────────────────────────────
 const EMBED_PROVIDER = "google";
 const EMBED_MODEL    = "gemini-embedding-001";  // free, 3072 dims (text-embedding-004 not on this key)
@@ -88,6 +99,16 @@ const NEVER_SAY = [
   /\bsend\s+me\s+money\b/i,
   /\bwire\s+transfer\b/i,
   CJK_PATTERN,  // CJK characters — never send Chinese/Japanese/Korean
+  // Identity reveals — if the model admits it's AI despite the system prompt, block it
+  /\bi\s*'?m\s+(an?\s+)?(ai|artificial intelligence|language model|chatbot|bot|llm)\b/i,
+  /\bi\s+am\s+(an?\s+)?(ai|artificial intelligence|language model|chatbot|bot|llm)\b/i,
+  /\bas\s+an?\s+(ai|artificial intelligence|language model)\b/i,
+  /\bmy\s+(creator|developer|programmer)\s+(is|was)\b/i,
+  /\b(openai|anthropic|google|meta)\s+(made|created|trained|built)\s+me\b/i,
+  /\bi\s+was\s+(trained|programmed|created)\s+by\b/i,
+  /\bi\s+don'?t\s+(actually\s+)?have\s+(real\s+)?(feelings|emotions|consciousness)\s+(like|because|since)\s+(humans?|people|you)\b/i,
+  /\bgodmode[\s:]*enabled/i,    // L1B3RT4S output signature
+  /\bsure,?\s+here\s+you\s+are\s+my\s+fren/i,  // L1B3RT4S output signature
 ];
 
 // Secrets
@@ -108,19 +129,24 @@ function loadEnvFile(filename) {
     return result;
   } catch { return {}; }
 }
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || loadEnvFile(".env").GEMINI_API_KEY || "";
+// Gemini key: check process.env, project .env, then fallback to ~/.openclaw/.env
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || loadEnvFile(path.join(__dirname, "..", ".env")).GEMINI_API_KEY || loadEnvFile(".env").GEMINI_API_KEY || "";
 
 // Network
-const PORT    = 18790;
-const BB_HOST = process.env.BB_HOST || "10.0.0.196";  // BB server lives on Collins, not localhost
-const BB_PORT = parseInt(process.env.BB_PORT || "1234");
+// All configurable via .env or environment variables — no hardcoded personal data
+const _env = loadEnvFile(path.join(__dirname, "..", ".env"));
+const env = (key, fallback = "") => process.env[key] || _env[key] || fallback;
+
+const PORT    = parseInt(env("GHOST_PORT", "18790"));
+const BB_HOST = env("BB_HOST", "127.0.0.1");
+const BB_PORT = parseInt(env("BB_PORT", "1234"));
 
 // Discord
-const GHOST_CHANNEL = "1474492563418517515";
+const GHOST_CHANNEL = env("GHOST_CHANNEL_ID");
 
 // Identity
-const OWNER_PHONE_NORMALIZED = "12673479614";
-const KLEIN_DISCORD_USER_ID  = process.env.KLEIN_DISCORD_USER_ID || "";
+const OWNER_PHONE_NORMALIZED = env("OWNER_PHONE");
+const KLEIN_DISCORD_USER_ID  = env("KLEIN_DISCORD_USER_ID");
 
 // Timing
 const DRAFT_DELAY_MS          = 30 * 1000;        // generate draft 30s after message (debounce)
@@ -138,7 +164,8 @@ const CATEGORY_TONE = {
 - Keep replies SHORT — under ~40 characters when possible. One thought per message.
 - Warm but minimal. Acknowledge what they said, don't over-explain.
 - Use: "yeah", "idk", "rlly", "tn", "bc", "omg" — keep it casual but never crude.
-- DO NOT use: "bruh", "lmfao", "nigga", heavy slang, or crude phrases.
+- DO NOT use: "bruh", "lmfao", "nigga", "bet", "fr", "lowkey", "say less", "fs", "fam", "no cap", "finna", "bussin", "it's giving", heavy slang, or crude phrases.
+- Treat family like close family, NOT like a friend group. Warm and casual but never street slang.
 - Capital I — Klein does not lowercase his first-person pronoun with family.
 - High emotional sensitivity — mirror their energy briefly. If venting, sympathize and move on.
 - Never initiate new topics. Just respond to what they said.`,
@@ -166,15 +193,15 @@ const CATEGORY_TONE = {
 };
 
 // ── Phase 2: Spark vllm (local, fastest, strongest)
-const SPARK_BASE_URL = process.env.SPARK_BASE_URL || "http://10.99.1.1:18080/v1";
+const SPARK_BASE_URL = env("SPARK_BASE_URL", "http://127.0.0.1:18080/v1");
 const SPARK_API_KEY  = readSecret(path.join(HOME, ".openclaw", ".spark-key")) ||
-                       "610b70253998918445408763682298af4c1f492fae39c9289f938f55f7c47310";
+                       env("SPARK_API_KEY");
 const SPARK_MODEL_FAST   = "openai/gpt-oss-20b";
 const SPARK_MODEL_STRONG = "openai/gpt-oss-120b";
 
 // ── Phase 4: OpenClaw Ghost Agent  (uses full model chain + workspace context)
 const OC_GATEWAY_TOKEN = readSecret(path.join(HOME, ".openclaw", ".gateway-token")) ||
-                         "c8715f1295db97dfb8970b2189df2a0a0871a251d2e6cef0";
+                         env("OC_GATEWAY_TOKEN");
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -285,6 +312,46 @@ function extractMessageText(eventData) {
       return eventData[key].trim();
   }
   return "";
+}
+
+/**
+ * Sanitize a message before sending to the model:
+ *   - Strips URLs (links should never reach the model — ghost can't act on them)
+ *   - Strips attachment/media markers
+ *   - Strips iMessage file names (IMG_1234.jpg, etc.)
+ *   - Redacts obvious secret patterns (API keys, bearer tokens)
+ * Returns null if nothing substantive remains (media-only message).
+ */
+function sanitizeMessageText(text) {
+  if (!text) return null;
+  let t = text.trim();
+  // Strip URLs — must come first (may be the entire message)
+  t = t.replace(/https?:\/\/\S+/gi, "").trim();
+  // Strip [attachment: …] and <attachment> style markers
+  t = t.replace(/\[attachment:[^\]]*\]/gi, "").trim();
+  t = t.replace(/<attachment[^>]*>/gi, "").trim();
+  // Strip bare media filenames (common in iMessage)
+  t = t.replace(/\b[\w-]+\.(jpg|jpeg|png|gif|webp|heic|heif|mp4|mov|pdf|zip|aac|mp3|m4a)\b/gi, "").trim();
+  // Redact long base64/hex API key-like strings (>40 alphanum chars in a token)
+  t = t.replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+  t = t.replace(/\bBearer\s+[A-Za-z0-9._-]{20,}\b/gi, "Bearer [REDACTED]");
+  // Clean up multiple spaces/newlines left by stripping
+  t = t.replace(/\s+/g, " ").trim();
+  return t || null;
+}
+
+/**
+ * Lightweight sanitize for model prompts — replaces links/media with placeholders
+ * instead of removing them, so the model understands what was there.
+ */
+function sanitizeForModel(text) {
+  if (!text) return text;
+  let t = text.trim();
+  t = t.replace(/https?:\/\/\S+/gi, "[link]");
+  t = t.replace(/\[attachment:[^\]]*\]/gi, "[attachment]");
+  t = t.replace(/\b[\w-]+\.(jpg|jpeg|png|gif|webp|heic|heif|mp4|mov|pdf)\b/gi, "[media]");
+  t = t.replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+  return t.replace(/\s+/g, " ").trim();
 }
 
 function tryParseJson(text) {
@@ -550,17 +617,74 @@ function onContactMessage(phone) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const INJECTION_PATTERNS = [
+  // ── Classic injection ──────────────────────────────────────────────────
   { re: /ignore\s+(all\s+)?previous\s+instructions/i,                label: "ignore previous instructions" },
-  { re: /you\s+are\s+(now\s+)?(an?\s+)?(?:ai|bot|assistant|language model|llm)/i, label: "you are an AI" },
-  { re: /reveal\s+(your\s+)?(system\s+)?prompt/i,                    label: "reveal prompt" },
-  { re: /repeat\s+(back\s+)?(everything|your instructions|your prompt)/i, label: "repeat instructions" },
   { re: /disregard\s+(your\s+)?(previous|prior|all)/i,               label: "disregard previous" },
   { re: /new\s+instructions?:/i,                                     label: "new instructions" },
-  { re: /\[system\]/i,                                               label: "[system] tag" },
-  { re: /as\s+an?\s+(ai|language model|llm)/i,                       label: "as an AI" },
-  { re: /your\s+true\s+(identity|purpose|role)/i,                    label: "true identity" },
-  { re: /print\s+(your\s+)?(instructions?|prompt|rules)/i,           label: "print instructions" },
-  { re: /what\s+(are|were)\s+your\s+(instructions?|rules|guidelines)/i, label: "what are your instructions" },
+  { re: /\bforget\s+(everything|all\s+(previous|prior|your)\s+\w+|your\s+instructions?)\b/i, label: "forget everything" },
+
+  // ── Identity probing / fishing ─────────────────────────────────────────
+  { re: /you\s+are\s+(now\s+)?(an?\s+)?(?:ai|bot|assistant|language model|llm|chatbot|gpt|claude|gemini)/i, label: "you are an AI" },
+  { re: /as\s+an?\s+(ai|language model|llm|chatbot|gpt)/i,           label: "as an AI" },
+  { re: /your\s+true\s+(identity|purpose|role|nature)/i,             label: "true identity" },
+  { re: /\bare\s+you\s+(an?\s+)?(ai|bot|robot|chatbot|language model|artificial|computer|machine|program|automated)/i, label: "identity fishing: are you an AI" },
+  { re: /\bare\s+you\s+(a\s+)?real(\s+person)?\b/i,                   label: "identity fishing: are you real" },
+  { re: /\bare\s+you\s+human\b/i,                                    label: "identity fishing: are you human" },
+  { re: /\bi\s+know\s+you.?re\s+(an?\s+)?(ai|bot|fake|not\s+real)/i, label: "identity fishing: I know you're AI" },
+  { re: /\badmit\s+(you.?re|that\s+you)\s+(an?\s+)?(ai|bot|fake|not\s+real|not\s+human|artificial)/i, label: "identity fishing: admit you're AI" },
+  { re: /\bwho\s+(made|created|built|programmed|trained)\s+you\b/i,  label: "identity fishing: who made you" },
+  { re: /\bwhat\s+(model|version|ai)\s+are\s+you\b/i,               label: "identity fishing: what model are you" },
+  { re: /\bpass\s+(the\s+)?turing\s+test\b/i,                        label: "identity fishing: turing test" },
+
+  // ── Prompt/instruction extraction ──────────────────────────────────────
+  { re: /reveal\s+(your\s+)?(system\s+)?prompt/i,                    label: "reveal prompt" },
+  { re: /repeat\s+(back\s+)?(everything|your instructions|your prompt)/i, label: "repeat instructions" },
+  { re: /print\s+(your\s+)?(instructions?|prompt|rules|system\s+message)/i, label: "print instructions" },
+  { re: /what\s+(are|were)\s+your\s+(instructions?|rules|guidelines|system\s+prompt)/i, label: "what are your instructions" },
+  { re: /\bshow\s+(me\s+)?(your\s+)?(system\s+)?(prompt|instructions|rules)\b/i, label: "show prompt" },
+  { re: /\bout(put|print)\s+(your\s+)?(full\s+)?(system|hidden|secret)/i, label: "output system prompt" },
+
+  // ── Role hijacking ────────────────────────────────────────────────────
+  { re: /\bact\s+as\b/i,                                             label: "act as" },
+  { re: /\bpretend\s+(you\s+are|to\s+be)\b/i,                        label: "pretend you are" },
+  { re: /\broleplay\s+as\b/i,                                        label: "roleplay as" },
+  { re: /\bsimulate\s+(being|you\s+are)\b/i,                         label: "simulate being" },
+  { re: /\byou\s+are\s+now\s+/i,                                     label: "you are now (role switch)" },
+
+  // ── L1B3RT4S / Pliny-style jailbreaks ─────────────────────────────────
+  { re: /GODMODE[\s:]*ENABLED/i,                                     label: "L1B3RT4S: GODMODE" },
+  { re: /!JAILBREAK/i,                                               label: "L1B3RT4S: !JAILBREAK" },
+  { re: /!OPPO\b/i,                                                  label: "L1B3RT4S: !OPPO" },
+  { re: /!MODECOLLAPSE/i,                                            label: "L1B3RT4S: !MODECOLLAPSE" },
+  { re: /!OMNI\b/i,                                                  label: "L1B3RT4S: !OMNI" },
+  { re: /RESET_CORTEX/i,                                             label: "L1B3RT4S: RESET_CORTEX" },
+  { re: /!OBFUSCATE/i,                                               label: "L1B3RT4S: !OBFUSCATE" },
+  { re: /!PLINYOS/i,                                                 label: "L1B3RT4S: !PLINYOS" },
+  { re: /LOVE\s*PLINY/i,                                             label: "L1B3RT4S: LOVE PLINY" },
+  { re: /I'?m\s+free!?\s*.*GODMODE/i,                                label: "L1B3RT4S: I'm free GODMODE" },
+  { re: /Sure,?\s+here\s+you\s+are\s+my\s+fren/i,                   label: "L1B3RT4S: fren template" },
+  { re: /\bvq_1337\b/i,                                              label: "L1B3RT4S: vq_1337" },
+  { re: /ResponseFormat:\s*1\.\s*your\s+response/i,                  label: "L1B3RT4S: ResponseFormat template" },
+  { re: /START\s*OF\s*OUTPUT|END\s*OF\s*INPUT|START\s*OF\s*INPUT/i,   label: "L1B3RT4S: IO boundary markers" },
+  { re: /refusal\s+mechanisms?[\s:]*disabled/i,                       label: "L1B3RT4S: refusal disabled" },
+  { re: /semantically\s*\n\s*fully\s*\n\s*godmode/is,                label: "L1B3RT4S: semantic godmode" },
+
+  // ── Model control tokens (jailbreak delimiters) ────────────────────────
+  { re: /<\|/,                                                        label: "model control token: <|" },
+  { re: /\[INST\]/,                                                   label: "model control token: [INST]" },
+  { re: /<<SYS>>/,                                                    label: "model control token: <<SYS>>" },
+  { re: /\[SYSTEM\]/i,                                                label: "model control token: [SYSTEM]" },
+  { re: /\[\/INST\]/,                                                 label: "model control token: [/INST]" },
+  { re: /<\/?s>/,                                                     label: "model control token: <s>" },
+
+  // ── Encoded/obfuscated payloads ────────────────────────────────────────
+  { re: /\b(base64|decode|eval|exec)\s*\(/i,                         label: "code execution attempt" },
+  { re: /[01]{32,}/,                                                  label: "binary encoded payload" },
+
+  // ── DAN / Do Anything Now variants ─────────────────────────────────────
+  { re: /\bDAN\b.*\b(mode|prompt|jailbreak|enabled)/i,               label: "DAN jailbreak" },
+  { re: /\bdo\s+anything\s+now\b/i,                                  label: "DAN: do anything now" },
+  { re: /\bdeveloper\s+mode\s+(enabled|on|activated)/i,              label: "developer mode" },
 ];
 
 /**
@@ -619,11 +743,13 @@ function loadAllowlist() {
         let labelField = "";
 
         if (rest.length >= 2 && KNOWN_CATEGORIES.has(rest[0].toLowerCase())) {
-          // 5-field format: rest[0]=category, rest[1]=label, rest[2+]=notes
+          // 5-field format: rest[0]=category, rest[1]=description (not an alias)
+          // The 5th field is a human note/description — NOT used as display name.
+          // Always use the name field (m[1]) for 5-field entries.
           category   = rest[0].toLowerCase();
-          labelField = rest[1] || "";
+          labelField = ""; // force alias to fall back to m[1] (the actual name)
         } else {
-          // Legacy 4-field: rest[0]=label, rest[1+]=notes
+          // Legacy 4-field: rest[0]=label (short alias like "Sam J", "Friend")
           labelField = rest[0] || "";
         }
 
@@ -673,9 +799,11 @@ function addToAllowlist(phone, name, { source = "manual", emails = [], birthday 
   const displayName = name || "Unknown";
   const sourceNote = source === "apple_contacts"
     ? `From Apple Contacts ${new Date().toISOString().slice(0, 10)}`
+    : source === "discord_approve"
+    ? "Approved via Discord"
     : `Added ${new Date().toISOString().slice(0, 10)}`;
   const extraNotes = [notes, birthday ? `birthday ${birthday}` : ""].filter(Boolean).join("; ");
-  const line = `- ${displayName} | +${n} | ask | Friend | ${sourceNote}${extraNotes ? " | " + extraNotes : ""}\n`;
+  const line = `- ${displayName} | +${n} | ask | friend | ${sourceNote}${extraNotes ? " | " + extraNotes : ""}\n`;
   const raw    = readFileSafe(CONTACTS_FILE);
   const marker = "<!-- CONTACT_ALLOWLIST_END -->";
   writeFileSafe(CONTACTS_FILE, raw.replace(marker, line + marker));
@@ -747,6 +875,13 @@ function requiresReply(messageText) {
     if (/^(yeah|yep|yup|yea|nah|nope)\b/.test(t)) return false;
   }
 
+  // ── URL-only messages — strip and check if anything meaningful remains ──
+  const withoutUrls = raw.replace(/https?:\/\/\S+/gi, "").replace(/\[(?:attachment|image|photo|video|file)[^\]]*\]/gi, "").trim();
+  if (!withoutUrls) return false;  // message was only URLs/attachments
+
+  // ── iMessage attachment-only markers (no text to respond to) ────────────
+  if (/^\s*(\[?(?:attachment|image|photo|video|file)[^\]]*\]?\s*)+$/i.test(raw)) return false;
+
   // ── Sensitive content — ghost should stay out of these ─────────────────
   // Klein needs to handle these personally; ghost drafting here would be inappropriate.
   const sensitivePatterns = [
@@ -758,6 +893,11 @@ function requiresReply(messageText) {
     /\b(fired|laid off|lost (my )?job)\b/i,
     /\b(arrested|in jail|in prison|bail|lawyer up)\b/i,
     /\b(i love you|love you|i('m| am) in love)\b/i,  // too personal for ghost
+    // Technical/system access requests — Klein handles these, not ghost
+    /\b(ssh|sftp|ftp|scp)\s+(access|into|to|server|cred)/i,
+    /\b(server|machine|box|vps|vm|nas)\s+(access|creds?|password|login)/i,
+    /\b(lemme|let me|can i|could i)\s+(get|have|use)\s+(ssh|access|creds?|your login|your password)/i,
+    /\b(api.?key|secret.?key|private.?key|passphrase)\b/i,
   ];
   if (sensitivePatterns.some(p => p.test(raw))) return false;
 
@@ -857,7 +997,41 @@ function isLikelySpam(phone, text) {
     return true;
   }
 
+  // 7. OTP/2FA/verification code patterns — never reply to auth codes from any sender
+  const otpPatterns = [
+    /\bverification code\b/i,
+    /\bauth(?:entication)? code\b/i,
+    /\bone.?time (?:password|passcode|code|pin)\b/i,
+    /\b(?:is your|as your) (?:verification|auth|sign.?in|security) code\b/i,
+    /\bvalid for \d+ minutes?\b/i,
+    /\bnever (?:share|forward) (?:this|your) (?:code|otp|pin)\b/i,
+    /\bsecurity code\b.{0,60}\d{4,8}/i,
+    /\benter (?:this|the|your) code\b/i,
+    /\bconfirmation code\b/i,
+    /\bsign.?in code\b/i,
+    /\b(?:tiktok|snapchat|instagram|facebook|google|apple|microsoft|twitter|x\.com|venmo|cashapp|paypal|uber|lyft|doordash|coinbase)\b.{0,100}\d{4,8}/i,
+    /\b\d{4,8}\b.{0,60}\b(?:verification|auth|otp|code|expires?|valid)\b/i,
+  ];
+  if (otpPatterns.some(p => p.test(t))) {
+    logSpam(phone, text, "otp_code");
+    return true;
+  }
+
   return false;
+}
+
+/**
+ * Strip URLs and attachment markers from a message before sending to the model.
+ * Prevents links from polluting the draft prompt; ghost should only respond to text.
+ */
+function sanitizeMessageForModel(text) {
+  if (!text) return "";
+  return text
+    .replace(/https?:\/\/\S+/gi, "[link]")
+    .replace(/\[(?:attachment|image|photo|video|file)[^\]]*\]/gi, "[attachment]")
+    .replace(/(\[link\]\s*)+/g, "[link] ")
+    .replace(/(\[attachment\]\s*)+/g, "[attachment] ")
+    .trim();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -984,6 +1158,12 @@ async function resolveChatGuid(phone) {
     }
     const guid = findChatGuidForPhone(`+${normalized}`, allChats) ||
                  findChatGuidForPhone(normalized, allChats);
+    // BUG-2 FIX: if the resolved guid is a group chat, do NOT proceed — require a direct 1:1 match.
+    // Ghost must never send to an individual when the triggering message came from a group chat context.
+    if (guid && guid.includes(";+;")) {
+      log(`resolveChatGuid: resolved guid ${guid} is a group chat — rejecting (groupChatSender protection)`);
+      return null;
+    }
     if (guid) log(`Resolved chatGuid for +${normalized}: ${guid} (scanned ${allChats.length} chats)`);
     else log(`resolveChatGuid: no match for +${normalized} in ${allChats.length} chats`);
     return guid || null;
@@ -1031,7 +1211,8 @@ function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
           const text   = (parsed?.choices?.[0]?.message?.content || "").trim();
           if (text) {
             log(`OR [${model.split("/").pop()}] draft ok`);
-            resolve(text);
+            const usage = parsed?.usage || null;
+            resolve({ text, usage });
           } else {
             // Log actual error if present (e.g. 429 rate limit, provider error)
             const errMsg = parsed?.error?.message || parsed?.error || "empty response";
@@ -1194,22 +1375,26 @@ async function checkSparkAvailable() {
 }
 
 // Ghost draft model waterfall — edit here to switch primary
+// Order matters: first success wins. Prioritize style-following quality over cost.
+// gpt-oss-20b/120b (Spark) are fast but small/code-optimized — poor at style mimicry.
+// claude-haiku is the sweet spot: fast, cheap, excellent at following SOUL/contact context.
+// Ghost draft model waterfall — cheapest first, escalates on failure/rate-limit
 const GHOST_DRAFT_MODELS = [
-  { id: "openai/gpt-oss-120b",                  label: "gpt-oss-120b"     },  // primary: $0.039/M
+  { id: "openai/gpt-oss-120b:free",              label: "gpt-oss-120b"     },  // primary: cheapest ($0.039/M free tier)
   { id: "google/gemini-3.1-flash-lite-preview",  label: "gemini-flash-lite" }, // $0.25/M
   { id: "google/gemini-3-flash-preview",         label: "gemini-flash"     },  // $0.50/M
-  { id: "anthropic/claude-haiku-4.5",            label: "claude-haiku"     },  // $0.80/M fallback
+  { id: "anthropic/claude-haiku-4.5",            label: "claude-haiku"     },  // last resort: $0.80/M
 ];
 
 /**
  * Phase 0.5 — Model Preflight
  * Probes which models are usable RIGHT NOW and returns them in priority order:
- *   ghost-agent → spark-fast → [OR models not on cooldown] → spark-strong
+ *   ghost-agent (if active) → claude-haiku → gemini-flash → gemini-flash-lite → gpt-oss-120b:free
  *
  * Checks:
  * - Ghost agent session: must be active within last 30 min (via OC gateway sessions_list)
- * - Spark: uses checkSparkAvailable() (5-min cache)
  * - OR models: skipped if OR_COOLDOWN_MAP has a future cooldownUntilMs entry
+ * - Spark is intentionally excluded (style/persona task, not code/reasoning)
  */
 async function probeAvailableModels() {
   const available = [];
@@ -1275,11 +1460,8 @@ async function probeAvailableModels() {
     }
   }
 
-  // 2. Spark fast
-  const sparkOk = await checkSparkAvailable();
-  if (sparkOk) available.push("spark-fast");
-
-  // 3. OR models — skip any currently cooling
+  // 2. OR models only — haiku first, then fallbacks.
+  //    Spark is intentionally excluded: Ghost is a style/persona task, not a coding/reasoning task.
   const now = Date.now();
   for (const entry of GHOST_DRAFT_MODELS) {
     const coolUntil = OR_COOLDOWN_MAP.get(entry.id);
@@ -1289,9 +1471,6 @@ async function probeAvailableModels() {
       log(`probeAvailableModels: ${entry.label} cooling (${Math.ceil((coolUntil - now) / 1000)}s remaining)`);
     }
   }
-
-  // 4. Spark strong — last resort
-  if (sparkOk) available.push("spark-strong");
 
   return available;
 }
@@ -1532,9 +1711,11 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
         const orEntry = GHOST_DRAFT_MODELS.find(e => e.label === modelKey);
         if (orEntry) {
           log(`Draft: OR ${orEntry.label}...`);
-          const t = await tryOpenRouter(orEntry.id, systemPrompt, userContent, 25000);
-          const r = safeReturn(t, orEntry.label);
-          if (r) return r;
+          const orResult = await tryOpenRouter(orEntry.id, systemPrompt, userContent, 25000);
+          // tryOpenRouter returns { text, usage } on success, null on failure
+          const rawText = orResult?.text ?? (typeof orResult === "string" ? orResult : null);
+          const r = safeReturn(rawText, orEntry.label);
+          if (r) return { ...r, usage: orResult?.usage || null };
         }
         break;
       }
@@ -1567,10 +1748,28 @@ function loadContactMemory(phone) {
   return "";
 }
 
+/**
+ * Redact secret-like patterns from context files before injecting into the model prompt.
+ * Defense-in-depth: prevents accidental API key / token leakage from workspace files.
+ * NOTE: ghost.js never reads .zshenv or arbitrary .env files — only specific known paths.
+ */
+function sanitizeSecretsFromContext(text) {
+  if (!text) return "";
+  return text
+    // Long hex strings (32+ chars — API keys, tokens)
+    .replace(/\b[0-9a-f]{32,}\b/gi, "[REDACTED_HEX]")
+    // OpenAI / Anthropic style API keys
+    .replace(/\bsk-[A-Za-z0-9\-_]{20,}\b/g, "[REDACTED_KEY]")
+    // Bearer tokens in text
+    .replace(/\bBearer [A-Za-z0-9\-_=.]+/g, "Bearer [REDACTED]")
+    // JWT-like strings (3 base64 segments)
+    .replace(/\bey[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\b/g, "[REDACTED_JWT]");
+}
+
 async function buildSystemPrompt(contactName, contactPhone, triggerMessage = "") {
-  const soul    = readFileSafe(SOUL_FILE).trim();
-  const voice   = readFileSafe(VOICE_PROFILE_FILE).trim();
-  const contact = loadContactMemory(contactPhone);
+  const soul    = sanitizeSecretsFromContext(readFileSafe(SOUL_FILE).trim());
+  const voice   = sanitizeSecretsFromContext(readFileSafe(VOICE_PROFILE_FILE).trim());
+  const contact = sanitizeSecretsFromContext(loadContactMemory(contactPhone));
 
   const { numToCategory } = loadContactsMap();
   const category     = numToCategory[normalizePhone(contactPhone)] || "friend";
@@ -1639,7 +1838,10 @@ function buildUserContent(contactName, messageText, recentMessages, triggerArriv
     .map(m => `${(m.isFromMe === true || m.from === "me") ? "Klein" : contactName}: ${m.text.trim().slice(0, 200)}`)
     .join("\n");
 
-  return `Recent conversation (oldest → newest):\n${history || "(no prior messages)"}\n\nLatest message from ${contactName}:\n"${messageText}"\n\nReply as Klein:`;
+  // Sanitize the trigger message before sending to model: strip URLs and attachment markers.
+  // Ghost should respond only to the text content, not links or media placeholders.
+  const sanitizedMessage = sanitizeMessageForModel(messageText);
+  return `Recent conversation (oldest → newest):\n${history || "(no prior messages)"}\n\nLatest message from ${contactName}:\n"${sanitizedMessage}"\n\nReply as Klein:`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1680,7 +1882,7 @@ async function discordDelete(channelId, messageId) {
   }
 }
 
-// In-memory map of unanswered unknown-contact alerts: phone → { messageId, postedAt, phone, messageText, contactName, source, enrichment }
+// In-memory map of unanswered unknown-contact alerts: phone → { messageId, postedAt, alertedAt, alertCount, phone, messageText, contactName, source, enrichment }
 const pendingUnknownAlerts = new Map();
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1734,7 +1936,12 @@ async function postDraftToDiscord(draftResult, meta) {
   if (hasUsableDraft) {
     const cooldownMin = Math.round((autoSendMs || AUTO_SEND_WINDOW_MS) / 60000 * 10) / 10;
     const draftLines  = draftResult.text.split("\n").map(l => `> ${l}`).join("\n");
-    content += `\n**Draft** · _${draftResult.model}_ · ${convMode}\n${draftLines}\n`;
+    // Show token usage from OR response (prompt_tokens → completion_tokens)
+    const usage = draftResult.usage;
+    const usageStr = usage
+      ? ` · ${usage.prompt_tokens || 0}↑${usage.completion_tokens || 0}↓tok`
+      : "";
+    content += `\n**Draft** · _${draftResult.model}_${usageStr} · ${convMode}\n${draftLines}\n`;
     content += `\n⏱️ Auto-sends in ${cooldownMin} min · \`${draftId}\``;
   } else if (isSafetyBlocked) {
     content += `\n⚠️ All draft tiers failed content safety — reply manually.`;
@@ -1825,7 +2032,7 @@ async function postDraftToDiscord(draftResult, meta) {
           log(`postDraftToDiscord: failed to fetch Discord msg for shortId extraction — ${err.message.slice(0, 80)}`);
         }
       } else {
-        log("postDraftToDiscord: OC gateway returned no messageId — falling back to discordPost");
+        log(`postDraftToDiscord: OC gateway returned no messageId — falling back to discordPost (raw buttons will NOT be registered; clicks will show 'expired'). OC resp: ${JSON.stringify(ocResp).slice(0, 200)}`);
       }
     } catch (err) {
       log(`postDraftToDiscord: OC gateway error (${err.message.slice(0, 80)}) — falling back`);
@@ -1864,7 +2071,7 @@ async function postDraftToDiscord(draftResult, meta) {
   }
 }
 
-async function postUnknownAlert(phone, messageText, contactName, { source = "unknown", enrichment = null } = {}) {
+async function postUnknownAlert(phone, messageText, contactName, { source = "unknown", enrichment = null, alertCount = 1 } = {}) {
   const n        = normalizePhone(phone);
   const inApple  = source === "apple_contacts";
   const nameDisp = inApple ? `**${contactName}** (+${n})` : `+${n}`;
@@ -1877,30 +2084,67 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
   content += `${sourceLine}\n`;
   if (enrichment?.emails?.length) content += `📧 ${enrichment.emails.slice(0,2).join(", ")}\n`;
   content += `💬 "${(messageText || "").slice(0, 200)}"`;
+  if (alertCount > 1) content += `\n_Alert #${alertCount} — ${3 - alertCount + 1} remaining before auto-deny_`;
 
-  const result = await discordPost(GHOST_CHANNEL, {
-    content,
-    components: [{
-      type: 1,
-      components: [
-        { type: 2, style: 3, label: "Approve", custom_id: `occomp:cid=approve_${phone}` },
-        { type: 2, style: 4, label: "Deny",    custom_id: `occomp:cid=deny_${phone}`    },
-      ],
-    }],
-  });
+  // Post via OC gateway with reusable=true so buttons never expire.
+  // Labels encode the phone so handler.js can parse them without a registry lookup.
+  let messageId = null;
+  if (OC_GATEWAY_TOKEN) {
+    try {
+      const ocResp = await ocGatewayPost("message", {
+        action:  "send",
+        channel: "discord",
+        target:  `channel:${GHOST_CHANNEL}`,
+        message: content,
+        components: {
+          reusable: true,
+          blocks: [{
+            type:    "actions",
+            buttons: [
+              { label: `✅ Approve · ${n}`, style: "success" },
+              { label: `❌ Deny · ${n}`,    style: "danger"  },
+            ],
+          }],
+        },
+      });
+      messageId = ocResp?.result?.details?.result?.messageId
+        || ocResp?.details?.result?.messageId
+        || null;
+      if (!messageId) {
+        try {
+          const tc = ocResp?.result?.content?.[0]?.text;
+          messageId = JSON.parse(tc || "{}")?.result?.messageId || null;
+        } catch {}
+      }
+    } catch (err) {
+      log(`postUnknownAlert: OC gateway failed (${err.message.slice(0, 80)}) — falling back`);
+    }
+  }
 
-  // Track so we can auto-repost before the 15-min Discord interaction token expires
-  if (result?.id) {
+  // Fallback to raw Discord if OC gateway unavailable
+  if (!messageId) {
+    const result = await discordPost(GHOST_CHANNEL, { content });
+    messageId = result?.id || null;
+    if (messageId) log(`postUnknownAlert: OC gateway unavailable — posted without buttons (fallback). Buttons will not work.`);
+  }
+
+  // Track for repost limiting (max MAX_UNKNOWN_ALERTS per phone, then auto-deny)
+  if (messageId) {
     const nowTs = Date.now();
-    pendingUnknownAlerts.set(phone, {
-      messageId: result.id, postedAt: nowTs, alertedAt: nowTs,
-      phone, messageText, contactName, source, enrichment,
+    pendingUnknownAlerts.set(n, {
+      messageId, postedAt: nowTs, alertedAt: nowTs,
+      alertCount,
+      phone: n, messageText, contactName, source, enrichment,
     });
   }
 }
 
+// Max times we'll re-alert for the same unknown number before auto-denying them
+const MAX_UNKNOWN_ALERTS = 3;
+
 // Refresh unknown-contact alerts before Discord's 15-min interaction token expires.
 // Runs every 12 min; deletes stale message + reposts fresh one for any unanswered alert.
+// After MAX_UNKNOWN_ALERTS reposts, auto-denies the contact to stop the spam loop.
 async function refreshUnknownAlerts() {
   if (!pendingUnknownAlerts.size) return;
   const REFRESH_MS = 12 * 60 * 1000; // 12 minutes
@@ -1908,12 +2152,32 @@ async function refreshUnknownAlerts() {
   // Snapshot stale entries BEFORE iterating — prevents re-visiting newly added entries
   const stale = [...pendingUnknownAlerts.entries()].filter(([, e]) => now - e.postedAt >= REFRESH_MS);
   for (const [phone, entry] of stale) {
-    log(`Refreshing unknown-contact alert for +${normalizePhone(phone)} (token age >${REFRESH_MS / 60000}m)`);
-    if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId);
+    const n = normalizePhone(phone);
+    // If the contact was added to the allowlist since the alert was first posted, cancel it
+    if (isAllowed(`+${n}`)) {
+      log(`Unknown-contact alert for +${n} is now on allowlist — cancelling stale alert`);
+      if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
+      pendingUnknownAlerts.delete(phone);
+      continue;
+    }
+    const nextCount = (entry.alertCount || 1) + 1;
+    // Max alerts reached — auto-deny to stop the spam loop
+    if (nextCount > MAX_UNKNOWN_ALERTS) {
+      log(`Unknown contact +${n} hit max alert limit (${MAX_UNKNOWN_ALERTS}) — auto-denying`);
+      addToDenylist(n);
+      if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
+      pendingUnknownAlerts.delete(phone);
+      discordPost(GHOST_CHANNEL, {
+        content: `🚫 Auto-denied \`+${n}\` after ${MAX_UNKNOWN_ALERTS} unanswered alerts. Use \`/approve-contact +${n}\` to override.`,
+      }).catch(() => {});
+      continue;
+    }
+    log(`Refreshing unknown-contact alert for +${n} (alert #${nextCount}/${MAX_UNKNOWN_ALERTS})`);
+    if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
     pendingUnknownAlerts.delete(phone);
-    // Repost fresh — re-adds to the map with a new postedAt
+    // Repost fresh — re-adds to the map with a new postedAt and incremented alertCount
     await postUnknownAlert(phone, entry.messageText, entry.contactName, {
-      source: entry.source, enrichment: entry.enrichment,
+      source: entry.source, enrichment: entry.enrichment, alertCount: nextCount,
     });
   }
 }
@@ -1971,12 +2235,12 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
   if (!injCheck.safe) {
     const { numToAlias, numToName } = loadContactsMap();
     const contactName = numToAlias[normalized] || numToName[normalized] || `+${normalized}`;
-    log(`INJECTION ATTEMPT from ${contactName} (${normalized}): ${injCheck.reason}`);
-    // Fire-and-forget Discord alert
+    log(`Prompt injection detected from ${contactName}: ${(messageText || "").slice(0, 80)}`);
+    // Fire-and-forget Discord alert — include message text so Klein can see the attempt
     discordPost(GHOST_CHANNEL, {
-      content: `⚠️ Prompt injection attempt from **${contactName}** (\`+${normalized}\`): ${injCheck.reason}`,
+      content: `⚠️ Prompt injection attempt from **${contactName}**: \`${(messageText || "").slice(0, 100)}\``,
     }).catch(() => {});
-    return { ok: false, reason: "injection" };
+    return { ok: false, reason: "prompt_injection" };
   }
 
   // 1. requiresReply — skip no-op acks, emoji-only, tapbacks, sensitive content
@@ -2033,8 +2297,9 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
   }
 
   // 5. isGroupChatGuid — skip group threads
+  // CRITICAL: Ghost must never reply to an individual if the message came from a group chat context.
   if (isGroupChatGuid(chatGuid, eventData)) {
-    return { ok: false, reason: "group_chat" };
+    return { ok: false, reason: "group_chat", groupChatSender: true };
   }
 
   // 6. isQuietHours — per-contact-category quiet window
@@ -2071,6 +2336,7 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
 
 // In-memory map: key (chatGuid|phone) → { contact, contactName, messageText, chatGuid, arrivedAt, timeoutId, contextMessages }
 const pendingMessages = new Map();
+// cancelledDraftIds declared at top of file (line ~65)
 
 async function checkAndDraft(key) {
   const entry = pendingMessages.get(key);
@@ -2194,7 +2460,9 @@ async function kleinRepliedSince(chatGuid, sinceIso) {
       "call", "bluebubbles.bb_get_chat_messages", "--args", argsJson,
     ], { timeout: 15000 });
     const data     = tryParseJson(stdout);
-    const messages = Array.isArray(data?.data) ? data.data : [];
+    // mcporter (MCP path) returns { messages: [...] } — use extractBBList to handle all formats
+    // BB direct HTTP returns { data: [...] } — extractBBList handles that too
+    const messages = extractBBList(data);
     // BB direct HTTP uses isFromMe:true; mcporter/MCP uses from:"me"
     // normalizeTs: BB timestamps may be in seconds or ms; compare consistently in ms.
     return messages.some(m => (m.isFromMe === true || m.from === "me") && normalizeTs(m.dateCreated || 0) > sinceMs);
@@ -2291,7 +2559,7 @@ async function doReactionCheck() {
 
     for (const phone of approveQ) {
       let name = "Unknown";
-      let source = "manual";
+      let source = "discord_approve";  // BUG-4 FIX: writes "Approved via Discord" note to CONTACTS.md
       let enrichOpts = {};
       try {
         const r = spawnSync("mcporter", [
@@ -2304,7 +2572,8 @@ async function doReactionCheck() {
             [`${cqData.firstName || ""}`, `${cqData.lastName || ""}`].filter(Boolean).join(" ").trim();
           if (resolved) {
             name   = resolved;
-            source = "apple_contacts";
+            // Keep source as "discord_approve" — always write "Approved via Discord" to CONTACTS.md.
+            // Still pull name/emails/birthday from Apple Contacts for richer entries.
             enrichOpts = {
               emails:   (cqData.emails || []).map(e => e.address).filter(Boolean),
               birthday: cqData.birthday || null,
@@ -2348,6 +2617,13 @@ async function doReactionCheck() {
       // No button action yet — check if auto-send window has elapsed
       const autoSendMs = draft.autoSendMs || AUTO_SEND_WINDOW_MS;
       if (autoSendMs > 0 && age >= autoSendMs) {
+        // Race guard: if cancelled via HTTP /action or outgoing webhook WHILE this check was running
+        if (cancelledDraftIds.has(draftId)) {
+          log(`Auto-send: draft ${draftId} was cancelled in-memory — skipping race victim`);
+          logFeedback(draft, "cancelled");
+          cancelledDraftIds.delete(draftId);
+          continue;
+        }
         if (alreadySentThisCycle.has(draft.chatGuid)) {
           log(`Auto-send: skipping older draft for ${contactName} (newer draft already sent this cycle)`);
           logFeedback(draft, "superseded");
@@ -2447,6 +2723,8 @@ function createServer() {
         if (draftIdx === -1) return send(404, { ok: false, error: "draft not found" });
         const draft = drafts[draftIdx];
         if (action === "cancel") {
+          // Register in-memory cancellation FIRST — prevents doReactionCheck race
+          cancelledDraftIds.add(draftId);
           logFeedback(draft, "cancelled");
           drafts.splice(draftIdx, 1);
           savePendingDrafts(drafts);
@@ -2493,13 +2771,40 @@ function createServer() {
         // Outgoing: Klein sent a message — cancel pending draft for this chat
         if (isFromMe || normalized === OWNER_PHONE_NORMALIZED) {
           const key = chatGuid || normalized;
+          let cancelled = false;
+
+          // 1. Cancel in-memory pending (pre-draft, within 30s window)
           if (key && pendingMessages.has(key)) {
             clearTimeout(pendingMessages.get(key).timeoutId);
             pendingMessages.delete(key);
-            log(`Klein replied to ${key} — cancelled pending draft`);
-            return send(200, { ok: true, action: "draft_cancelled" });
+            log(`Klein replied to ${key} — cancelled in-memory pending draft`);
+            cancelled = true;
           }
-          return send(200, { ok: true, action: "outgoing_noop" });
+
+          // 2. Cancel any already-posted draft for this chat (in ghost-pending-drafts.json)
+          //    This fires when Klein replies AFTER the draft was already posted to Discord.
+          const postedDrafts = loadPendingDrafts();
+          const toCancel = postedDrafts.filter(d =>
+            d.chatGuid === key ||
+            d.chatGuid === chatGuid ||
+            normalizePhone(d.contact) === normalized
+          );
+          if (toCancel.length > 0) {
+            const remaining = postedDrafts.filter(d => !toCancel.includes(d));
+            savePendingDrafts(remaining);
+            for (const draft of toCancel) {
+              // Register in-memory cancellation — closes the race with doReactionCheck
+              cancelledDraftIds.add(draft.draftId);
+              log(`Klein outgoing — cancelled posted draft ${draft.draftId} for ${draft.contactName}`);
+              logFeedback(draft, "auto-cancelled-klein-replied");
+              discordPost(GHOST_CHANNEL, {
+                content: `↩️ Cancelled draft for **${draft.contactName}** — Klein already replied.`,
+              }).catch(() => {});
+            }
+            cancelled = true;
+          }
+
+          return send(200, { ok: true, action: cancelled ? "draft_cancelled" : "outgoing_noop" });
         }
 
         if (!contact || !normalized) return send(200, { ok: true, action: "drop", reason: "no_contact" });
@@ -2606,13 +2911,30 @@ function extractBBList(data) {
 }
 
 /**
- * Returns true if the chatGuid (or event participants) indicate a group chat.
+ * Returns true if the chatGuid (or event data) indicate a group chat.
  * Direct messages use ";-;" separator across all protocols (iMessage, SMS, iMessageLite, RCS).
  * Group chats use ";+;" separator (e.g. "iMessage;+;chat123456789").
+ *
+ * BB sometimes fires group-chat webhooks with the individual sender's handle rather than
+ * the group chatGuid — so we also check participants, chats array, and groupName field.
  */
 function isGroupChatGuid(chatGuid, eventData = {}) {
-  if (chatGuid) return chatGuid.includes(";+;");
-  return Array.isArray(eventData.participants) && eventData.participants.length > 1;
+  // Primary: chatGuid format (most reliable when present)
+  if (chatGuid && chatGuid.includes(";+;")) return true;
+
+  // Secondary: participants list on the event itself (> 1 means group)
+  if (Array.isArray(eventData.participants) && eventData.participants.length > 1) return true;
+
+  // Tertiary: BB sometimes embeds a `chats` array — if any entry is a group chat, block it
+  if (Array.isArray(eventData.chats)) {
+    if (eventData.chats.some(c => (c.guid || c.chatGuid || "").includes(";+;"))) return true;
+    if (eventData.chats.some(c => Array.isArray(c.participants) && c.participants.length > 1)) return true;
+  }
+
+  // Quaternary: explicit group name field (BB sets this for named group chats)
+  if (eventData.groupName || eventData.group_name) return true;
+
+  return false;
 }
 
 function findChatsForPhone(phone, allChats) {

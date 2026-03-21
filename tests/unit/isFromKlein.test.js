@@ -13,7 +13,7 @@ describe("isFromKlein", () => {
     expect(isFromKlein({ isFromMe: false })).toBe(false);
   });
   test("from: phone number → false", () => {
-    expect(isFromKlein({ from: "+14847070468" })).toBe(false);
+    expect(isFromKlein({ from: "+15558887777" })).toBe(false);
   });
   test("empty object → false", () => {
     expect(isFromKlein({})).toBe(false);

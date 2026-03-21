@@ -1,19 +1,29 @@
 /**
  * Contact parser tests — verifies CONTACTS.md 5-field format parses correctly.
  * Uses the real CONTACTS.md (workspace-ghost/governance/CONTACTS.md).
+ * Skipped in CI (requires local CONTACTS.md with real contact data).
  */
 
+const fs = require("fs");
+const path = require("path");
 const { loadAllowlist, loadContactsMap } = require("../../src/ghost.js");
 
-describe("loadAllowlist — 5-field format parsing", () => {
+const CONTACTS_FILE = path.join(
+  process.env.HOME, ".openclaw", "workspace-ghost", "governance", "CONTACTS.md"
+);
+const hasContacts = fs.existsSync(CONTACTS_FILE);
+
+const describeIfContacts = hasContacts ? describe : describe.skip;
+
+describeIfContacts("loadAllowlist — 5-field format parsing", () => {
   let contacts;
 
   beforeAll(() => {
     contacts = loadAllowlist();
   });
 
-  test("returns 10 contacts", () => {
-    expect(contacts.length).toBe(10);
+  test("returns 11 contacts", () => {
+    expect(contacts.length).toBe(11);
   });
 
   test("Brenda parses as family_close with alias Brenda", () => {
@@ -50,14 +60,29 @@ describe("loadAllowlist — 5-field format parsing", () => {
     expect(c.alias).toBe("Jacob");
   });
 
+  test("Frat Phone alias is 'Frat Phone', not the description field", () => {
+    const c = contacts.find(c => c.phone === "15405105477");
+    expect(c).toBeDefined();
+    expect(c.category).toBe("close_friend");
+    expect(c.alias).toBe("Frat Phone");
+    expect(c.alias).not.toContain("Android");
+    expect(c.alias).not.toContain("live test");
+  });
+
   test("no contact has alias 'family_close' or 'close_friend' (category not leaking into alias)", () => {
     for (const c of contacts) {
-      expect(c.alias).not.toMatch(/family_close|close_friend|friend|acquaintance/);
+      expect(c.alias).not.toMatch(/family_close|close_friend|acquaintance/);
+    }
+  });
+
+  test("no contact alias is a long description (5-field description not leaking into alias)", () => {
+    for (const c of contacts) {
+      expect(c.alias.length).toBeLessThan(30);
     }
   });
 });
 
-describe("loadContactsMap — numToCategory populated", () => {
+describeIfContacts("loadContactsMap — numToCategory populated", () => {
   test("returns numToCategory for all contacts", () => {
     const { numToCategory } = loadContactsMap();
     expect(numToCategory["14847070468"]).toBe("family_close"); // Brenda

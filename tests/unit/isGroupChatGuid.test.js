@@ -10,15 +10,15 @@ const { isGroupChatGuid } = require("../../src/ghost.js");
 
 describe("isGroupChatGuid — direct message GUIDs (should return false)", () => {
   test("iMessage direct", () => {
-    expect(isGroupChatGuid("iMessage;-;+14846342876")).toBe(false);
+    expect(isGroupChatGuid("iMessage;-;+15551234567")).toBe(false);
   });
 
   test("SMS direct", () => {
-    expect(isGroupChatGuid("SMS;-;+14847070468")).toBe(false);
+    expect(isGroupChatGuid("SMS;-;+15559876543")).toBe(false);
   });
 
-  test("iMessageLite direct (Dad's protocol)", () => {
-    expect(isGroupChatGuid("iMessageLite;-;+14846342876")).toBe(false);
+  test("iMessageLite direct", () => {
+    expect(isGroupChatGuid("iMessageLite;-;+15551234567")).toBe(false);
   });
 
   test("RCS direct", () => {

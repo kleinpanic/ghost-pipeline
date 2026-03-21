@@ -18,7 +18,7 @@ describe("REGRESSION: isFromKlein detects both BB and MCP field formats", () => 
   });
 
   test("Incoming message: from:phone → NOT Klein", () => {
-    expect(isFromKlein({ from: "+14847070468", text: "hi" })).toBe(false);
+    expect(isFromKlein({ from: "+15558887777", text: "hi" })).toBe(false);
   });
 
   test("Incoming message: isFromMe:false → NOT Klein", () => {

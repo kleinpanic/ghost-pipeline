@@ -10,7 +10,7 @@
 
 const { findChatsForPhone, findChatGuidForPhone } = require("../../src/ghost.js");
 
-const PHONE = "14846342876"; // Dad
+const PHONE = "15551234567"; // TestContact
 
 function makeChat(guid, participants = []) {
   return { guid, participants, chatIdentifier: guid.split(";").pop() };

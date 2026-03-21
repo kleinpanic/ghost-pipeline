@@ -72,6 +72,24 @@ describe("isLikelySpam — is spam (→ true)", () => {
   });
 });
 
+// ── OTP/2FA/verification code patterns ──────────────────────────────────────
+describe("isLikelySpam — OTP/2FA codes (→ true)", () => {
+  test.each([
+    ["[TikTok] 659540 is your verification code, valid for 5 minutes. To keep your account safe, never forward this code."],
+    ["Your Google verification code is 847291"],
+    ["Apple ID verification code: 123456"],
+    ["Your one-time password is 9876"],
+    ["Use 443210 as your sign-in code for Microsoft"],
+    ["Enter this code to continue: 555123"],
+    ["Your Venmo confirmation code is 7890"],
+    ["Uber: 329154 is your verification code. Never share this code."],
+    ["Your security code is 482931 — valid for 10 minutes"],
+    ["PayPal: Your verification code is 112233. It's valid for 10 minutes."],
+  ])('OTP message "%s" → spam', (text) => {
+    expect(isLikelySpam("19015551234", text)).toBe(true);
+  });
+});
+
 describe("isLikelySpam — NOT spam (→ false)", () => {
   test.each([
     ["hey what's up"],
