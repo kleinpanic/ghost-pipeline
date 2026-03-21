@@ -117,9 +117,20 @@ const OPENROUTER_API_KEY = readSecret(path.join(HOME, ".config", "openrouter", "
 const DISCORD_BOT_TOKEN  = readSecret(path.join(HOME, ".config", "discord", "bot-token"));
 
 // GEMINI_API_KEY — loaded from env or .env file
+/**
+ * Load env vars from a specific .env file.
+ * SECURITY: only call with trusted paths (project .env or ~/.openclaw/.env).
+ * Never call with user-supplied paths or shell RC files (.zshenv, .bashrc, etc.).
+ */
 function loadEnvFile(filename) {
   try {
     const envPath = path.isAbsolute(filename) ? filename : path.join(HOME, ".openclaw", filename);
+    // Safeguard: refuse to read shell RC/profile files that may contain unrelated secrets
+    const base = path.basename(envPath);
+    if ([".zshenv", ".zshrc", ".bashrc", ".bash_profile", ".profile", ".zprofile"].includes(base)) {
+      log(`loadEnvFile: refused to read shell RC file: ${envPath}`);
+      return {};
+    }
     const raw = fs.readFileSync(envPath, "utf8");
     const result = {};
     for (const line of raw.split("\n")) {
@@ -893,10 +904,13 @@ function requiresReply(messageText) {
     /\b(fired|laid off|lost (my )?job)\b/i,
     /\b(arrested|in jail|in prison|bail|lawyer up)\b/i,
     /\b(i love you|love you|i('m| am) in love)\b/i,  // too personal for ghost
-    // Technical/system access requests — Klein handles these, not ghost
-    /\b(ssh|sftp|ftp|scp)\s+(access|into|to|server|cred)/i,
+    // ── Technical/system access requests — Klein must decide these, not ghost ──
+    /\b(ssh|sftp|ftp|scp)\s+(access|into|to|server|key|creds?)/i,
+    /\b(send|give|share)\s+.{0,30}\bssh\s+key\b/i,
     /\b(server|machine|box|vps|vm|nas)\s+(access|creds?|password|login)/i,
-    /\b(lemme|let me|can i|could i)\s+(get|have|use)\s+(ssh|access|creds?|your login|your password)/i,
+    /\b(lemme|let me|can i|could i|could i have|can i get)\s+(get|have|use)?\s*(ssh|access|creds?|your login|your password)/i,
+    /\bremote\s+(access|into|desktop)\b/i,
+    /\bvpn\s+(access|config|credentials?|creds?|setup)\b/i,
     /\b(api.?key|secret.?key|private.?key|passphrase)\b/i,
   ];
   if (sensitivePatterns.some(p => p.test(raw))) return false;
@@ -1005,6 +1019,9 @@ function isLikelySpam(phone, text) {
     /\b(?:is your|as your) (?:verification|auth|sign.?in|security) code\b/i,
     /\bvalid for \d+ minutes?\b/i,
     /\bnever (?:share|forward) (?:this|your) (?:code|otp|pin)\b/i,
+    /\bdo not (?:share|forward) (?:this|your) (?:code|otp|pin)\b/i,
+    /\byour code is[:\s]+\d{4,8}\b/i,
+    /\bcode[:\s]+\d{4,8}\b.{0,30}\bdo not\b/i,
     /\bsecurity code\b.{0,60}\d{4,8}/i,
     /\benter (?:this|the|your) code\b/i,
     /\bconfirmation code\b/i,
@@ -1936,11 +1953,19 @@ async function postDraftToDiscord(draftResult, meta) {
   if (hasUsableDraft) {
     const cooldownMin = Math.round((autoSendMs || AUTO_SEND_WINDOW_MS) / 60000 * 10) / 10;
     const draftLines  = draftResult.text.split("\n").map(l => `> ${l}`).join("\n");
-    // Show token usage from OR response (prompt_tokens → completion_tokens)
+    // Show token usage + cost from OR response
     const usage = draftResult.usage;
-    const usageStr = usage
-      ? ` · ${usage.prompt_tokens || 0}↑${usage.completion_tokens || 0}↓tok`
-      : "";
+    let usageStr = "";
+    if (usage) {
+      const pt = usage.prompt_tokens || 0;
+      const ct = usage.completion_tokens || 0;
+      const tt = usage.total_tokens || (pt + ct);
+      // OR returns cost in USD as usage.cost (some models) or generation.cost
+      const cost = typeof usage.cost === "number" ? usage.cost
+        : typeof usage?.["x-ratelimit-cost"] === "number" ? usage["x-ratelimit-cost"] : null;
+      const costStr = cost !== null ? ` · $${cost.toFixed(5)}` : "";
+      usageStr = ` · ${tt}tok (↑${pt} ↓${ct})${costStr}`;
+    }
     content += `\n**Draft** · _${draftResult.model}_${usageStr} · ${convMode}\n${draftLines}\n`;
     content += `\n⏱️ Auto-sends in ${cooldownMin} min · \`${draftId}\``;
   } else if (isSafetyBlocked) {
@@ -2130,10 +2155,13 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
 
   // Track for repost limiting (max MAX_UNKNOWN_ALERTS per phone, then auto-deny)
   if (messageId) {
-    const nowTs = Date.now();
+    const nowTs   = Date.now();
+    // ocGateway=true → buttons are reusable, no need to refresh them
+    const ocGateway = !!(OC_GATEWAY_TOKEN && messageId);
     pendingUnknownAlerts.set(n, {
       messageId, postedAt: nowTs, alertedAt: nowTs,
       alertCount,
+      ocGateway,
       phone: n, messageText, contactName, source, enrichment,
     });
   }
@@ -2150,7 +2178,11 @@ async function refreshUnknownAlerts() {
   const REFRESH_MS = 12 * 60 * 1000; // 12 minutes
   const now = Date.now();
   // Snapshot stale entries BEFORE iterating — prevents re-visiting newly added entries
-  const stale = [...pendingUnknownAlerts.entries()].filter(([, e]) => now - e.postedAt >= REFRESH_MS);
+  // Skip entries posted via OC gateway: reusable=true buttons persist indefinitely, no refresh needed
+  const stale = [...pendingUnknownAlerts.entries()].filter(([, e]) => {
+    if (e.ocGateway) return false;  // OC reusable buttons — never need refreshing
+    return now - e.postedAt >= REFRESH_MS;
+  });
   for (const [phone, entry] of stale) {
     const n = normalizePhone(phone);
     // If the contact was added to the allowlist since the alert was first posted, cancel it
@@ -2243,13 +2275,22 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
     return { ok: false, reason: "prompt_injection" };
   }
 
+  // 0.5. Sanitize — strip URLs, attachment markers, media filenames.
+  // If nothing substantive remains (pure media message), skip silently.
+  const sanitizedText = sanitizeMessageText(messageText);
+  if (!sanitizedText) {
+    log(`Media/URL-only message from +${normalized} — skipping (no text content)`);
+    return { ok: false, reason: "media_only" };
+  }
+
   // 1. requiresReply — skip no-op acks, emoji-only, tapbacks, sensitive content
-  if (!requiresReply(messageText)) {
+  // Use sanitized text so URL-only or attachment-only messages don't get drafted
+  if (!requiresReply(sanitizedText)) {
     return { ok: false, reason: "no_reply_needed" };
   }
 
   // 2. isLikelySpam — keyword, url, short-code, rate-limit checks
-  if (isLikelySpam(normalized, messageText)) {
+  if (isLikelySpam(normalized, sanitizedText)) {
     return { ok: false, reason: "spam" };
   }
 
@@ -2327,7 +2368,7 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
     return { ok: false, reason: "klein_recently_active" };
   }
 
-  return { ok: true, context: { messages, contactName, category } };
+  return { ok: true, context: { messages, contactName, category, sanitizedText } };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2341,7 +2382,9 @@ const pendingMessages = new Map();
 async function checkAndDraft(key) {
   const entry = pendingMessages.get(key);
   if (!entry) return;
-  let { contact, contactName, messageText, chatGuid, arrivedAt, autoSendMs } = entry;
+  let { contact, contactName, messageText, sanitizedText, chatGuid, arrivedAt, autoSendMs } = entry;
+  // Use sanitized text for model (strips links, media, secrets) — show original in Discord
+  const modelText = sanitizedText || messageText;
   pendingMessages.delete(key);
 
   log(`checkAndDraft: ${contactName} (${key})`);
@@ -2388,8 +2431,9 @@ async function checkAndDraft(key) {
   }
 
   // Build prompt + generate via full failover chain
-  const systemPrompt = await buildSystemPrompt(contactName, contact, messageText);
-  const userContent  = buildUserContent(contactName, messageText, contextMessages, arrivedAt);
+  // Use sanitized (model-safe) text for prompt building; original shown in Discord post
+  const systemPrompt = await buildSystemPrompt(contactName, contact, modelText);
+  const userContent  = buildUserContent(contactName, modelText, contextMessages, arrivedAt);
   const historyLines = contextMessages
     .filter(m => m.text?.trim())
     .slice().reverse()
@@ -2397,7 +2441,7 @@ async function checkAndDraft(key) {
     .join("\n");
 
   const draftResult = await generateDraft(systemPrompt, userContent, {
-    contactName, contactPhone: contact, messageText, historyLines,
+    contactName, contactPhone: contact, messageText: modelText, historyLines,
   });
 
   // Cannot-answer gate: if model returned [CANNOT_ANSWER: ...], alert and abort
@@ -2486,6 +2530,18 @@ async function executeSend(draft, reason) {
     log(`[${reason}] Quiet hours — holding draft for ${contactName} until morning`);
     // Keep in pending; it will fire when quiet hours lift
     return false;
+  }
+
+  // ── In-memory collision check (fix #6: prevents "cancelled but sent anyway" race) ──────
+  // Check before hitting mcporter — faster and catches the race where outgoing webhook
+  // fires concurrently with a running reaction check.
+  const chatKey  = chatGuid || "";
+  const normKey  = normalizePhone(contact || "");
+  const inMemTs  = kleinRepliedRecentlyChats.get(chatKey) || kleinRepliedRecentlyChats.get(normKey);
+  if (inMemTs && Date.now() - inMemTs < 30 * 60 * 1000) {
+    log(`[${reason}] Klein replied recently (in-memory) for ${contactName} — skipping`);
+    await discordPost(GHOST_CHANNEL, { content: `ℹ️ Skipped **${contactName}** — Klein already replied.` });
+    return true;
   }
 
   // Late collision check — use arrivedAt (when contact's message arrived) so we catch
@@ -2600,6 +2656,19 @@ async function doReactionCheck() {
 
       const action = actionMap[draftId];
 
+      // ── In-memory cancel guard (race fix #1) ──────────────────────────────
+      // Prune expired TTLs first
+      for (const [id, exp] of cancelledDraftTtl.entries()) {
+        if (Date.now() > exp) { cancelledDraftIds.delete(id); cancelledDraftTtl.delete(id); }
+      }
+      if (cancelledDraftIds.has(draftId)) {
+        log(`doReactionCheck: draft ${draftId} was in-memory cancelled (HTTP /action) — skipping auto-send`);
+        logFeedback(draft, "cancelled");
+        cancelledDraftIds.delete(draftId);
+        cancelledDraftTtl.delete(draftId);
+        continue;
+      }
+
       if (action === "cancel") {
         log(`❌ Cancel: ${contactName} (${draftId})`);
         await discordPost(GHOST_CHANNEL, { content: `❌ Cancelled draft for **${contactName}**.` });
@@ -2694,8 +2763,33 @@ function createServer() {
       try {
         const { phone, name } = JSON.parse(await readBody());
         if (!phone) throw new Error("phone required");
-        addToAllowlist(phone, name || "Unknown");
-        return send(200, { ok: true, action: "approved", phone });
+        // Enrich from Apple Contacts (best-effort, 4s timeout)
+        let resolvedName = name && name !== "Unknown" ? name : null;
+        let enrichOpts   = {};
+        try {
+          const r = spawnSync("mcporter", [
+            "call", "bluebubbles.bb_contact_query",
+            "--args", JSON.stringify({ addresses: [`+${normalizePhone(phone)}`] }),
+          ], { encoding: "utf8", timeout: 4000, env: { ...process.env, HOME } });
+          const cqData = (() => { try { return JSON.parse(r.stdout)?.data?.[0]; } catch { return null; } })();
+          if (cqData) {
+            const fullName = cqData.displayName ||
+              [`${cqData.firstName || ""}`, `${cqData.lastName || ""}`].filter(Boolean).join(" ").trim();
+            if (fullName) {
+              resolvedName = fullName;
+              enrichOpts = {
+                emails:   (cqData.emails || []).map(e => e.address).filter(Boolean),
+                birthday: cqData.birthday || null,
+              };
+              log(`/approve-contact: enriched +${normalizePhone(phone)} → "${fullName}"`);
+            }
+          }
+        } catch {}
+        addToAllowlist(phone, resolvedName || "Unknown", { source: "discord_approve", ...enrichOpts });
+        // Remove from pending unknown alerts map
+        pendingUnknownAlerts.delete(normalizePhone(phone));
+        await discordPost(GHOST_CHANNEL, { content: `✅ Approved **${resolvedName || phone}** — added to allowlist.` });
+        return send(200, { ok: true, action: "approved", phone, name: resolvedName || "Unknown" });
       } catch (e) { return send(400, { ok: false, error: e.message }); }
     }
 
@@ -2705,6 +2799,9 @@ function createServer() {
         const { phone } = JSON.parse(await readBody());
         if (!phone) throw new Error("phone required");
         addToDenylist(phone);
+        // Remove from pending unknown alerts map — stops refresh loop
+        pendingUnknownAlerts.delete(normalizePhone(phone));
+        await discordPost(GHOST_CHANNEL, { content: `🚫 Denied \`+${normalizePhone(phone)}\` — added to denylist.` });
         return send(200, { ok: true, action: "denied", phone });
       } catch (e) { return send(400, { ok: false, error: e.message }); }
     }
@@ -2723,8 +2820,9 @@ function createServer() {
         if (draftIdx === -1) return send(404, { ok: false, error: "draft not found" });
         const draft = drafts[draftIdx];
         if (action === "cancel") {
-          // Register in-memory cancellation FIRST — prevents doReactionCheck race
+          // Register in-memory cancellation FIRST — prevents doReactionCheck auto-send race
           cancelledDraftIds.add(draftId);
+          cancelledDraftTtl.set(draftId, Date.now() + 10 * 60 * 1000); // 10-min TTL
           logFeedback(draft, "cancelled");
           drafts.splice(draftIdx, 1);
           savePendingDrafts(drafts);
@@ -2772,6 +2870,15 @@ function createServer() {
         if (isFromMe || normalized === OWNER_PHONE_NORMALIZED) {
           const key = chatGuid || normalized;
           let cancelled = false;
+
+          // Update in-memory reply tracker (prevents executeSend race condition — fix #6)
+          const replyTs = Date.now();
+          if (key)        kleinRepliedRecentlyChats.set(key, replyTs);
+          if (normalized) kleinRepliedRecentlyChats.set(normalized, replyTs);
+          // Prune entries older than 30 min
+          for (const [k, ts] of kleinRepliedRecentlyChats.entries()) {
+            if (replyTs - ts > 30 * 60 * 1000) kleinRepliedRecentlyChats.delete(k);
+          }
 
           // 1. Cancel in-memory pending (pre-draft, within 30s window)
           if (key && pendingMessages.has(key)) {
@@ -2856,7 +2963,7 @@ function createServer() {
 
         const cooldownMs = getCooldownMs(contact);
         const timeoutId = setTimeout(() => checkAndDraft(key), DRAFT_DELAY_MS);
-        pendingMessages.set(key, { contact, contactName, messageText, chatGuid: chatGuid || key, arrivedAt, timeoutId, contextMessages: preflight.context.messages, autoSendMs: cooldownMs });
+        pendingMessages.set(key, { contact, contactName, messageText, sanitizedText: preflight.context.sanitizedText, chatGuid: chatGuid || key, arrivedAt, timeoutId, contextMessages: preflight.context.messages, autoSendMs: cooldownMs });
         log(`Draft queued for ${contactName} — fires in ${DRAFT_DELAY_MS / 60000}min (cooldown: ${Math.round(cooldownMs/1000)}s)`);
 
         return send(200, {
@@ -3562,5 +3669,12 @@ if (require.main !== module) {
     postDraftToDiscord,
     indexMessage,
     embedText,
+    // New exports for fix validation tests
+    sanitizeMessageText,
+    sanitizeForModel,
+    cancelledDraftIds,
+    cancelledDraftTtl,
+    kleinRepliedRecentlyChats,
+    unknownAlertCounts,
   };
 }
