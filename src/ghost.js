@@ -818,6 +818,10 @@ function addToAllowlist(phone, name, { source = "manual", emails = [], birthday 
   const raw    = readFileSafe(CONTACTS_FILE);
   const marker = "<!-- CONTACT_ALLOWLIST_END -->";
   writeFileSafe(CONTACTS_FILE, raw.replace(marker, line + marker));
+  // Remove from denylist — last action wins (approve after deny = approved)
+  const denyList = loadJson(DENYLIST_FILE, []);
+  const filtered = denyList.filter(d => d !== n);
+  if (filtered.length !== denyList.length) { saveJson(DENYLIST_FILE, filtered); log(`Removed +${n} from denylist (approve wins)`); }
   log(`Added +${n} to allowlist as "${displayName}" (source: ${source})`);
 }
 
@@ -825,6 +829,10 @@ function addToDenylist(phone) {
   const n    = normalizePhone(phone);
   const list = loadJson(DENYLIST_FILE, []);
   if (!list.includes(n)) { list.push(n); saveJson(DENYLIST_FILE, list); }
+  // Remove from allowlist — last action wins (deny after approve = denied)
+  const raw     = readFileSafe(CONTACTS_FILE);
+  const cleaned = raw.split("\n").filter(l => !l.includes(`+${n}`)).join("\n");
+  if (cleaned !== raw) { writeFileSafe(CONTACTS_FILE, cleaned); log(`Removed +${n} from allowlist (deny wins)`); }
   log(`Added +${n} to denylist`);
 }
 
