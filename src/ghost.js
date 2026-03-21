@@ -2110,6 +2110,9 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
   if (enrichment?.emails?.length) content += `📧 ${enrichment.emails.slice(0,2).join(", ")}\n`;
   content += `💬 "${(messageText || "").slice(0, 200)}"`;
   if (alertCount > 1) content += `\n_Alert #${alertCount} — ${3 - alertCount + 1} remaining before auto-deny_`;
+  // Text command fallback — buttons click visually but don't route to agent session
+  // Typing in this channel DOES reach the ghost agent. Use text commands as the real action path.
+  content += `\n\`approve ${n}\` · \`deny ${n}\``;
 
   // Post via OC gateway with reusable=true so buttons never expire.
   // Labels encode the phone so handler.js can parse them without a registry lookup.
