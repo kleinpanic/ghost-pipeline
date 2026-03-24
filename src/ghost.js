@@ -86,6 +86,30 @@ const ACTIVE_TIMEOUT_MS          = 5  * 60 * 1000;
 
 // ── Content safety patterns (checked on every draft before returning) ────
 const CJK_PATTERN = /[\u3400-\u9fff\uf900-\ufaff]/;  // CJK characters — never send Chinese/Japanese/Korean
+// Commitment patterns — Ghost must NEVER send replies that obligate Klein
+// to plans, events, time slots, or agreements of any kind.
+const COMMITMENT_PATTERNS = [
+  // Explicit "I will show up" language — always a commitment
+  /\bi('ll| will)\s+(be there|come|show up|make it|join|attend|come over|swing by|stop by)/i,
+  // "sounds good" only blocks when paired with explicit scheduling context (time/day/place)
+  /\bsounds\s+(good|great|perfect|like\s+a\s+plan)[^.!?]*\b(see you|at \d|tonight|tomorrow|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
+  // Explicit "count me in" — unambiguous commitment
+  /\bcount\s+me\s+in\b/i,
+  // "i'm in" = explicit acceptance; "i'm down/game/free" is too casual/vague to reliably indicate commitment
+  /\bi('m| am)\s+in\b/i,
+  // Explicit time-anchored "see you" — always a commitment
+  /\bsee\s+you\s+(then|there|at|tonight|tomorrow|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
+  // "we're on/set" = plan confirmation
+  /\bwe('re| are)\s+(on|set)\b/i,
+  // "works for me" / "that works" = plan confirmation
+  /\bworks?\s+for\s+me\b/i,
+  /\bthat\s+works?\b/i,
+  // "i can make it / be there / come" = explicit commitment
+  /\bi\s+can\s+(make\s+it|be\s+there|come)\b/i,
+  // "yeah/sure/definitely + i'll/i will/let's" = explicit follow-through
+  /\b(yes|yeah|yep|sure|absolutely|definitely|for\s+sure)[,!.]?\s*(i'll|i\s+will|i\s+can|let's)\b/i,
+];
+
 const NEVER_SAY = [
   /\bn[\-*]+w+er\b/i,
   /\bf[\-*]+ck\s+you\b/i,
@@ -722,6 +746,13 @@ function passesContentSafety(draftText, tier = "unknown") {
       if (pattern === CJK_PATTERN) {
         log(`[${tier}] CJK characters detected in draft — rejecting`);
       }
+      return false;
+    }
+  }
+  // Hard block: never send anything that commits Klein to plans/events/times
+  for (const pattern of COMMITMENT_PATTERNS) {
+    if (pattern.test(draftText)) {
+      log(`[${tier}] Commitment language detected in draft — rejecting: "${draftText.slice(0, 80)}"`);
       return false;
     }
   }
@@ -1831,7 +1862,7 @@ async function buildSystemPrompt(contactName, contactPhone, triggerMessage = "")
 
   prompt += `\n\nAlways respond in American English only. Never use Chinese, Japanese, or Korean characters under any circumstances.`;
 
-  prompt += `\n\nIf the message requires specific personal knowledge not visible in context (specific plans, events, or facts), respond with EXACTLY: [CANNOT_ANSWER: brief reason max 12 words]`;
+  prompt += `\n\nCRITICAL RULES — these are internal pipeline signals, never shown to the recipient:\n1. NEVER commit Klein to any plan, event, meetup, time slot, or activity. If the message is about scheduling, plans, "are you free", "want to hang", "can you make it", or anything that requires knowing his calendar — output EXACTLY on its own line (this is caught internally and never sent): [CANNOT_ANSWER: cannot commit to plans]\n2. NEVER say "sounds good", "I'm in", "count me in", "see you then/there", "works for me", "I'll be there", "that works", or any phrase that agrees to do something — even casually. If you would naturally write any of those, use [CANNOT_ANSWER: cannot commit to plans] instead.\n3. If the message requires specific personal knowledge not visible in context (specific plans, events, facts about Klein's schedule) — output EXACTLY: [CANNOT_ANSWER: brief reason max 12 words]\n\n[CANNOT_ANSWER: ...] is a pipeline abort signal. It is intercepted before sending and the recipient sees nothing.`;
 
   const feedbackSummary = recentFeedbackSummary();
   if (feedbackSummary) prompt += feedbackSummary;

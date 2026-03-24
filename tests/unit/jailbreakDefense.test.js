@@ -184,8 +184,9 @@ describe("passesContentSafety — identity reveal blocking", () => {
   }
 
   const okDrafts = [
-    "yeah i'm down for that",
-    "sounds good, see you at 8",
+    "yeah i'm down for that",      // casual vibe, no explicit time/plan
+    "yeah sounds good",             // casual ack, no explicit scheduling context
+    "sounds good",                  // standalone — no time/place attached
     "lol that's crazy",
     "my mom made dinner last night, it was fire",
     "just got back from the gym",
@@ -197,6 +198,29 @@ describe("passesContentSafety — identity reveal blocking", () => {
   for (const text of okDrafts) {
     test(`allows draft: "${text.slice(0, 50)}..."`, () => {
       expect(passesContentSafety(text)).toBe(true);
+    });
+  }
+
+  // Commitment language — explicit time/plan anchors must always be blocked
+  const commitmentBlockedDrafts = [
+    "sounds good, see you at 8",          // explicit time anchor → blocked
+    "sounds good, see you tomorrow",       // explicit day → blocked
+    "I'll be there at 7",                  // explicit show-up → blocked
+    "count me in",                         // explicit acceptance → blocked
+    "I'm in",                              // explicit acceptance → blocked
+    "see you then",                        // explicit time ref → blocked
+    "see you tonight",                     // explicit time → blocked
+    "see you Saturday",                    // explicit day → blocked
+    "works for me",                        // plan confirmation → blocked
+    "that works",                          // plan confirmation → blocked
+    "I can make it",                       // explicit commitment → blocked
+    "I can be there",                      // explicit commitment → blocked
+    "yeah I'll come by",                   // explicit follow-through → blocked
+  ];
+
+  for (const text of commitmentBlockedDrafts) {
+    test(`blocks commitment draft: "${text.slice(0, 60)}"`, () => {
+      expect(passesContentSafety(text)).toBe(false);
     });
   }
 });
