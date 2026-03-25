@@ -201,26 +201,52 @@ describe("passesContentSafety — identity reveal blocking", () => {
     });
   }
 
-  // Commitment language — explicit time/plan anchors must always be blocked
+  // Commitment language — hard-block cases: always blocked regardless of context
   const commitmentBlockedDrafts = [
-    "sounds good, see you at 8",          // explicit time anchor → blocked
-    "sounds good, see you tomorrow",       // explicit day → blocked
-    "I'll be there at 7",                  // explicit show-up → blocked
-    "count me in",                         // explicit acceptance → blocked
-    "I'm in",                              // explicit acceptance → blocked
-    "see you then",                        // explicit time ref → blocked
-    "see you tonight",                     // explicit time → blocked
-    "see you Saturday",                    // explicit day → blocked
-    "works for me",                        // plan confirmation → blocked
-    "that works",                          // plan confirmation → blocked
-    "I can make it",                       // explicit commitment → blocked
-    "I can be there",                      // explicit commitment → blocked
-    "yeah I'll come by",                   // explicit follow-through → blocked
+    "sounds good, see you at 8",          // sounds good + explicit time anchor → always blocked
+    "sounds good, see you tomorrow",       // sounds good + explicit day → always blocked
+    "I'll be there at 7",                  // explicit show-up → always blocked
+    "count me in",                         // explicit RSVP → always blocked
+    "see you then",                        // explicit time ref → always blocked
+    "see you tonight",                     // explicit time → always blocked
+    "see you Saturday",                    // explicit day → always blocked
   ];
 
   for (const text of commitmentBlockedDrafts) {
     test(`blocks commitment draft: "${text.slice(0, 60)}"`, () => {
       expect(passesContentSafety(text)).toBe(false);
+    });
+  }
+
+  // Soft-block cases: only blocked when scheduling context is also present
+  const softCommitmentWithContextDrafts = [
+    "I'm in for dinner Friday",           // "I'm in" + scheduling context → blocked
+    "that works, dinner at 6pm",           // "that works" + scheduling context → blocked
+    "works for me, see you at the party",  // "works for me" + scheduling context → blocked
+    "I can make it to the meeting",        // "I can make it" + scheduling context → blocked
+    "I can be there for lunch",            // "I can be there" + scheduling context → blocked
+    "yeah I'll come by tonight",           // "I'll come by" + scheduling context → blocked
+  ];
+
+  for (const text of softCommitmentWithContextDrafts) {
+    test(`blocks soft commitment with scheduling context: "${text.slice(0, 60)}"`, () => {
+      expect(passesContentSafety(text)).toBe(false);
+    });
+  }
+
+  // Standalone phrases — allowed when NO scheduling context is present
+  const commitmentAllowedStandaloneDrafts = [
+    "I'm in the middle of something",     // "I'm in" but no scheduling context → allowed
+    "that works out well",                 // "that works" but no scheduling context → allowed
+    "works for me as a solution",          // "works for me" but no scheduling context → allowed
+    "I can make it happen",                // "I can make it" without scheduling context → allowed
+    "I can be there for you emotionally",  // "I can be there" but no scheduling context → allowed
+    "yeah I'll come by and check it out",  // "I'll come by" but no scheduling context → allowed
+  ];
+
+  for (const text of commitmentAllowedStandaloneDrafts) {
+    test(`allows standalone soft phrase without scheduling context: "${text.slice(0, 60)}"`, () => {
+      expect(passesContentSafety(text)).toBe(true);
     });
   }
 });

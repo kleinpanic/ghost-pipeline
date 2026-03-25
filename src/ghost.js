@@ -87,26 +87,45 @@ const ACTIVE_TIMEOUT_MS          = 5  * 60 * 1000;
 // ── Content safety patterns (checked on every draft before returning) ────
 const CJK_PATTERN = /[\u3400-\u9fff\uf900-\ufaff]/;  // CJK characters — never send Chinese/Japanese/Korean
 // Commitment patterns — Ghost must NEVER send replies that obligate Klein
-// to plans, events, time slots, or agreements of any kind.
-const COMMITMENT_PATTERNS = [
-  // Explicit "I will show up" language — always a commitment
-  /\bi('ll| will)\s+(be there|come|show up|make it|join|attend|come over|swing by|stop by)/i,
-  // "sounds good" only blocks when paired with explicit scheduling context (time/day/place)
-  /\bsounds\s+(good|great|perfect|like\s+a\s+plan)[^.!?]*\b(see you|at \d|tonight|tomorrow|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
-  // Explicit "count me in" — unambiguous commitment
+// to a specific time, place, or event.
+//
+// Split into two tiers:
+//   HARD_COMMITMENT_PATTERNS  — always blocked, unambiguously scheduling
+//   SOFT_COMMITMENT_PATTERNS  — only blocked when SCHEDULING_CONTEXT is also present
+//
+// This avoids false positives on casual responses ("that works", "sure I can check that")
+// while still catching real plan-confirmations ("I'll be there at 8", "that works, dinner Friday").
+
+// Scheduling context keywords — if any appear in the draft, apply soft commitment checks too
+const SCHEDULING_CONTEXT = /\b(dinner|lunch|breakfast|brunch|meet(ing)?|hang(ing|s|out)?|come\s+over|party|event|plans?|tonight|tomorrow|this\s+(weekend|week|morning|afternoon|evening)|sunday|monday|tuesday|wednesday|thursday|friday|saturday|\d{1,2}(:\d{2})?\s*(am|pm)|o'clock)\b/i;
+
+// Always block — these are unambiguous commitments regardless of surrounding context
+const HARD_COMMITMENT_PATTERNS = [
+  // "I'll be there / I will show up" — no ambiguity
+  /\bi('ll| will)\s+(be there|show up)\b/i,
+  // "count me in" — always an explicit RSVP
   /\bcount\s+me\s+in\b/i,
-  // "i'm in" = explicit acceptance; "i'm down/game/free" is too casual/vague to reliably indicate commitment
-  /\bi('m| am)\s+in\b/i,
-  // Explicit time-anchored "see you" — always a commitment
+  // "see you [at/tonight/tomorrow/day]" — explicit future meetup confirmation
   /\bsee\s+you\s+(then|there|at|tonight|tomorrow|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
-  // "we're on/set" = plan confirmation
+  // "we're on / we're set" — plan confirmed
   /\bwe('re| are)\s+(on|set)\b/i,
-  // "works for me" / "that works" = plan confirmation
+  // "sounds good, see you at 8" — scheduling-anchored agreement
+  /\bsounds\s+(good|great|perfect|like\s+a\s+plan)[^.!?]*\b(see you|at \d|tonight|tomorrow|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
+];
+
+// Block ONLY when SCHEDULING_CONTEXT is also present in the draft —
+// these phrases are fine in normal conversation but dangerous in scheduling context
+const SOFT_COMMITMENT_PATTERNS = [
+  // "I'll come / make it / join / attend / swing by" — commitment if scheduling context present
+  /\bi('ll| will)\s+(come|make it|join|attend|come over|swing by|stop by)\b/i,
+  // "I'm in" — could mean anything casually, but in scheduling context it's an RSVP
+  /\bi('m| am)\s+in\b/i,
+  // "works for me" / "that works" — fine as casual agreement, dangerous in scheduling context
   /\bworks?\s+for\s+me\b/i,
   /\bthat\s+works?\b/i,
-  // "i can make it / be there / come" = explicit commitment
+  // "I can make it / be there / come" — commitment if scheduling context present
   /\bi\s+can\s+(make\s+it|be\s+there|come)\b/i,
-  // "yeah/sure/definitely + i'll/i will/let's" = explicit follow-through
+  // "yeah/sure/definitely I'll/let's" — follow-through phrases, only block in scheduling context
   /\b(yes|yeah|yep|sure|absolutely|definitely|for\s+sure)[,!.]?\s*(i'll|i\s+will|i\s+can|let's)\b/i,
 ];
 
@@ -749,11 +768,20 @@ function passesContentSafety(draftText, tier = "unknown") {
       return false;
     }
   }
-  // Hard block: never send anything that commits Klein to plans/events/times
-  for (const pattern of COMMITMENT_PATTERNS) {
+  // Hard block: always fire — unambiguous scheduling commitments
+  for (const pattern of HARD_COMMITMENT_PATTERNS) {
     if (pattern.test(draftText)) {
-      log(`[${tier}] Commitment language detected in draft — rejecting: "${draftText.slice(0, 80)}"`);
+      log(`[${tier}] Hard commitment language detected in draft — rejecting: "${draftText.slice(0, 80)}"`);
       return false;
+    }
+  }
+  // Soft block: only fire when the draft also contains scheduling context keywords
+  if (SCHEDULING_CONTEXT.test(draftText)) {
+    for (const pattern of SOFT_COMMITMENT_PATTERNS) {
+      if (pattern.test(draftText)) {
+        log(`[${tier}] Soft commitment language in scheduling context — rejecting: "${draftText.slice(0, 80)}"`);
+        return false;
+      }
     }
   }
   return true;
