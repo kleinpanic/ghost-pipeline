@@ -1768,11 +1768,50 @@ function recentFeedbackSummary(limit = 20) {
 const GHOST_AGENT_SESSION_KEY = "agent:ghost:main";
 const OC_GATEWAY_PORT         = 18789;  // loopback TLS, confirmed
 
-/**
- * Call the ghost agent session via OC gateway /tools/invoke HTTPS endpoint.
- * gateway.tools.allow includes "sessions_send" so this is permitted.
- * Returns { text, model } or null on timeout/failure.
- */
+// Authenticated OC gateway client — all /tools/invoke calls go through here.
+// Adds request ID + timestamp headers for auditability; throws on auth failure.
+async function ocGatewayInvoke(tool, args, timeoutMs = 25000) {
+  if (!OC_GATEWAY_TOKEN) throw new Error("OC gateway token not configured");
+  const requestId = crypto.randomBytes(8).toString("hex");
+  const body = JSON.stringify({ tool, args });
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname:           "127.0.0.1",
+      port:               OC_GATEWAY_PORT,
+      path:               "/tools/invoke",
+      method:             "POST",
+      rejectUnauthorized: false,   // self-signed local cert
+      headers: {
+        "Authorization":  `Bearer ${OC_GATEWAY_TOKEN}`,
+        "Content-Type":   "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        "X-Request-ID":   requestId,
+        "X-Timestamp":    Date.now().toString(),
+      },
+    }, (res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        res.resume();
+        return reject(new Error(`OC gateway auth failure (${res.statusCode}) req=${requestId}`));
+      }
+      let data = "";
+      res.on("data", c => { data += c; });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed?.error) return reject(new Error(`OC gateway error: ${JSON.stringify(parsed.error).slice(0, 120)} req=${requestId}`));
+          resolve({ requestId, parsed });
+        } catch (e) {
+          reject(new Error(`OC gateway parse error: ${e.message} req=${requestId}`));
+        }
+      });
+    });
+    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error(`OC gateway timeout req=${requestId}`)); });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 async function tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, timeoutMs = 25000) {
   if (!OC_GATEWAY_TOKEN) { log("Ghost agent: no gateway token — skipping"); return null; }
 
@@ -1784,68 +1823,33 @@ async function tryGhostAgentSession(contactName, messageText, systemPrompt, user
     `\nOutput ONLY the reply text — nothing else. Max 1-2 short texts.`,
   ].join("\n");
 
-  return new Promise((resolve) => {
-    const body = JSON.stringify({
-      tool:       "sessions_send",
-      args: {
-        sessionKey:     GHOST_AGENT_SESSION_KEY,
-        message:        prompt,
-        timeoutSeconds: Math.floor(timeoutMs / 1000) - 2,
-      },
-    });
+  try {
+    const { requestId, parsed } = await ocGatewayInvoke("sessions_send", {
+      sessionKey:     GHOST_AGENT_SESSION_KEY,
+      message:        prompt,
+      timeoutSeconds: Math.floor(timeoutMs / 1000) - 2,
+    }, timeoutMs);
 
-    const req = https.request({
-      hostname: "127.0.0.1",
-      port:     OC_GATEWAY_PORT,
-      path:     "/tools/invoke",
-      method:   "POST",
-      rejectUnauthorized: false,   // self-signed local cert
-      headers: {
-        "Authorization": `Bearer ${OC_GATEWAY_TOKEN}`,
-        "Content-Type":  "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    }, (res) => {
-      let data = "";
-      res.on("data", c => { data += c; });
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(data);
-          // Extract text from OC tool result envelope
-          const inner = parsed?.result?.details ?? parsed?.result;
-          // sessions_send with timeout returns details.reply as the agent's response
-          const rawText = (typeof inner === "string" ? inner
-            : inner?.reply ?? inner?.text ?? inner?.message ?? inner?.content?.[0]?.text ?? "");
-          // Strip any JSON wrapper the agent might have added
-          let text = rawText.trim();
-          try {
-            const j = JSON.parse(text);
-            text = j.text ?? j.reply ?? j.message ?? text;
-          } catch {}
-          if (text && !parsed?.error) {
-            if (hasInternalDriftMarkers(text)) {
-              log(`Ghost agent session: BLOCKED internal marker in OC gateway response`);
-              resolve(null);
-            } else {
-              log(`Ghost agent session draft ok: "${text.slice(0,40)}"`);
-              resolve({ text: text.trim(), model: "ghost-agent" });
-            }
-          } else {
-            log(`Ghost agent session: empty/error response — ${JSON.stringify(parsed).slice(0,100)}`);
-            resolve(null);
-          }
-        } catch (e) {
-          log(`Ghost agent session parse error: ${e.message}`);
-          resolve(null);
-        }
-      });
-    });
+    const inner   = parsed?.result?.details ?? parsed?.result;
+    const rawText = (typeof inner === "string" ? inner
+      : inner?.reply ?? inner?.text ?? inner?.message ?? inner?.content?.[0]?.text ?? "");
+    let text = rawText.trim();
+    try { const j = JSON.parse(text); text = j.text ?? j.reply ?? j.message ?? text; } catch {}
 
-    req.setTimeout(timeoutMs, () => { req.destroy(); log("Ghost agent session: timeout"); resolve(null); });
-    req.on("error", (e) => { log(`Ghost agent session error: ${e.message}`); resolve(null); });
-    req.write(body);
-    req.end();
-  });
+    if (!text) {
+      log(`Ghost agent session: empty response (req=${requestId})`);
+      return null;
+    }
+    if (hasInternalDriftMarkers(text)) {
+      log(`Ghost agent session: BLOCKED internal marker in response (req=${requestId})`);
+      return null;
+    }
+    log(`Ghost agent session draft ok (req=${requestId}): "${text.slice(0, 40)}"`);
+    return { text: text.trim(), model: "ghost-agent" };
+  } catch (e) {
+    log(`Ghost agent session error: ${e.message}`);
+    return null;
+  }
 }
 
 /**
