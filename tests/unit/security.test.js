@@ -28,12 +28,16 @@ const {
   onContactMessage,
   loadConvState,
   saveConvState,
-  COOLDOWN_STRANGER_MIN_MS,
-  COOLDOWN_STRANGER_MAX_MS,
-  COOLDOWN_ACTIVE_MIN_MS,
-  COOLDOWN_ACTIVE_MAX_MS,
-  ACTIVE_EXCHANGE_THRESHOLD,
-  ACTIVE_TIMEOUT_MS,
+  CATEGORY_AUTO_SEND_MS,
+  hasInternalDriftMarkers,
+  outboundRateGate,
+  getRateBackoff,
+  recordRateLimitHit,
+  clearRateBackoff,
+  BACKOFF_BASE_MS,
+  BACKOFF_MAX_LEVEL,
+  OUTBOUND_RATE_FILE,
+  OUTBOUND_BACKOFF_FILE,
 } = require("../../src/ghost");
 
 // ─── Helper: reset conv state before each test ───────────────────────────
@@ -186,7 +190,7 @@ describe("passesContentSafety", () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-//  Conversation state machine + getCooldownMs
+//  Cooldown + analytics state
 // ═════════════════════════════════════════════════════════════════════════
 
 describe("randomCooldown", () => {
@@ -199,50 +203,31 @@ describe("randomCooldown", () => {
   });
 });
 
-describe("getCooldownMs — stranger mode", () => {
+describe("getCooldownMs", () => {
   beforeEach(resetConvState);
 
-  test("new contact defaults to stranger-range cooldown", () => {
+  test("allowed contact uses relationship-based window from CONTACTS.md", () => {
     const ms = getCooldownMs("15551234567");
-    expect(ms).toBeGreaterThanOrEqual(COOLDOWN_STRANGER_MIN_MS);
-    expect(ms).toBeLessThan(COOLDOWN_STRANGER_MAX_MS);
+    expect(ms).toBe(CATEGORY_AUTO_SEND_MS.friend);
   });
 
-  test("stranger mode after fewer than ACTIVE_EXCHANGE_THRESHOLD sends", () => {
-    const phone = "15551234567";
-    for (let i = 0; i < ACTIVE_EXCHANGE_THRESHOLD - 1; i++) onGhostSend(phone);
-    const ms = getCooldownMs(phone);
-    expect(ms).toBeGreaterThanOrEqual(COOLDOWN_STRANGER_MIN_MS);
-    expect(ms).toBeLessThan(COOLDOWN_STRANGER_MAX_MS);
+  test("unknown contact falls back to friend window", () => {
+    const ms = getCooldownMs("15550000000");
+    expect(ms).toBe(CATEGORY_AUTO_SEND_MS.friend);
   });
 });
 
-describe("getCooldownMs — active mode", () => {
+describe("onGhostSend", () => {
   beforeEach(resetConvState);
 
-  test("enters active mode after ACTIVE_EXCHANGE_THRESHOLD sends", () => {
+  test("increments exchangeCount and records lastGhostSendAt", () => {
     const phone = "15551234568";
-    for (let i = 0; i < ACTIVE_EXCHANGE_THRESHOLD; i++) onGhostSend(phone);
+    onGhostSend(phone);
+    onGhostSend(phone);
     const state = loadConvState();
-    expect(state[phone]?.mode).toBe("active");
-    const ms = getCooldownMs(phone);
-    expect(ms).toBeGreaterThanOrEqual(COOLDOWN_ACTIVE_MIN_MS);
-    expect(ms).toBeLessThan(COOLDOWN_ACTIVE_MAX_MS);
-  });
-
-  test("active mode times out after ACTIVE_TIMEOUT_MS silence", () => {
-    const phone = "15551234569";
-    for (let i = 0; i < ACTIVE_EXCHANGE_THRESHOLD; i++) onGhostSend(phone);
-
-    // Backdate lastGhostSendAt to simulate timeout
-    const state = loadConvState();
-    state[phone].lastGhostSendAt = new Date(Date.now() - ACTIVE_TIMEOUT_MS - 1000).toISOString();
-    saveConvState(state);
-
-    // getCooldownMs should detect the timeout and return stranger-range
-    const ms = getCooldownMs(phone);
-    expect(ms).toBeGreaterThanOrEqual(COOLDOWN_STRANGER_MIN_MS);
-    expect(ms).toBeLessThan(COOLDOWN_STRANGER_MAX_MS);
+    expect(state[phone].exchangeCount).toBe(2);
+    expect(state[phone].lastGhostSendAt).toBeTruthy();
+    expect(state[phone].lastMode).toBe("ghost_sent");
   });
 });
 
@@ -254,27 +239,139 @@ describe("onContactMessage", () => {
     onContactMessage(phone);
     const state = loadConvState();
     expect(state[phone]?.lastContactMsgAt).toBeTruthy();
+    expect(state[phone]?.lastMode).toBe("contact_sent");
   });
 
-  test("resets active mode to stranger if ghost has been silent > ACTIVE_TIMEOUT_MS", () => {
+  test("preserves prior exchangeCount while recording inbound contact activity", () => {
     const phone = "15551230002";
-    for (let i = 0; i < ACTIVE_EXCHANGE_THRESHOLD; i++) onGhostSend(phone);
-    // Backdate last send
-    const state = loadConvState();
-    state[phone].lastGhostSendAt = new Date(Date.now() - ACTIVE_TIMEOUT_MS - 5000).toISOString();
-    saveConvState(state);
-
+    onGhostSend(phone);
+    onGhostSend(phone);
     onContactMessage(phone);
     const updated = loadConvState();
-    expect(updated[phone].mode).toBe("stranger");
-    expect(updated[phone].exchangeCount).toBe(0);
+    expect(updated[phone].exchangeCount).toBe(2);
+    expect(updated[phone].lastGhostSendAt).toBeTruthy();
+    expect(updated[phone].lastContactMsgAt).toBeTruthy();
+    expect(updated[phone].lastMode).toBe("contact_sent");
   });
 
-  test("keeps active mode if ghost sent recently", () => {
+  test("does not use or require legacy active/stranger mode state", () => {
     const phone = "15551230003";
-    for (let i = 0; i < ACTIVE_EXCHANGE_THRESHOLD; i++) onGhostSend(phone);
+    onGhostSend(phone);
     onContactMessage(phone);
     const state = loadConvState();
-    expect(state[phone].mode).toBe("active");
+    expect(state[phone].mode).toBeUndefined();
+    expect(getCooldownMs(phone)).toBe(CATEGORY_AUTO_SEND_MS.friend);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+//  hasInternalDriftMarkers
+// ═════════════════════════════════════════════════════════════════════════
+
+describe("hasInternalDriftMarkers", () => {
+  test("returns false for normal draft text", () => {
+    expect(hasInternalDriftMarkers("yeah sounds good")).toBe(false);
+    expect(hasInternalDriftMarkers("on my way, give me 10")).toBe(false);
+    expect(hasInternalDriftMarkers("lol that's wild")).toBe(false);
+    expect(hasInternalDriftMarkers("")).toBe(false);
+    expect(hasInternalDriftMarkers(null)).toBe(false);
+  });
+
+  test("blocks [KleinClaw-Ghost] prefix (the exact incident pattern)", () => {
+    expect(hasInternalDriftMarkers("[KleinClaw-Ghost] 🧭 New session: abc-123")).toBe(true);
+    expect(hasInternalDriftMarkers("[KleinClaw-Ghost] Read: lines 1-50")).toBe(true);
+    expect(hasInternalDriftMarkers("[kleinclaw-ghost] something internal")).toBe(true);
+  });
+
+  test("blocks kleinclaw-ghost bare mention", () => {
+    expect(hasInternalDriftMarkers("kleinclaw-ghost is active")).toBe(true);
+    expect(hasInternalDriftMarkers("via KleinClaw Ghost pipeline")).toBe(true);
+  });
+
+  test("blocks internal file-path patterns", () => {
+    expect(hasInternalDriftMarkers("check ~/.openclaw/data/file")).toBe(true);
+    expect(hasInternalDriftMarkers("see workspace-ghost/SOUL.md")).toBe(true);
+    expect(hasInternalDriftMarkers("openclaw/workspace/ghost")).toBe(true);
+    expect(hasInternalDriftMarkers("openclaw/governance/CONTACTS")).toBe(true);
+  });
+
+  test("blocks mcporter and systemctl mentions", () => {
+    expect(hasInternalDriftMarkers("mcporter call bluebubbles.bb_send")).toBe(true);
+    expect(hasInternalDriftMarkers("systemctl --user restart ghost")).toBe(true);
+  });
+
+  test("blocks model fallback trace", () => {
+    expect(hasInternalDriftMarkers("model fallback triggered")).toBe(true);
+  });
+
+  test("does not false-positive on similar casual text", () => {
+    // "read" and "exec" as standalone words in conversation are fine
+    expect(hasInternalDriftMarkers("did you read that?")).toBe(false);
+    expect(hasInternalDriftMarkers("they exec'd the contract")).toBe(false);
+    // "openclaw" not followed by /
+    expect(hasInternalDriftMarkers("I use openclaw for chat")).toBe(false);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+//  outboundRateGate + adaptive backoff (unit level)
+// ═════════════════════════════════════════════════════════════════════════
+
+describe("outboundRateGate", () => {
+  const RATE_PHONE = "15550010001";
+
+  beforeEach(() => {
+    try { require("fs").unlinkSync(OUTBOUND_RATE_FILE);    } catch {}
+    try { require("fs").unlinkSync(OUTBOUND_BACKOFF_FILE); } catch {}
+  });
+
+  test("allows first send", () => {
+    const result = outboundRateGate(`+${RATE_PHONE}`, null);
+    expect(result.ok).toBe(true);
+  });
+
+  test("blocks second send to same contact within 5-min window", () => {
+    outboundRateGate(`+${RATE_PHONE}`, null);          // first — passes
+    const result = outboundRateGate(`+${RATE_PHONE}`, null); // second — blocked
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/rate-limit/);
+  });
+
+  test("blocked result includes backoffLevel and shouldPause fields", () => {
+    outboundRateGate(`+${RATE_PHONE}`, null);
+    const result = outboundRateGate(`+${RATE_PHONE}`, null);
+    expect(result).toHaveProperty("backoffLevel");
+    expect(result).toHaveProperty("shouldPause");
+    expect(typeof result.backoffLevel).toBe("number");
+    expect(typeof result.shouldPause).toBe("boolean");
+  });
+
+  test("shouldPause is true when backoff level reaches BACKOFF_MAX_LEVEL", () => {
+    const key = RATE_PHONE;
+    const fs = require("fs");
+    // Pre-seed backoff at one below max
+    const backoff = { [key]: { level: BACKOFF_MAX_LEVEL - 1, lastHitAt: Date.now() - 1000 } };
+    fs.writeFileSync(OUTBOUND_BACKOFF_FILE, JSON.stringify(backoff));
+    // Pre-fill the rate window so the gate fires immediately (no pass that would clear backoff)
+    const rate = { [key]: [Date.now()] };
+    fs.writeFileSync(OUTBOUND_RATE_FILE, JSON.stringify(rate));
+    // This hit should push level to max and set shouldPause
+    const blocked = outboundRateGate(`+${RATE_PHONE}`, null);
+    expect(blocked.ok).toBe(false);
+    expect(blocked.shouldPause).toBe(true);
+  });
+
+  test("clears backoff on successful send after cooldown", () => {
+    const key = RATE_PHONE;
+    const fs = require("fs");
+    // Pre-seed backoff at level 2
+    fs.writeFileSync(OUTBOUND_BACKOFF_FILE, JSON.stringify({ [key]: { level: 2, lastHitAt: Date.now() - 30 * 60 * 1000 } }));
+    // Clear the rate window so the gate passes
+    try { fs.unlinkSync(OUTBOUND_RATE_FILE); } catch {}
+    const result = outboundRateGate(`+${RATE_PHONE}`, null);
+    expect(result.ok).toBe(true);
+    // Backoff should be cleared
+    const backoffAfter = getRateBackoff(key);
+    expect(backoffAfter.level).toBe(0);
   });
 });

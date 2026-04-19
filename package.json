@@ -8,6 +8,7 @@
     "test": "jest --coverage",
     "test:unit": "jest tests/unit --coverage",
     "test:integration": "jest tests/integration",
+    "e2e": "FORCE=1 jest tests/e2e --runInBand --forceExit",
     "status": "node src/ghost.js status",
     "pause": "node src/ghost.js pause",
     "resume": "node src/ghost.js resume"

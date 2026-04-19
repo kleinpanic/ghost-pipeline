@@ -56,7 +56,11 @@ const SPAM_LOG_FILE       = path.join(DATA_DIR, "ghost-spam-log.json");
 const SPAM_RATELIMIT_FILE = path.join(DATA_DIR, "ghost-spam-ratelimit.json");
 const FEEDBACK_FILE       = path.join(DATA_DIR, "ghost-feedback.json");
 const OUTBOUND_RATE_FILE  = path.join(DATA_DIR, "ghost-outbound-rate.json");
+const OUTBOUND_BACKOFF_FILE = path.join(DATA_DIR, "ghost-outbound-backoff.json");
 const EVENT_DEDUP_FILE    = path.join(DATA_DIR, "ghost-event-dedup.json");
+
+// Per-contact send lock — prevents concurrent sends to the same contact
+const sendLocks = new Map();
 
 // Embeddings + memories DB
 const GHOST_MEMORIES_DB   = path.join(DATA_DIR, "ghost-memories.db");
@@ -310,7 +314,7 @@ function hasInternalDriftMarkers(text) {
     /\bworkspace-ghost\b/i,
     /\bmcporter\b/i,
     /\bsystemctl\s+--user\b/i,
-    /\b\.openclaw\//i,
+    /\.openclaw\//i,
   ];
   return checks.some(re => re.test(norm));
 }
@@ -356,42 +360,101 @@ function isDuplicateInboundEvent(eventType, eventData) {
   }
 }
 
+// ── Adaptive backoff helpers ─────────────────────────────────────────────────
+// Level 0 = 5 min, 1 = 10 min, 2 = 20 min, 3 = 40 min, 4+ = pause Ghost.
+const BACKOFF_BASE_MS          = 5 * 60 * 1000;
+const BACKOFF_MAX_LEVEL        = 4;
+const BACKOFF_ESCALATE_WINDOW  = 2.5; // escalate if hit again within 2.5× current window
+
+function getRateBackoff(key) {
+  try {
+    const data = loadJson(OUTBOUND_BACKOFF_FILE, {});
+    return data[key] || { level: 0, lastHitAt: 0 };
+  } catch { return { level: 0, lastHitAt: 0 }; }
+}
+
+function recordRateLimitHit(key) {
+  try {
+    const now   = Date.now();
+    const data  = loadJson(OUTBOUND_BACKOFF_FILE, {});
+    const state = data[key] || { level: 0, lastHitAt: 0 };
+    const windowMs = BACKOFF_BASE_MS * Math.pow(2, state.level);
+    if (state.lastHitAt && (now - state.lastHitAt) < windowMs * BACKOFF_ESCALATE_WINDOW) {
+      state.level = Math.min(state.level + 1, BACKOFF_MAX_LEVEL);
+    }
+    state.lastHitAt = now;
+    data[key] = state;
+    saveJson(OUTBOUND_BACKOFF_FILE, data);
+    return state.level;
+  } catch { return 0; }
+}
+
+function clearRateBackoff(key) {
+  try {
+    const data = loadJson(OUTBOUND_BACKOFF_FILE, {});
+    delete data[key];
+    saveJson(OUTBOUND_BACKOFF_FILE, data);
+  } catch {}
+}
+
+// ── Per-contact send lock ────────────────────────────────────────────────────
+async function withContactSendLock(contact, fn) {
+  const key = normalizePhone(contact) || contact;
+  while (sendLocks.has(key)) {
+    await sendLocks.get(key).catch(() => {});
+  }
+  let resolve;
+  const lock = new Promise(r => { resolve = r; });
+  sendLocks.set(key, lock);
+  try {
+    return await fn();
+  } finally {
+    sendLocks.delete(key);
+    resolve();
+  }
+}
+
 function outboundRateGate(contact, chatGuid) {
   try {
     const now = Date.now();
     const key = normalizePhone(contact) || (chatGuid || "");
     if (!key) return { ok: true };
 
-    const FIVE_MIN = 5 * 60 * 1000;
-    const HOUR = 60 * 60 * 1000;
-    const MAX_5_MIN = 2;
-    const MAX_1_HOUR = 6;
+    const FIVE_MIN    = 5 * 60 * 1000;
+    const HOUR        = 60 * 60 * 1000;
+    const MAX_PER_5   = 1;  // hard limit: one message per 5-min window per contact
+    const MAX_PER_HR  = 4;
 
-    const data = loadJson(OUTBOUND_RATE_FILE, {});
-    const all = Array.isArray(data[key]) ? data[key].map(Number).filter(Number.isFinite) : [];
+    // Apply adaptive backoff: add extra effective window at higher levels
+    const backoff    = getRateBackoff(key);
+    const backoffMs  = backoff.level > 0 ? BACKOFF_BASE_MS * Math.pow(2, backoff.level) : 0;
+    const effectiveWindow = FIVE_MIN + backoffMs;
+
+    const data   = loadJson(OUTBOUND_RATE_FILE, {});
+    const all    = Array.isArray(data[key]) ? data[key].map(Number).filter(Number.isFinite) : [];
     const inHour = all.filter(ts => (now - ts) < HOUR);
-    const in5 = inHour.filter(ts => (now - ts) < FIVE_MIN);
+    const inWin  = inHour.filter(ts => (now - ts) < effectiveWindow);
 
-    if (in5.length >= MAX_5_MIN) {
-      return { ok: false, reason: `rate-limit: ${in5.length}/${MAX_5_MIN} in 5min` };
+    if (inWin.length >= MAX_PER_5) {
+      const level = recordRateLimitHit(key);
+      return { ok: false, reason: `rate-limit: ${inWin.length}/${MAX_PER_5} in ${Math.round(effectiveWindow / 60000)}min`, backoffLevel: level, shouldPause: level >= BACKOFF_MAX_LEVEL };
     }
-    if (inHour.length >= MAX_1_HOUR) {
-      return { ok: false, reason: `rate-limit: ${inHour.length}/${MAX_1_HOUR} in 60min` };
+    if (inHour.length >= MAX_PER_HR) {
+      const level = recordRateLimitHit(key);
+      return { ok: false, reason: `rate-limit: ${inHour.length}/${MAX_PER_HR} in 60min`, backoffLevel: level, shouldPause: level >= BACKOFF_MAX_LEVEL };
     }
+
+    // Successful gate pass — clear any accumulated backoff
+    if (backoff.level > 0) clearRateBackoff(key);
 
     inHour.push(now);
     data[key] = inHour;
-
-    // prune all keys to hour window, cap key count
     const cleaned = {};
     for (const [k, arr] of Object.entries(data)) {
       const kept = (Array.isArray(arr) ? arr : []).map(Number).filter(ts => Number.isFinite(ts) && (now - ts) < HOUR);
       if (kept.length) cleaned[k] = kept;
     }
-    const topKeys = Object.entries(cleaned)
-      .sort((a, b) => (Math.max(...b[1]) - Math.max(...a[1])))
-      .slice(0, 2000);
-    saveJson(OUTBOUND_RATE_FILE, Object.fromEntries(topKeys));
+    saveJson(OUTBOUND_RATE_FILE, Object.fromEntries(Object.entries(cleaned).sort((a, b) => Math.max(...b[1]) - Math.max(...a[1])).slice(0, 2000)));
 
     return { ok: true };
   } catch {
@@ -760,6 +823,7 @@ function onGhostSend(phone) {
   const entry = state[n] || { exchangeCount: 0 };
   entry.exchangeCount   = (entry.exchangeCount || 0) + 1;
   entry.lastGhostSendAt = new Date().toISOString();
+  entry.lastMode        = "ghost_sent";
   if (entry.exchangeCount >= ACTIVE_EXCHANGE_THRESHOLD) entry.mode = "active";
   state[n] = entry;
   saveConvState(state);
@@ -771,6 +835,7 @@ function onContactMessage(phone) {
   const state = loadConvState();
   const entry = state[n] || { exchangeCount: 0 };
   entry.lastContactMsgAt = new Date().toISOString();
+  entry.lastMode         = "contact_sent";
   // If active but ghost has been silent > ACTIVE_TIMEOUT_MS, clear mode (reverts to stranger on next load)
   if (entry.mode === "active") {
     const lastSend = entry.lastGhostSendAt ? new Date(entry.lastGhostSendAt).getTime() : 0;
@@ -2741,7 +2806,12 @@ async function kleinRepliedSince(chatGuid, sinceIso) {
   }
 }
 
+// Public wrapper — acquires per-contact send lock before calling inner logic
 async function executeSend(draft, reason) {
+  return withContactSendLock(draft.contact || draft.chatGuid || "", () => _executeSend(draft, reason));
+}
+
+async function _executeSend(draft, reason) {
   const { contactName, chatGuid, draftText, arrivedAt, postedAt, contact } = draft;
 
   if (!draftText) {
@@ -2801,8 +2871,20 @@ async function executeSend(draft, reason) {
 
   const rate = outboundRateGate(contact, chatGuid);
   if (!rate.ok) {
-    log(`[${reason}] BLOCKED send to ${contactName}: ${rate.reason}`);
-    await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${contactName}**: ${rate.reason}` });
+    log(`[${reason}] BLOCKED send to ${contactName}: ${rate.reason} (backoff level ${rate.backoffLevel ?? 0})`);
+    const lvl = rate.backoffLevel ?? 0;
+    if (rate.shouldPause) {
+      // Backoff maxed out — something is wrong, stop Ghost entirely
+      log(`[${reason}] Adaptive backoff reached level ${lvl} for ${contactName} — triggering emergency pause`);
+      cmdPause([]);
+      await discordPost(GHOST_CHANNEL, { content: `🚨 **Ghost emergency pause**: repeated rate-limit escalation for **${contactName}** (level ${lvl}). Ghost stopped. Run \`ghost resume\` to restart.` });
+    } else if (lvl >= 3) {
+      await discordPost(GHOST_CHANNEL, { content: `⚠️ **Rate-limit escalation** (level ${lvl}) for **${contactName}**: ${rate.reason}. Backoff window now ${Math.round(BACKOFF_BASE_MS * Math.pow(2, lvl) / 60000)}min. Check for runaway sends.` });
+    } else if (lvl >= 1) {
+      await discordPost(GHOST_CHANNEL, { content: `⚠️ Rate-limit (level ${lvl}) for **${contactName}**: ${rate.reason}` });
+    } else {
+      await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${contactName}**: ${rate.reason}` });
+    }
     logFeedback(draft, "blocked-rate-limit");
     return true;
   }
@@ -3958,5 +4040,16 @@ if (require.main !== module) {
     cancelledDraftTtl,
     kleinRepliedRecentlyChats,
     unknownAlertCounts,
+    // Rate-limit + backoff exports
+    outboundRateGate,
+    getRateBackoff,
+    recordRateLimitHit,
+    clearRateBackoff,
+    hasInternalDriftMarkers,
+    OUTBOUND_BACKOFF_FILE,
+    OUTBOUND_RATE_FILE,
+    BACKOFF_BASE_MS,
+    BACKOFF_MAX_LEVEL,
+    sendLocks,
   };
 }
