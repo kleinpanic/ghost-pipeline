@@ -55,6 +55,8 @@ const LOCK_FILE           = path.join(DATA_DIR, "ghost-reaction-check.lock");
 const SPAM_LOG_FILE       = path.join(DATA_DIR, "ghost-spam-log.json");
 const SPAM_RATELIMIT_FILE = path.join(DATA_DIR, "ghost-spam-ratelimit.json");
 const FEEDBACK_FILE       = path.join(DATA_DIR, "ghost-feedback.json");
+const OUTBOUND_RATE_FILE  = path.join(DATA_DIR, "ghost-outbound-rate.json");
+const EVENT_DEDUP_FILE    = path.join(DATA_DIR, "ghost-event-dedup.json");
 
 // Embeddings + memories DB
 const GHOST_MEMORIES_DB   = path.join(DATA_DIR, "ghost-memories.db");
@@ -83,6 +85,13 @@ const COOLDOWN_ACTIVE_MIN_MS     = 1.5 * 60 * 1000;
 const COOLDOWN_ACTIVE_MAX_MS     = 3.5 * 60 * 1000;
 const ACTIVE_EXCHANGE_THRESHOLD  = 3;
 const ACTIVE_TIMEOUT_MS          = 5  * 60 * 1000;
+// Fixed cooldown per relationship tier (returned deterministically for non-active contacts)
+const CATEGORY_AUTO_SEND_MS = {
+  family_close:  COOLDOWN_ACTIVE_MIN_MS,          // closest — fastest
+  close_friend:  COOLDOWN_ACTIVE_MIN_MS,
+  friend:        Math.round((COOLDOWN_STRANGER_MIN_MS + COOLDOWN_STRANGER_MAX_MS) / 2), // 5.5 min midpoint
+  acquaintance:  COOLDOWN_STRANGER_MAX_MS,          // most cautious — longest
+};
 
 // ── Content safety patterns (checked on every draft before returning) ────
 const CJK_PATTERN = /[\u3400-\u9fff\uf900-\ufaff]/;  // CJK characters — never send Chinese/Japanese/Korean
@@ -286,6 +295,108 @@ function saveJson(filePath, data) {
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] [ghost] ${msg}`);
+}
+
+function hasInternalDriftMarkers(text) {
+  if (!text) return false;
+  const norm = String(text).normalize("NFKC");
+  const checks = [
+    /\[\s*kleinclaw\s*[-_ ]\s*ghost\s*\]/i,
+    /\bkleinclaw\s*[-_ ]\s*ghost\b/i,
+    /\bexec\s*:/i,
+    /\bread\s*:/i,
+    /\bmodel\s+fallback\b/i,
+    /\bopenclaw\/(workspace|governance)\b/i,
+    /\bworkspace-ghost\b/i,
+    /\bmcporter\b/i,
+    /\bsystemctl\s+--user\b/i,
+    /\b\.openclaw\//i,
+  ];
+  return checks.some(re => re.test(norm));
+}
+
+function eventDedupKey(eventType, eventData) {
+  const guid = (eventData?.guid || "").toString().trim();
+  if (guid) return `${eventType}:guid:${guid}`;
+
+  const rowId = eventData?.originalROWID;
+  if (rowId !== undefined && rowId !== null && `${rowId}`.trim() !== "") {
+    return `${eventType}:row:${rowId}`;
+  }
+
+  const chatGuid = (eventData?.chatGuid || "").toString().trim();
+  const text = (extractMessageText(eventData) || "").slice(0, 120);
+  const from = eventData?.isFromMe === true ? "me" : "them";
+  const hash = crypto.createHash("sha1").update(`${chatGuid}|${from}|${text}`).digest("hex").slice(0, 16);
+  return `${eventType}:fallback:${hash}`;
+}
+
+function isDuplicateInboundEvent(eventType, eventData) {
+  try {
+    const key = eventDedupKey(eventType, eventData);
+    const now = Date.now();
+    const TTL_MS = 12 * 60 * 60 * 1000;
+
+    const data = loadJson(EVENT_DEDUP_FILE, {});
+    const seenAt = Number(data[key] || 0);
+    if (seenAt && (now - seenAt) < TTL_MS) return true;
+
+    data[key] = now;
+
+    // prune old keys + cap file size
+    const entries = Object.entries(data)
+      .filter(([, ts]) => Number.isFinite(Number(ts)) && (now - Number(ts)) < TTL_MS)
+      .sort((a, b) => Number(b[1]) - Number(a[1]))
+      .slice(0, 4000);
+
+    saveJson(EVENT_DEDUP_FILE, Object.fromEntries(entries));
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function outboundRateGate(contact, chatGuid) {
+  try {
+    const now = Date.now();
+    const key = normalizePhone(contact) || (chatGuid || "");
+    if (!key) return { ok: true };
+
+    const FIVE_MIN = 5 * 60 * 1000;
+    const HOUR = 60 * 60 * 1000;
+    const MAX_5_MIN = 2;
+    const MAX_1_HOUR = 6;
+
+    const data = loadJson(OUTBOUND_RATE_FILE, {});
+    const all = Array.isArray(data[key]) ? data[key].map(Number).filter(Number.isFinite) : [];
+    const inHour = all.filter(ts => (now - ts) < HOUR);
+    const in5 = inHour.filter(ts => (now - ts) < FIVE_MIN);
+
+    if (in5.length >= MAX_5_MIN) {
+      return { ok: false, reason: `rate-limit: ${in5.length}/${MAX_5_MIN} in 5min` };
+    }
+    if (inHour.length >= MAX_1_HOUR) {
+      return { ok: false, reason: `rate-limit: ${inHour.length}/${MAX_1_HOUR} in 60min` };
+    }
+
+    inHour.push(now);
+    data[key] = inHour;
+
+    // prune all keys to hour window, cap key count
+    const cleaned = {};
+    for (const [k, arr] of Object.entries(data)) {
+      const kept = (Array.isArray(arr) ? arr : []).map(Number).filter(ts => Number.isFinite(ts) && (now - ts) < HOUR);
+      if (kept.length) cleaned[k] = kept;
+    }
+    const topKeys = Object.entries(cleaned)
+      .sort((a, b) => (Math.max(...b[1]) - Math.max(...a[1])))
+      .slice(0, 2000);
+    saveJson(OUTBOUND_RATE_FILE, Object.fromEntries(topKeys));
+
+    return { ok: true };
+  } catch {
+    return { ok: true };
+  }
 }
 
 /**
@@ -617,8 +728,9 @@ function randomCooldown(minMs, maxMs) {
 
 /**
  * Returns the cooldown in ms before auto-sending to this phone.
- * - 'active' mode (≥3 ghost sends): 1.5–3.5 min
- * - 'stranger' mode: 3.5–7.5 min
+ * - 'active' mode (≥3 ghost sends): 1.5–3.5 min (random)
+ * - relationship tier (known contact, no active state): fixed per category
+ * - stranger/unknown: friend-tier fixed value as fallback
  */
 function getCooldownMs(phone) {
   const n     = normalizePhone(phone);
@@ -628,19 +740,24 @@ function getCooldownMs(phone) {
     // Check if active mode timed out (5min silence since last ghost send)
     const lastSend = entry.lastGhostSendAt ? new Date(entry.lastGhostSendAt).getTime() : 0;
     if (Date.now() - lastSend > ACTIVE_TIMEOUT_MS) {
-      // timed out — treat as stranger
-      return randomCooldown(COOLDOWN_STRANGER_MIN_MS, COOLDOWN_STRANGER_MAX_MS);
+      // timed out — treat as friend tier (contact's relationship category or friend fallback)
+      const { numToCategory } = loadContactsMap();
+      const cat = numToCategory[n] || "friend";
+      return CATEGORY_AUTO_SEND_MS[cat] ?? CATEGORY_AUTO_SEND_MS.friend;
     }
     return randomCooldown(COOLDOWN_ACTIVE_MIN_MS, COOLDOWN_ACTIVE_MAX_MS);
   }
-  return randomCooldown(COOLDOWN_STRANGER_MIN_MS, COOLDOWN_STRANGER_MAX_MS);
+  // Non-active: use relationship tier (friend fallback for unknown contacts)
+  const { numToCategory } = loadContactsMap();
+  const cat = numToCategory[n] || "friend";
+  return CATEGORY_AUTO_SEND_MS[cat] ?? CATEGORY_AUTO_SEND_MS.friend;
 }
 
 /** Called when ghost successfully sends to a contact. */
 function onGhostSend(phone) {
   const n     = normalizePhone(phone);
   const state = loadConvState();
-  const entry = state[n] || { mode: "stranger", exchangeCount: 0 };
+  const entry = state[n] || { exchangeCount: 0 };
   entry.exchangeCount   = (entry.exchangeCount || 0) + 1;
   entry.lastGhostSendAt = new Date().toISOString();
   if (entry.exchangeCount >= ACTIVE_EXCHANGE_THRESHOLD) entry.mode = "active";
@@ -652,13 +769,13 @@ function onGhostSend(phone) {
 function onContactMessage(phone) {
   const n     = normalizePhone(phone);
   const state = loadConvState();
-  const entry = state[n] || { mode: "stranger", exchangeCount: 0 };
+  const entry = state[n] || { exchangeCount: 0 };
   entry.lastContactMsgAt = new Date().toISOString();
-  // If active but ghost has been silent > ACTIVE_TIMEOUT_MS, reset to stranger
+  // If active but ghost has been silent > ACTIVE_TIMEOUT_MS, clear mode (reverts to stranger on next load)
   if (entry.mode === "active") {
     const lastSend = entry.lastGhostSendAt ? new Date(entry.lastGhostSendAt).getTime() : 0;
     if (Date.now() - lastSend > ACTIVE_TIMEOUT_MS) {
-      entry.mode          = "stranger";
+      delete entry.mode;
       entry.exchangeCount = 0;
     }
   }
@@ -760,6 +877,11 @@ function scanForInjection(messageText) {
 
 function passesContentSafety(draftText, tier = "unknown") {
   if (!draftText) return true;
+
+  if (hasInternalDriftMarkers(draftText)) {
+    log(`[${tier}] Internal pipeline marker detected in draft — rejecting`);
+    return false;
+  }
   for (const pattern of NEVER_SAY) {
     if (pattern.test(draftText)) {
       if (pattern === CJK_PATTERN) {
@@ -902,13 +1024,15 @@ function addToDenylist(phone) {
 function requiresReply(messageText) {
   if (!messageText || !messageText.trim()) return false;
   const raw = messageText.trim();
-  const t   = raw.toLowerCase().replace(/[!?.]+$/, "").trim(); // strip trailing punctuation for matching
+  // Normalize curly quotes so tapback regex matching is robust regardless of quote style
+  const t   = raw.toLowerCase().replace(/[!?.]+$/, "").trim().replace(/[\u201C\u201D]/g, '"');
 
   // ── Emoji-only ──────────────────────────────────────────────────────────
   if (/^[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}\s]+$/u.test(raw)) return false;
 
   // ── iMessage tapback reactions ───────────────────────────────────────────
-  if (/^(liked|loved|disliked|emphasized|questioned|laughed at) ".{0,80}"$/.test(t)) return false;
+  // Matches both straight and curly quotes; max 200-char quoted text to be safe
+  if (/^(liked|loved|disliked|emphasized|questioned|laughed at) ["\u201C\u201D].{0,200}["\u201D]$/.test(t)) return false;
 
   // ── Exact ack set (strip trailing punctuation before matching) ───────────
   const noReplyExact = new Set([
@@ -1699,8 +1823,13 @@ async function tryGhostAgentSession(contactName, messageText, systemPrompt, user
             text = j.text ?? j.reply ?? j.message ?? text;
           } catch {}
           if (text && !parsed?.error) {
-            log(`Ghost agent session draft ok: "${text.slice(0,40)}"`);
-            resolve({ text: text.trim(), model: "ghost-agent" });
+            if (hasInternalDriftMarkers(text)) {
+              log(`Ghost agent session: BLOCKED internal marker in OC gateway response`);
+              resolve(null);
+            } else {
+              log(`Ghost agent session draft ok: "${text.slice(0,40)}"`);
+              resolve({ text: text.trim(), model: "ghost-agent" });
+            }
           } else {
             log(`Ghost agent session: empty/error response — ${JSON.stringify(parsed).slice(0,100)}`);
             resolve(null);
@@ -2132,17 +2261,12 @@ async function postDraftToDiscord(draftResult, meta) {
   }
 
   // Fallback: raw Discord API (no-draft case, or if OC gateway failed)
+  // IMPORTANT: do NOT post raw buttons here. They expire and cause "This component has expired".
   if (!messageId) {
-    const result = await discordPost(GHOST_CHANNEL, {
-      content,
-      components: hasUsableDraft ? [{
-        type: 1,
-        components: [
-          { type: 2, label: "✅ Send Now", style: 3, custom_id: `occomp:cid=GHOST_SEND:${draftId}`   },
-          { type: 2, label: "❌ Cancel",   style: 4, custom_id: `occomp:cid=GHOST_CANCEL:${draftId}` },
-        ],
-      }] : [],
-    });
+    const fallbackContent = hasUsableDraft
+      ? `${content}\n⚠️ Controls unavailable (gateway fallback). Auto-send only for this draft.`
+      : content;
+    const result = await discordPost(GHOST_CHANNEL, { content: fallbackContent });
     messageId = result?.id || null;
   }
 
@@ -2323,6 +2447,12 @@ const MAX_MESSAGE_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours — BB replays old msg
 
 async function runPreflight(contact, messageText, chatGuid, eventData) {
   const normalized = normalizePhone(contact);
+
+  // -2. Reaction-event guard — skip tapback/emoji reactions without further processing
+  // BlueBubbles may emit standalone reaction events where text == reaction label (e.g. "liked")
+  if (eventData?.type === "reaction" || eventData?.isReaction === true) {
+    return { ok: false, reason: "reaction_event" };
+  }
 
   // -1. Age gate — skip messages older than 2 hours (BB replays stale msgs on reconnect)
   const msgDateCreated = eventData?.dateCreated ?? eventData?.date_created ?? 0;
@@ -2533,6 +2663,27 @@ async function checkAndDraft(key) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function bbSendMessage(chatGuid, message) {
+  const normalizedMessage = (message || "").toString().trim();
+  if (!normalizedMessage) {
+    log("bbSendMessage blocked: empty outbound message");
+    return false;
+  }
+
+  if (hasInternalDriftMarkers(normalizedMessage)) {
+    log(`bbSendMessage BLOCKED internal/pipeline marker for ${chatGuid || "unknown-chat"}`);
+    return false;
+  }
+
+  // Verify DM recipient is in the Ghost contact allowlist (belt+suspenders against routing bugs)
+  const dmPhoneMatch = chatGuid && chatGuid.match(/^(?:iMessage|SMS|iMessageLite);-;(\+?\d+)$/);
+  if (dmPhoneMatch) {
+    const dmPhone = dmPhoneMatch[1];
+    if (!isAllowed(dmPhone) && normalizePhone(dmPhone) !== OWNER_PHONE_NORMALIZED) {
+      log(`bbSendMessage BLOCKED: recipient ${chatGuid} not in contact allowlist`);
+      return false;
+    }
+  }
+
   // iMessageLite guids return 405 on send — swap to SMS equivalent immediately
   if (chatGuid && chatGuid.startsWith("iMessageLite;-;")) {
     const smsGuid = chatGuid.replace("iMessageLite;-;", "SMS;-;");
@@ -2595,6 +2746,20 @@ async function executeSend(draft, reason) {
     return true; // remove from pending
   }
 
+  if (isPaused()) {
+    log(`[${reason}] BLOCKED while paused for ${contactName}`);
+    await discordPost(GHOST_CHANNEL, { content: `⏸ Blocked send to **${contactName}**: Ghost is paused.` });
+    logFeedback(draft, "blocked-paused");
+    return true;
+  }
+
+  if (isDenied(contact || chatGuid)) {
+    log(`[${reason}] BLOCKED denylist for ${contactName}`);
+    await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${contactName}**: contact is denylisted.` });
+    logFeedback(draft, "blocked-denylist");
+    return true;
+  }
+
   // Quiet hours guard — applies to auto-send too, not just incoming messages
   if (reason === "auto-send" && isQuietHours(contact || chatGuid)) {
     log(`[${reason}] Quiet hours — holding draft for ${contactName} until morning`);
@@ -2620,6 +2785,21 @@ async function executeSend(draft, reason) {
   if (collisionAnchor && await kleinRepliedSince(chatGuid, collisionAnchor)) {
     log(`[${reason}] Klein already replied to ${contactName} — skipping`);
     await discordPost(GHOST_CHANNEL, { content: `ℹ️ Skipped **${contactName}** — Klein already replied.` });
+    return true;
+  }
+
+  if (hasInternalDriftMarkers(draftText)) {
+    log(`[${reason}] BLOCKED internal/pipeline marker in draft for ${contactName}`);
+    await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${contactName}**: internal pipeline text detected.` });
+    logFeedback(draft, "blocked-internal-marker");
+    return true;
+  }
+
+  const rate = outboundRateGate(contact, chatGuid);
+  if (!rate.ok) {
+    log(`[${reason}] BLOCKED send to ${contactName}: ${rate.reason}`);
+    await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${contactName}**: ${rate.reason}` });
+    logFeedback(draft, "blocked-rate-limit");
     return true;
   }
 
@@ -2881,8 +3061,8 @@ function createServer() {
       try {
         const { draftId, action, userId } = JSON.parse(await readBody());
         if (!draftId || !action) return send(400, { ok: false, error: "draftId and action required" });
-        // Optional userId check — enforced only when KLEIN_DISCORD_USER_ID env var is set
-        if (KLEIN_DISCORD_USER_ID && userId && userId !== KLEIN_DISCORD_USER_ID) {
+        // Require userId to match when KLEIN_DISCORD_USER_ID is configured — absent userId also fails
+        if (KLEIN_DISCORD_USER_ID && userId !== KLEIN_DISCORD_USER_ID) {
           return send(403, { ok: false, error: "unauthorized" });
         }
         const drafts   = loadPendingDrafts();
@@ -2935,6 +3115,11 @@ function createServer() {
         }
 
         const normalized = normalizePhone(contact);
+
+        if (isDuplicateInboundEvent(eventType, eventData)) {
+          log(`Duplicate webhook event dropped (${eventType}) for ${normalized || chatGuid || "unknown"}`);
+          return send(200, { ok: true, action: "ignored", reason: "duplicate_event" });
+        }
 
         // Outgoing: Klein sent a message — cancel pending draft for this chat
         if (isFromMe || normalized === OWNER_PHONE_NORMALIZED) {
@@ -3008,6 +3193,23 @@ function createServer() {
         const { contactName } = preflight.context;
         const arrivedAt     = Date.now();
         const key           = chatGuid || normalized;
+
+        // If a posted draft already exists for this contact/chat, don't queue another.
+        // This prevents duplicate draft cards when multiple messages arrive before action is taken.
+        const postedDrafts = loadPendingDrafts();
+        const activeDraft = postedDrafts.find(d =>
+          normalizePhone(d.contact) === normalized || d.chatGuid === key || d.chatGuid === chatGuid
+        );
+        if (activeDraft) {
+          log(`Existing posted draft ${activeDraft.draftId} for ${contactName} — skipping re-queue`);
+          return send(200, {
+            ok: true,
+            action: "draft_already_posted",
+            contactName,
+            chatGuid: key,
+            draftId: activeDraft.draftId,
+          });
+        }
 
         // Replace existing pending for same chat (debounce rapid messages)
         // ISSUE-8 fix: also remove old draft from ghost-pending-drafts.json so it doesn't auto-send stale context
@@ -3450,7 +3652,12 @@ function cmdPause(args) {
   const data = { paused: true };
   if (until) data.pauseUntil = until;
   saveJson(PAUSE_FILE, data);
-  console.log(`✅ Ghost paused${until ? ` until ${until}` : " indefinitely"}.`);
+
+  // Hard stop pending sends while paused to prevent any delayed auto-send race.
+  pendingMessages.clear();
+  savePendingDrafts([]);
+
+  console.log(`✅ Ghost paused${until ? ` until ${until}` : " indefinitely"}. Cleared pending drafts.`);
 }
 
 function cmdResume() {
@@ -3713,6 +3920,7 @@ if (require.main !== module) {
     COOLDOWN_ACTIVE_MAX_MS,
     ACTIVE_EXCHANGE_THRESHOLD,
     ACTIVE_TIMEOUT_MS,
+    CATEGORY_AUTO_SEND_MS,
     // Bug-fix exports
     normalizeTs,
     loadButtonRegistry,
