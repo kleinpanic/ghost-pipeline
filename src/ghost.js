@@ -3346,12 +3346,29 @@ function createServer() {
 //  LEARNING PIPELINE  (Phase 1)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// mcporter lives in the npm global prefix, which cron's minimal PATH omits —
+// bare-name resolution ENOENT'd every nightly learn run (90-01 regression).
+// Resolve to the absolute binary when present; fall back to PATH lookup.
+const MCPORTER_BIN = (() => {
+  const candidates = [
+    path.join(HOME, ".local", "share", "npm", "bin", "mcporter"),
+    path.join(HOME, ".local", "bin", "mcporter"),
+  ];
+  for (const c of candidates) {
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch {}
+  }
+  return "mcporter";
+})();
+
 async function mcporterCallSync(tool, argsObj) {
   // Sync variant for learn CLI ONLY — do NOT use in the webhook/serve path (blocks event loop).
-  const result = spawnSync("mcporter", [
+  const result = spawnSync(MCPORTER_BIN, [
     "call", `bluebubbles.${tool}`, "--args", JSON.stringify(argsObj),
   ], { encoding: "utf8", timeout: 60000, env: { ...process.env, HOME } });
-  if (result.status !== 0) throw new Error(`mcporter ${tool}: ${result.stderr?.slice(0, 200)}`);
+  if (result.status !== 0) {
+    const reason = result.stderr?.slice(0, 200) || result.error?.message || `exit ${result.status}`;
+    throw new Error(`mcporter ${tool}: ${reason}`);
+  }
   return JSON.parse(result.stdout);
 }
 
@@ -4054,5 +4071,8 @@ if (require.main !== module) {
     sendLocks,
     // Bind-host export (90-01: loopback confinement support)
     BIND_HOST,
+    // Learn-path exports (90-01: mcporter resolution regression)
+    MCPORTER_BIN,
+    mcporterCallSync,
   };
 }
