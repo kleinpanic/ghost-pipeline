@@ -3362,14 +3362,26 @@ const MCPORTER_BIN = (() => {
 
 async function mcporterCallSync(tool, argsObj) {
   // Sync variant for learn CLI ONLY — do NOT use in the webhook/serve path (blocks event loop).
-  const result = spawnSync(MCPORTER_BIN, [
-    "call", `bluebubbles.${tool}`, "--args", JSON.stringify(argsObj),
-  ], { encoding: "utf8", timeout: 60000, env: { ...process.env, HOME } });
+  // stdout is captured via a temp-file fd, NOT a pipe: mcporter's async pipe writes are
+  // dropped at child exit for large payloads (~145KB truncation, reproduced 2026-08-06);
+  // file fds get synchronous writes, so the full result always lands.
+  const tmp = path.join(require("os").tmpdir(), `ghost-mcp-${process.pid}-${Date.now()}.json`);
+  const fd = fs.openSync(tmp, "w");
+  let result;
+  try {
+    result = spawnSync(MCPORTER_BIN, [
+      "call", `bluebubbles.${tool}`, "--args", JSON.stringify(argsObj),
+    ], { stdio: ["ignore", fd, "pipe"], encoding: "utf8", timeout: 60000, env: { ...process.env, HOME } });
+  } finally {
+    fs.closeSync(fd);
+  }
+  let stdout = "";
+  try { stdout = fs.readFileSync(tmp, "utf8"); } finally { try { fs.unlinkSync(tmp); } catch {} }
   if (result.status !== 0) {
     const reason = result.stderr?.slice(0, 200) || result.error?.message || `exit ${result.status}`;
     throw new Error(`mcporter ${tool}: ${reason}`);
   }
-  return JSON.parse(result.stdout);
+  return JSON.parse(stdout);
 }
 
 async function mcporterCallAsync(tool, argsObj) {
@@ -3568,11 +3580,10 @@ ${stats.examples}
 Keep it short and practical.`;
 
   log(`Generating contact summary for ${contact.alias}...`);
-  let summary = await tryGeminiCli(prompt, { timeoutMs: 45000 });
-  if (!summary) {
-    log(`Gemini CLI failed — trying OR gemma-27b...`);
-    summary = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
-  }
+  // tryGeminiCli was removed in 404fe2f but these call sites were left dangling —
+  // learn crashed with ReferenceError. Go straight to OR (returns { text } or null).
+  const orSummary = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
+  let summary = orSummary?.text || null;
   if (!summary) {
     summary = `## Who They Are\n${contact.alias} (${contact.name})\n\n## Sample Klein Messages\n${stats.examples}`;
     log(`All models failed — writing stats-only stub for ${contact.alias}`);
@@ -3623,8 +3634,9 @@ Write a universal voice profile capturing what's consistent ACROSS all relations
 Keep it practical — Ghost reads this before every draft.`;
 
   log("Building voice profile...");
-  let profile = await tryGeminiCli(prompt, { timeoutMs: 45000 });
-  if (!profile) profile = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
+  // tryGeminiCli removed in 404fe2f (dangling ref crashed learn); OR returns { text } or null
+  const orProfile = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
+  let profile = orProfile?.text || null;
   if (!profile) profile = `## Core Typography\nLowercase, no period at end, contractions without apostrophes common.\n\n## Universal Vocabulary\nyea, nah, bet, fs, idk, tbh, lowkey, bruh, bro, lol (sparingly)`;
 
   writeFileSafe(VOICE_PROFILE_FILE, `# Klein Voice Profile\n_Updated: ${new Date().toISOString().slice(0, 10)}_\n\n${profile}\n`);
