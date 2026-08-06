@@ -205,6 +205,7 @@ const _env = loadEnvFile(path.join(__dirname, "..", ".env"));
 const env = (key, fallback = "") => process.env[key] || _env[key] || fallback;
 
 const PORT    = parseInt(env("GHOST_PORT", "18790"));
+const BIND_HOST = env("GHOST_BIND_HOST", "0.0.0.0");
 const BB_HOST = env("BB_HOST", "127.0.0.1");
 const BB_PORT = parseInt(env("BB_PORT", "1234"));
 
@@ -3800,8 +3801,8 @@ function cmdServe() {
   purgeStaleDrafts();
   pruneStaleDraftsOnStartup().catch(err => log(`Startup preflight error: ${err.message}`));
   const server = createServer();
-  server.listen(PORT, "0.0.0.0", () => {
-    log(`Ghost v3 listening on :${PORT}`);
+  server.listen(PORT, BIND_HOST, () => {
+    log(`Ghost v3 listening on ${BIND_HOST}:${PORT}`);
     log(`  Webhook : http://10.0.0.27:${PORT}/bluebubbles/message-sent`);
     log(`  Health  : http://127.0.0.1:${PORT}/health`);
     log(`  Pending : http://127.0.0.1:${PORT}/pending`);
@@ -4051,5 +4052,7 @@ if (require.main !== module) {
     BACKOFF_BASE_MS,
     BACKOFF_MAX_LEVEL,
     sendLocks,
+    // Bind-host export (90-01: loopback confinement support)
+    BIND_HOST,
   };
 }
