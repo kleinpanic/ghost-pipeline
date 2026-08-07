@@ -417,6 +417,15 @@ describe("E2E Flow 2: Normal message → draft lifecycle", () => {
     async () => {
       const chatGuid = `iMessage;-;+${ALLOWED_PHONE}`;
 
+      // Pin Date.now() to 2pm ET (14:00) to avoid quiet-hours gate (23:00–08:00).
+      // doNotFake preserves real timers so httpPost/setTimeout in this test still work.
+      const twopm = new Date();
+      twopm.setHours(14, 0, 0, 0);
+      jest.useFakeTimers({
+        now: twopm.getTime(),
+        doNotFake: ["nextTick", "setImmediate", "Promise", "setTimeout", "setInterval", "clearTimeout", "clearInterval"],
+      });
+
       // Override the OpenRouter response via global (avoids nock duplicate-interceptor issue)
       // "Sounds good, I'll be there!" would fail content safety; use a safe response instead.
       global.__ghostORResponse = { choices: [{ message: { content: "That works for me." } }] };
@@ -528,6 +537,15 @@ describe("E2E Flow 3: Klein outgoing → draft cancelled", () => {
     async () => {
       const chatGuid = `iMessage;-;+${ALLOWED_PHONE}`;
 
+      // Pin Date.now() to 2pm ET (14:00) to avoid quiet-hours gate (23:00–08:00).
+      // doNotFake preserves real timers so httpPost/setTimeout in this test still work.
+      const twopm = new Date();
+      twopm.setHours(14, 0, 0, 0);
+      jest.useFakeTimers({
+        now: twopm.getTime(),
+        doNotFake: ["nextTick", "setImmediate", "Promise", "setTimeout", "setInterval", "clearTimeout", "clearInterval"],
+      });
+
       const resp1 = await httpPost(serverPort, "/bluebubbles/message-sent",
         makeEvent({ chatGuid, text: "Hey, are you there?" })
       );
@@ -580,6 +598,16 @@ describe("E2E Flow 4: Klein replies before auto-send", () => {
     async () => {
       // Use SECOND_PHONE to avoid cross-test rate-limit contamination
       const chatGuid  = `iMessage;-;+${SECOND_PHONE}`;
+
+      // Pin Date.now() to 2pm ET (14:00) to avoid quiet-hours gate (23:00–08:00).
+      // doNotFake preserves real timers so httpPost/setTimeout in this test still work.
+      const twopm = new Date();
+      twopm.setHours(14, 0, 0, 0);
+      jest.useFakeTimers({
+        now: twopm.getTime(),
+        doNotFake: ["nextTick", "setImmediate", "Promise", "setTimeout", "setInterval", "clearTimeout", "clearInterval"],
+      });
+
       const arrivedAt = Date.now();
 
       const resp = await httpPost(serverPort, "/bluebubbles/message-sent",
