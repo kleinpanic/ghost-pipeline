@@ -30,6 +30,10 @@ process.env.HOME               = tmpHome;
 process.env.BB_HOST            = "127.0.0.1";
 process.env.BB_PORT            = "19234";
 process.env.KLEIN_DISCORD_USER_ID = "KLEIN_USER_123";
+// 90-03: bbSendMessage is fail-closed by default. Enable the master send toggle
+// for the pre-existing gate/flow tests; toggle-specific behavior is pinned in
+// tests/unit/sendToggleStyleGate.test.js.
+process.env.GHOST_SEND_ENABLED = "1";
 
 const ghostWsDir  = path.join(tmpHome, ".openclaw", "workspace-ghost");
 const dataDir     = path.join(tmpHome, ".openclaw", "data");

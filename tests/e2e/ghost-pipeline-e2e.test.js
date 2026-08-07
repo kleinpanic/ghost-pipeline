@@ -16,7 +16,7 @@
  *   4. Draft → Send   → BB MCP called, Discord confirmation posted
  *   5. Klein outgoing → in-memory pending draft cancelled
  *   6. Klein replies before auto-send → draft auto-cancelled
- *   7. doReactionCheck auto-sends stale draft
+ *   7. doReactionCheck expiry clock: stale draft EXPIRES UNSENT (AUTOSEND-FAILCLOSED, 90-03)
  */
 
 const fs   = require("fs");
@@ -49,6 +49,10 @@ process.env.HOME                = tmpHome;
 process.env.BB_HOST            = "127.0.0.1";
 process.env.BB_PORT            = "19234";
 process.env.KLEIN_DISCORD_USER_ID = "KLEIN_USER_123";
+// 90-03: bbSendMessage is fail-closed by default. Enable the master send toggle
+// for the pre-existing gate/flow tests; toggle-specific behavior is pinned in
+// tests/unit/sendToggleStyleGate.test.js.
+process.env.GHOST_SEND_ENABLED = "1";
 
 const ghostWsDir = path.join(tmpHome, ".openclaw", "workspace-ghost");
 const dataDir     = path.join(tmpHome, ".openclaw", "data");
@@ -600,16 +604,19 @@ describe("E2E Flow 4: Klein replies before auto-send", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  E2E FLOW 5 — doReactionCheck auto-send
+//  E2E FLOW 5 — doReactionCheck expiry clock (AUTOSEND-FAILCLOSED, 90-03)
+//  BINDING (90-RESEARCH :377-386): the timer may NEVER be the thing that sends.
+//  A draft whose window elapses with no operator tap expires UNSENT — even with
+//  the send toggle ENABLED (it is enabled in this harness's env).
 // ═══════════════════════════════════════════════════════════════════════════════
-describe("E2E Flow 5: doReactionCheck auto-send", () => {
-  test("autosend_fires: draft past cooldown → BB send triggered, draft removed",
+describe("E2E Flow 5: doReactionCheck expiry clock", () => {
+  test("expiry_cancels_unsent: timer fires, toggle enabled, no tap → zero send calls, draft expired",
     async () => {
       const chatGuid = `iMessage;-;+${ALLOWED_PHONE}`;
 
       ghost.savePendingDrafts([{
-        draftId:     "e2e-autosend-001",
-        messageId:   "discord-msg-autosend",
+        draftId:     "e2e-expiry-001",
+        messageId:   "discord-msg-expiry",
         chatGuid,
         contact:     `+${ALLOWED_PHONE}`,
         contactName: "Test User",
@@ -621,9 +628,15 @@ describe("E2E Flow 5: doReactionCheck auto-send", () => {
       await ghost.doReactionCheck();
       await new Promise(r => setTimeout(r, 200));
 
-      expect(global.__ghostBBLog).toHaveLength(1);
-      expect(global.__ghostBBLog[0].chat_guid).toBe(chatGuid);
+      // ZERO wire calls — the expiry clock cancelled, it did not send
+      expect(global.__ghostBBLog).toHaveLength(0);
+      // Draft removed from pending (expired, not held)
       expect(ghost.loadPendingDrafts()).toHaveLength(0);
+      // Feedback ledger records the expiry
+      const feedback = JSON.parse(
+        fs.readFileSync(path.join(dataDir, "ghost-feedback.json"), "utf8")
+      );
+      expect(feedback.some(e => e.draftId === "e2e-expiry-001" && e.decision === "expired")).toBe(true);
     },
     15_000
   );
