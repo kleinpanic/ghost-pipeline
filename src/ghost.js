@@ -48,6 +48,8 @@ const BUTTON_ACTIONS_FILE   = path.join(DATA_DIR, "ghost-button-actions.json");
 // Separate registry for OC-managed button shortIds (object format, keyed by shortId)
 const BUTTON_REGISTRY_FILE  = path.join(DATA_DIR, "ghost-button-registry.json");
 const PAUSE_FILE          = path.join(DATA_DIR, "ghost-paused.json");
+// 90-03 (GHOST-TOGGLE): master send switch state. Fail-closed — absence means OFF.
+const SEND_TOGGLE_FILE    = path.join(DATA_DIR, "ghost-send-enabled.json");
 const SOUL_FILE           = path.join(GHOST_DIR, "SOUL.md");
 const VOICE_PROFILE_FILE  = path.join(GHOST_DIR, "memory", "voice-profile.md");
 const CONTACTS_MEMORY_DIR = path.join(GHOST_DIR, "memory", "contacts");
@@ -1325,6 +1327,81 @@ function isPaused() {
   } catch { return false; }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  90-03 SEND-GATE LAYERS — fail-closed toggle + positive style allowlist
+//  (additive checks consumed at the top of the bbSendMessage chokepoint)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Master send switch (GHOST-TOGGLE, 70-research addendum 2026-07-30).
+// Fail-closed: cold start / missing file / unparseable or non-boolean state
+// ⇒ sending DISABLED. Only an explicit affirmative state enables the wire.
+// Enable paths (owner-only surfaces):
+//   env  GHOST_SEND_ENABLED=1|true              (test harnesses, dev shells)
+//   file SEND_TOGGLE_FILE = {"enabled": true}   (operator; re-read every send,
+//                                                runtime-toggleable, no restart)
+let _lastToggleEnabled = null;
+function ghostSendToggleState() {
+  let state;
+  const env = process.env.GHOST_SEND_ENABLED;
+  if (env === "1" || env === "true") {
+    state = { enabled: true, source: "env" };
+  } else {
+    try {
+      const d = JSON.parse(fs.readFileSync(SEND_TOGGLE_FILE, "utf8"));
+      state = (d && d.enabled === true)
+        ? { enabled: true, source: "file" }
+        : { enabled: false, reason: "disabled-by-file" };
+    } catch {
+      state = { enabled: false, reason: "absent" };
+    }
+  }
+  if (_lastToggleEnabled !== state.enabled) {
+    log(`Send toggle state: ${state.enabled ? "ENABLED" : "DISABLED"} (${state.source || state.reason})`);
+    _lastToggleEnabled = state.enabled;
+  }
+  return state;
+}
+
+// Positive style allowlist (70-research §5b): an outbound must LOOK like a
+// casual human text. Structural rejection of assistant/markdown/essay shapes —
+// the fail-closed complement to the drift-marker denylist, which can only
+// enumerate known-bad strings. Returns null when allowed, else a reason string.
+const STYLE_MAX_CHARS    = 640; // a few SMS segments; ghost drafts are casual replies
+const STYLE_MAX_NEWLINES = 3;
+const STYLE_ALLOWED_EXTRA = "‘’“”–—…"; // ’ ‘ “ ” – — …
+// Small explicit emoji allowance — casual-register emoji only, everything else rejected
+const STYLE_EMOJI_ALLOW = ["😂","❤️","👍","😊","😅","🙏","😭","💀","🔥","🤣","😉","🙌","😎"];
+const STYLE_ASSISTANT_TELLS = [
+  /\bas an ai\b/i,
+  /\blanguage model\b/i,
+  /\bi('m| am) an? (ai|assistant|bot)\b/i,
+  /\bhow (can|may) i (help|assist)\b/i,
+  /\bi('d| would) be happy to (help|assist)\b/i,
+];
+function styleAllowlistViolation(text) {
+  const t = (text || "").toString();
+  if (t.length > STYLE_MAX_CHARS) return "too-long";
+  if ((t.match(/\n/g) || []).length > STYLE_MAX_NEWLINES) return "too-many-lines";
+  if (/\n\s*\n/.test(t)) return "essay-shape";           // blank-line paragraph breaks
+  if (/`/.test(t)) return "backtick";                    // fences AND inline code
+  if (/\*\*|__|~~/.test(t)) return "markdown-emphasis";
+  if (/^\s*(?:[#>]|[-*]\s|\d+\.\s)/m.test(t)) return "markdown-structure"; // headings/quotes/bullets/lists
+  if (/\[[^\]]*\]\([^)]*\)/.test(t)) return "markdown-link";
+  if (/^\s*\[[^\]]+\]/.test(t)) return "tag-prefix";     // "[Tag] ..." wrapper shapes
+  for (const p of STYLE_ASSISTANT_TELLS) { if (p.test(t)) return "assistant-register"; }
+  // Character allowlist: ASCII printable + newline/tab + typographic punctuation
+  // + the small emoji allowance. Anything else (CJK, control chars, arbitrary
+  // symbols/emoji) is not representable in a casual owner-voice text.
+  let rest = t;
+  for (const e of STYLE_EMOJI_ALLOW) rest = rest.split(e).join("");
+  for (const ch of rest) {
+    const cp = ch.codePointAt(0);
+    const ascii = cp === 0x0a || cp === 0x09 || (cp >= 0x20 && cp <= 0x7e);
+    if (!ascii && !STYLE_ALLOWED_EXTRA.includes(ch)) return "disallowed-characters";
+  }
+  return null;
+}
+
 function isQuietHours(phone) {
   const h    = new Date().getHours();
   const norm = normalizePhone(phone || "");
@@ -2233,7 +2310,7 @@ async function postDraftToDiscord(draftResult, meta) {
       usageStr = ` · ${tt}tok (↑${pt} ↓${ct})${costStr}`;
     }
     content += `\n**Draft** · _${draftResult.model}_${usageStr} · ${convMode}\n${draftLines}\n`;
-    content += `\n⏱️ Auto-sends in ${cooldownMin} min · \`${draftId}\``;
+    content += `\n⏳ Expires unsent in ${cooldownMin} min — tap ✅ Send to deliver · \`${draftId}\``;
   } else if (isSafetyBlocked) {
     content += `\n⚠️ All draft tiers failed content safety — reply manually.`;
   } else {
@@ -2733,6 +2810,24 @@ async function checkAndDraft(key) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function bbSendMessage(chatGuid, message) {
+  // ── 90-03 additive layers: fail-closed toggle + positive style allowlist ──
+  // Both checks sit at the top of the single outbound chokepoint (G10) so the
+  // mcporter path AND the direct-BB fallback are equally covered. They are
+  // ADDITIVE: every pre-existing gate below runs unchanged when they pass.
+  // Layer 1 — master send toggle: absent/off/unparseable state ⇒ no send.
+  // Layer 2 — positive style allowlist: casual-text shape only; the structural
+  // close for what the hasInternalDriftMarkers denylist cannot enumerate.
+  const toggle = ghostSendToggleState();
+  if (!toggle.enabled) {
+    log(`bbSendMessage BLOCKED fail-closed: send toggle ${toggle.reason || "off"} for ${chatGuid || "unknown-chat"}`);
+    return false;
+  }
+  const styleViolation = styleAllowlistViolation(message);
+  if (styleViolation) {
+    log(`bbSendMessage BLOCKED style-allowlist (${styleViolation}) for ${chatGuid || "unknown-chat"}`);
+    return false;
+  }
+
   const normalizedMessage = (message || "").toString().trim();
   if (!normalizedMessage) {
     log("bbSendMessage blocked: empty outbound message");
@@ -2981,7 +3076,6 @@ async function doReactionCheck() {
 
     const now  = Date.now();
     const keep = [];
-    const alreadySentThisCycle = new Set();
 
     const sortedDrafts = [...drafts].sort((a, b) => new Date(b.arrivedAt || 0) - new Date(a.arrivedAt || 0));
     for (const draft of sortedDrafts) {
@@ -3020,36 +3114,16 @@ async function doReactionCheck() {
         continue;
       }
 
-      // No button action yet — check if auto-send window has elapsed
-      const autoSendMs = draft.autoSendMs || AUTO_SEND_WINDOW_MS;
-      if (autoSendMs > 0 && age >= autoSendMs) {
-        // Race guard: if cancelled via HTTP /action or outgoing webhook WHILE this check was running
-        if (cancelledDraftIds.has(draftId)) {
-          log(`Auto-send: draft ${draftId} was cancelled in-memory — skipping race victim`);
-          logFeedback(draft, "cancelled");
-          cancelledDraftIds.delete(draftId);
-          continue;
-        }
-        if (alreadySentThisCycle.has(draft.chatGuid)) {
-          log(`Auto-send: skipping older draft for ${contactName} (newer draft already sent this cycle)`);
-          logFeedback(draft, "superseded");
-          continue;
-        }
-        if (isQuietHours(draft.contact || draft.chatGuid)) {
-          log(`Auto-send: quiet hours — deferring draft for ${contactName}`);
-          keep.push(draft);
-          continue;
-        }
-        if (await kleinRepliedSince(draft.chatGuid, draft.arrivedAt || draft.postedAt)) {
-          log(`Auto-send: Klein already replied to ${contactName} — cancelling draft`);
-          logFeedback(draft, "auto-cancelled-collision");
-          await discordPost(GHOST_CHANNEL, { content: `↩️ Auto-cancelled: **${contactName}** already replied to manually.` });
-          continue;
-        }
-        log(`Auto-send: ${contactName} (${draftId}, age ${Math.round(age / 60000)}min)`);
-        const ok = await executeSend(draft, "auto-send");
-        if (ok) alreadySentThisCycle.add(draft.chatGuid);
-        if (!ok) keep.push(draft);
+      // No button action yet — AUTOSEND-FAILCLOSED (90-03, binding, 90-RESEARCH
+      // :377-386): the window clock may NEVER be the thing that sends. An
+      // unanswered draft EXPIRES UNSENT when its window elapses — even with the
+      // master send toggle enabled. Only an explicit operator tap (Send button /
+      // G4-auth'd /action) reaches executeSend.
+      const expiryMs = draft.autoSendMs || AUTO_SEND_WINDOW_MS;
+      if (expiryMs > 0 && age >= expiryMs) {
+        log(`Draft expired unsent for ${contactName} (${draftId}, age ${Math.round(age / 60000)}min) reason=expired`);
+        logFeedback(draft, "expired");
+        await discordPost(GHOST_CHANNEL, { content: `⏳ Draft for **${contactName}** expired unsent (no Send tap within ${Math.round(expiryMs / 60000)} min).` });
         continue;
       }
 
@@ -3082,7 +3156,7 @@ function createServer() {
 
     // GET /health
     if (req.method === "GET" && req.url === "/health") {
-      return send(200, { ok: true, service: "ghost-v3", paused: isPaused(), pending: pendingMessages.size });
+      return send(200, { ok: true, service: "ghost-v3", paused: isPaused(), sendEnabled: ghostSendToggleState().enabled, pending: pendingMessages.size });
     }
 
     // GET /pending
@@ -3747,6 +3821,8 @@ async function cmdStatus() {
   console.log(`──────────────────────────────────`);
   console.log(`Server:        ${serverOk ? "✅ running" : "❌ down"} (port ${PORT})`);
   console.log(`Paused:        ${paused ? `⏸  YES${pauseData?.pauseUntil ? ` until ${pauseData.pauseUntil}` : ""}` : "▶️  no"}`);
+  const sendToggle = ghostSendToggleState();
+  console.log(`Send toggle:   ${sendToggle.enabled ? `🟢 ENABLED (${sendToggle.source})` : `🔴 DISABLED (${sendToggle.reason}) — drafts expire unsent`}`);
   console.log(`Pending:       ${pending.length} draft(s) awaiting action`);
   console.log(`Voice profile: ${voiceOk ? "✅" : "❌ missing  →  run: ghost learn"}`);
   console.log(`Contacts:      ${contacts.length}/7`);
@@ -4086,5 +4162,8 @@ if (require.main !== module) {
     // Learn-path exports (90-01: mcporter resolution regression)
     MCPORTER_BIN,
     mcporterCallSync,
+    // 90-03: fail-closed send toggle + style allowlist + expiry-cancel exports
+    bbSendMessage, executeSend, ghostSendToggleState, styleAllowlistViolation,
+    SEND_TOGGLE_FILE, AUTO_SEND_WINDOW_MS,
   };
 }
