@@ -1597,8 +1597,13 @@ function trySparkVllm(model, systemPrompt, userContent, timeoutMs = 15000) {
         { role: "system", content: systemPrompt },
         { role: "user",   content: userContent  },
       ],
-      max_tokens:  180,
+      // Nemotron serves in reasoning mode by default and a long SOUL prompt can burn the whole
+      // token budget as reasoning_content before any reply text emits (90-02 attempt #5, empty
+      // drafts at finish_reason=length). enable_thinking:false turns reasoning off at the chat
+      // template (verified live: has_reasoning=false, clean content); the larger cap is belt.
+      max_tokens:  300,
       temperature: 0.72,
+      chat_template_kwargs: { enable_thinking: false },
     });
     const url  = new URL(`${SPARK_BASE_URL}/chat/completions`);
     const opts = {
