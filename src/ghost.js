@@ -2059,11 +2059,16 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
   const available = await probeAvailableModels();
   log(`Draft: probed [${available.join(", ")}] — trying ${available[0] || "none"}...`);
 
+  // Per-tier failure reasons, surfaced on the card (F4 — "content safety" used to be blamed
+  // for plain availability failures; the operator needs to know WHICH to fix).
+  const tierFailures = [];
+
   // Helper: check content safety then return or log+skip
   const safeReturn = (text, model) => {
-    if (!text) return null;
+    if (!text) { tierFailures.push(`${model}: no output`); return null; }
     const trimmed = text.trim();
     if (!passesContentSafety(trimmed, model)) {
+      tierFailures.push(`${model}: content-safety`);
       log(`Draft failed content safety [${model}] — trying next model`);
       return null;
     }
@@ -2110,8 +2115,9 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
     }
   }
 
-  log("Draft: all probed models exhausted (or all failed content safety)");
-  return { text: null, model: "safety-blocked" };
+  const anySafety = tierFailures.some(f => f.endsWith("content-safety"));
+  log(`Draft: all tiers failed — ${tierFailures.join("; ") || "no tiers available"}`);
+  return { text: null, model: anySafety ? "safety-blocked" : "exhausted", failures: tierFailures };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2304,14 +2310,17 @@ async function postDraftToDiscord(draftResult, meta) {
     .filter(m => m.text?.trim())
     .slice(0, 4)
     .reverse();
-  content += `\n**Context** (${ctxMsgs.length})\n`;
-  for (const m of ctxMsgs) {
-    const label = (m.isFromMe === true || m.from === "me") ? "You" : contactName;
-    content += `> **${label}**: ${m.text.trim().slice(0, 120)}\n`;
+  if (ctxMsgs.length) {
+    content += `\n**Context** (${ctxMsgs.length})\n`;
+    for (const m of ctxMsgs) {
+      const label = (m.isFromMe === true || m.from === "me") ? "You" : contactName;
+      content += `> **${label}**: ${m.text.trim().slice(0, 120)}\n`;
+    }
   }
 
   const isSafetyBlocked = draftResult && draftResult.model === "safety-blocked";
-  const hasUsableDraft  = draftResult && draftResult.text && !isSafetyBlocked;
+  const isExhausted     = draftResult && draftResult.model === "exhausted";
+  const hasUsableDraft  = draftResult && draftResult.text && !isSafetyBlocked && !isExhausted;
 
   if (hasUsableDraft) {
     const cooldownMin = Math.round((autoSendMs || AUTO_SEND_WINDOW_MS) / 60000 * 10) / 10;
@@ -2333,6 +2342,9 @@ async function postDraftToDiscord(draftResult, meta) {
     content += `\n⏳ Expires unsent in ${cooldownMin} min — tap ✅ Send to deliver · \`${draftId}\``;
   } else if (isSafetyBlocked) {
     content += `\n⚠️ All draft tiers failed content safety — reply manually.`;
+  } else if (isExhausted) {
+    const fl = (draftResult.failures || []).slice(0, 6).map(f => `> ${f}`).join("\n");
+    content += `\n⚠️ No draft model available — reply manually.\n${fl}`;
   } else {
     content += `\n⚠️ Draft generation failed — reply manually.`;
   }
@@ -2454,7 +2466,7 @@ async function postDraftToDiscord(draftResult, meta) {
   }
 }
 
-async function postUnknownAlert(phone, messageText, contactName, { source = "unknown", enrichment = null, alertCount = 1 } = {}) {
+async function postUnknownAlert(phone, messageText, contactName, { source = "unknown", enrichment = null, alertCount = 1, recentQuotes = null, alertedAt = null } = {}) {
   const n        = normalizePhone(phone);
   const inApple  = source === "apple_contacts";
   const nameDisp = inApple ? `**${contactName}** (+${n})` : `+${n}`;
@@ -2466,7 +2478,9 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
   content += `📞 ${nameDisp}\n`;
   content += `${sourceLine}\n`;
   if (enrichment?.emails?.length) content += `📧 ${enrichment.emails.slice(0,2).join(", ")}\n`;
-  content += `💬 "${(messageText || "").slice(0, 200)}"`;
+  const quotes = (recentQuotes && recentQuotes.length ? recentQuotes : [messageText]);
+  for (const q of quotes) content += `💬 "${(q || "").slice(0, 200)}"\n`;
+  content = content.trimEnd();
   if (alertCount > 1) content += `\n_Alert #${alertCount} — ${3 - alertCount + 1} remaining before auto-deny_`;
   // Text command fallback — buttons click visually but don't route to agent session
   // Typing in this channel DOES reach the ghost agent. Use text commands as the real action path.
@@ -2520,10 +2534,12 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
     // ocGateway=true → buttons are reusable, no need to refresh them
     const ocGateway = !!(OC_GATEWAY_TOKEN && messageId);
     pendingUnknownAlerts.set(n, {
-      messageId, postedAt: nowTs, alertedAt: nowTs,
+      // alertedAt carries through a coalesced repost so a chatty sender can't reset the 4h clock
+      messageId, postedAt: nowTs, alertedAt: alertedAt || nowTs,
       alertCount,
       ocGateway,
       phone: n, messageText, contactName, source, enrichment,
+      recentQuotes: quotes,
     });
   }
 }
@@ -2561,7 +2577,7 @@ async function refreshUnknownAlerts() {
       if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
       pendingUnknownAlerts.delete(phone);
       discordPost(GHOST_CHANNEL, {
-        content: `🚫 Auto-denied \`+${n}\` after ${MAX_UNKNOWN_ALERTS} unanswered alerts. Use \`/approve-contact +${n}\` to override.`,
+        content: `🚫 Auto-denied **${entry.contactName || `+${n}`}** (\`+${n}\`) after ${MAX_UNKNOWN_ALERTS} unanswered alerts.\n💬 last: "${(entry.messageText || "").slice(0, 120)}"\n\`approve ${n}\` reverses it.`,
       }).catch(() => {});
       continue;
     }
@@ -2590,7 +2606,7 @@ async function sweepStaleUnknownAlerts() {
     addToDenylist(n);
     pendingUnknownAlerts.delete(phone);
     discordPost(GHOST_CHANNEL, {
-      content: `🚫 Auto-denied \`+${n}\` (no approval after 4h). Use \`ghost-approve +${n}\` to override.`,
+      content: `🚫 Auto-denied **${entry.contactName || `+${n}`}** (\`+${n}\`) — no approval after 4h.\n💬 last: "${(entry.messageText || "").slice(0, 120)}"\n\`approve ${n}\` reverses it.`,
     }).catch(() => {});
   }
 }
@@ -2637,7 +2653,7 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
     log(`Prompt injection detected from ${contactName}: ${(messageText || "").slice(0, 80)}`);
     // Fire-and-forget Discord alert — include message text so Klein can see the attempt
     discordPost(GHOST_CHANNEL, {
-      content: `⚠️ Prompt injection attempt from **${contactName}**: \`${(messageText || "").slice(0, 100)}\``,
+      content: `⚠️ Prompt injection attempt from **${contactName}**: \`${(messageText || "").slice(0, 100)}\`\n→ Action: message dropped, no draft, no reply sent.`,
     }).catch(() => {});
     return { ok: false, reason: "prompt_injection" };
   }
@@ -2696,10 +2712,40 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
     }
     const { numToAlias } = loadContactsMap();
     const displayName = appleContactName || numToAlias[normalized] || `+${normalized}`;
+
+    // F5 — short codes and transactional senders cannot be "approved" into a conversation:
+    // give them an FYI notice with no approve/deny ask and deny immediately instead of
+    // letting them ride the 3-alert + 4h auto-deny loop. Only for numbers NOT in Contacts.
+    const isShortCode     = normalized.length < 7;
+    const isTransactional = alertSource === "unknown" &&
+      /\b(txn|transaction #|receipt|reminder:|appointment at|verification code|one[- ]time (code|passcode)|your (transfer|order|package|payment)|do not reply|unsubscribe|reply STOP)\b/i
+        .test(messageText || "");
+    if (isShortCode || isTransactional) {
+      addToDenylist(normalized);
+      discordPost(GHOST_CHANNEL, {
+        content: `ℹ️ **${isShortCode ? "Short code" : "Transactional"}** \`+${normalized}\` — no reply path, auto-denied.\n💬 "${(messageText || "").slice(0, 160)}"\n_Wrong call? \`approve ${normalized}\` reverses it._`,
+      }).catch(() => {});
+      return { ok: false, reason: "transactional_sender", resolvedName: displayName };
+    }
+
+    // F1 — coalesce: one live alert card per contact. A new message from a contact that
+    // already has a pending alert replaces the old card (delete+repost) with the recent
+    // quotes stacked, instead of a second card. alertedAt is preserved so the 4h
+    // auto-deny clock is not reset by a chatty sender.
+    const existing = pendingUnknownAlerts.get(normalized);
+    if (existing?.messageId) await discordDelete(GHOST_CHANNEL, existing.messageId).catch(() => {});
+    const recentQuotes = [
+      ...(existing?.recentQuotes || (existing?.messageText ? [existing.messageText] : [])),
+      messageText,
+    ].filter(Boolean).slice(-3);
+
     // Fire-and-forget — alert Klein without blocking the webhook response
     postUnknownAlert(normalized, messageText, displayName, {
       source:     alertSource,
       enrichment: appleEnrichment,
+      alertCount: existing?.alertCount || 1,
+      recentQuotes,
+      alertedAt:  existing?.alertedAt,
     }).catch(() => {});
     return { ok: false, reason: "unknown_contact", resolvedName: displayName, source: alertSource };
   }
