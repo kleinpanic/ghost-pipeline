@@ -266,8 +266,8 @@ const CATEGORY_TONE = {
 const SPARK_BASE_URL = env("SPARK_BASE_URL", "http://127.0.0.1:18080/v1");
 const SPARK_API_KEY  = readSecret(path.join(HOME, ".openclaw", ".spark-key")) ||
                        env("SPARK_API_KEY");
-const SPARK_MODEL_FAST   = "openai/gpt-oss-20b";
-const SPARK_MODEL_STRONG = "openai/gpt-oss-120b";
+const SPARK_MODEL_FAST   = env("SPARK_MODEL_FAST", "openai/gpt-oss-20b");
+const SPARK_MODEL_STRONG = env("SPARK_MODEL_STRONG", "openai/gpt-oss-120b");
 
 // ── Phase 4: OpenClaw Ghost Agent  (uses full model chain + workspace context)
 const OC_GATEWAY_TOKEN = readSecret(path.join(HOME, ".openclaw", ".gateway-token")) ||
