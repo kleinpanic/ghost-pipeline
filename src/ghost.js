@@ -1744,8 +1744,9 @@ const GHOST_DRAFT_MODELS = [
  *
  * Checks:
  * - Ghost agent session: must be active within last 30 min (via OC gateway sessions_list)
+ * - Spark: liveness via checkSparkAvailable (5-min cache); leads the list when up
+ *   (operator ruling 2026-08-10 — supersedes the old style-task exclusion)
  * - OR models: skipped if OR_COOLDOWN_MAP has a future cooldownUntilMs entry
- * - Spark is intentionally excluded (style/persona task, not code/reasoning)
  */
 async function probeAvailableModels() {
   const available = [];
@@ -1811,8 +1812,19 @@ async function probeAvailableModels() {
     }
   }
 
-  // 2. OR models only — haiku first, then fallbacks.
-  //    Spark is intentionally excluded: Ghost is a style/persona task, not a coding/reasoning task.
+  // 2. Spark (DGX over the wg path) — operator ruling 2026-08-10 (90-02 option (b)+(d)):
+  //    spark IS the draft path — free, local, and the only tier not gated on external credits.
+  //    The old "intentionally excluded: style/persona task" exclusion is superseded by that
+  //    ruling; SPARK_MODEL_FAST/STRONG now point at the served Nemotron ids via service env.
+  const sparkUp = await checkSparkAvailable();
+  if (sparkUp) {
+    available.push("spark-fast");
+    log("probeAvailableModels: spark alive — spark-fast leads the waterfall");
+  } else {
+    log("probeAvailableModels: spark unavailable");
+  }
+
+  // 3. OR models — haiku first, then fallbacks.
   const now = Date.now();
   for (const entry of GHOST_DRAFT_MODELS) {
     const coolUntil = OR_COOLDOWN_MAP.get(entry.id);
@@ -1822,6 +1834,9 @@ async function probeAvailableModels() {
       log(`probeAvailableModels: ${entry.label} cooling (${Math.ceil((coolUntil - now) / 1000)}s remaining)`);
     }
   }
+
+  // 4. spark-strong closes the waterfall — same box, explicit big-model pin.
+  if (sparkUp) available.push("spark-strong");
 
   return available;
 }
