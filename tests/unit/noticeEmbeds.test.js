@@ -161,6 +161,31 @@ describe("buildExpiryEmbed / buildCancelEmbed", () => {
   });
 });
 
+describe("F10 transport markers", () => {
+  test("every builder stamps the raw-webhook footer", () => {
+    const embeds = [
+      buildNoticeEmbed({ title: "t" }),
+      buildInjectionEmbed("A", "b"),
+      buildAutoDenyEmbed({ contactName: "A", phone: "1", cause: "timeout" }),
+      buildTransactionalEmbed({ kind: "Short code", phone: "1", messageText: "x" }),
+      buildExpiryEmbed("A", 5),
+      buildCancelEmbed("A"),
+      buildUnknownAlertEmbed("c"),
+    ];
+    for (const e of embeds) expect(e.footer).toEqual({ text: "via raw-webhook" });
+  });
+
+  test("footer length counts toward the 6000 total", () => {
+    const e = buildNoticeEmbed({
+      title: "t".repeat(256),
+      description: "d".repeat(4096),
+      fields: Array.from({ length: 25 }, () => ({ name: "n".repeat(256), value: "v".repeat(1024) })),
+    });
+    expect(embedTotal(e)).toBeLessThanOrEqual(6000);
+    expect(e.footer.text.length).toBeGreaterThan(0);
+  });
+});
+
 describe("buildUnknownAlertEmbed", () => {
   test("approval severity, prebuilt alert content (coalesced quotes) rides whole", () => {
     const content = "⚠️ Unknown contact +1555\n> quote one\n> quote two\napprove 1555 / deny 1555";

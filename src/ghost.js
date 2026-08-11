@@ -2297,6 +2297,8 @@ function buildNoticeEmbed({ severity = "info", title, description = "", fields =
     title:       clamp(title, 256),
     description: clamp(description, 4096),
     color:       EMBED_COLORS[severity] ?? EMBED_COLORS.info,
+    // F10: transport marker — every embed rides raw discordPost (curl), never OC
+    footer:      { text: "via raw-webhook" },
   };
   const fs = (fields || [])
     .filter(f => f && f.value)
@@ -2304,6 +2306,7 @@ function buildNoticeEmbed({ severity = "info", title, description = "", fields =
     .map(f => ({ name: clamp(f.name, 256), value: clamp(f.value, 1024) }));
   if (fs.length) embed.fields = fs;
   let total = embed.title.length + embed.description.length +
+    embed.footer.text.length +
     fs.reduce((a, f) => a + f.name.length + f.value.length, 0);
   if (total > 6000) {
     const keep = Math.max(0, embed.description.length - (total - 6000) - 1);
@@ -2475,7 +2478,9 @@ async function postDraftToDiscord(draftResult, meta) {
         action:     "send",
         channel:    "discord",
         target:     `channel:${GHOST_CHANNEL}`,
-        message:    content,
+        // F10: transport marker — appended only on the OC path; the raw
+        // fallback below reuses bare `content`, where this line would lie.
+        message:    content + "\n_via oc-gateway_",
         components: {
           reusable: true,
           blocks: [{
