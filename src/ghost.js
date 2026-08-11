@@ -2273,6 +2273,114 @@ async function discordDelete(channelId, messageId) {
   }
 }
 
+// ── F9 (2026-08-10 audit): severity-colored embeds for the informational,
+// button-less notice classes. These ride raw discordPost (curl), which carries
+// embeds fine — the OC gateway path (draft cards, unknown-alert buttons) keeps
+// its content+components shape and is NOT converted.
+const EMBED_COLORS = {
+  injection:     0xED4245, // red — security event
+  approval:      0xE67E22, // orange — waiting on Klein's decision
+  autodeny:      0x95A5A6, // grey — routine deny/transactional outcome
+  transactional: 0x95A5A6,
+  expiry:        0x95A5A6,
+  info:          0x3498DB, // blue
+};
+
+// Discord hard limits: title 256, description 4096, field value 1024,
+// field name 256, ≤25 fields, 6000 chars total across the embed.
+function buildNoticeEmbed({ severity = "info", title, description = "", fields = [] }) {
+  const clamp = (s, n) => {
+    s = String(s ?? "");
+    return s.length > n ? s.slice(0, n - 1) + "…" : s;
+  };
+  const embed = {
+    title:       clamp(title, 256),
+    description: clamp(description, 4096),
+    color:       EMBED_COLORS[severity] ?? EMBED_COLORS.info,
+  };
+  const fs = (fields || [])
+    .filter(f => f && f.value)
+    .slice(0, 25)
+    .map(f => ({ name: clamp(f.name, 256), value: clamp(f.value, 1024) }));
+  if (fs.length) embed.fields = fs;
+  let total = embed.title.length + embed.description.length +
+    fs.reduce((a, f) => a + f.name.length + f.value.length, 0);
+  if (total > 6000) {
+    const keep = Math.max(0, embed.description.length - (total - 6000) - 1);
+    total -= embed.description.length;
+    embed.description = keep ? embed.description.slice(0, keep) + "…" : "";
+    total += embed.description.length;
+  }
+  while (total > 6000 && fs.length) {
+    const dropped = fs.pop();
+    total -= dropped.name.length + dropped.value.length;
+  }
+  if (embed.fields && !fs.length) delete embed.fields;
+  return embed;
+}
+
+function buildInjectionEmbed(contactName, messageText) {
+  return buildNoticeEmbed({
+    severity:    "injection",
+    title:       "⚠️ Prompt injection attempt",
+    description: `From **${contactName}**\n\`${(messageText || "").slice(0, 100)}\``,
+    fields:      [{ name: "Action", value: "message dropped, no draft, no reply sent" }],
+  });
+}
+
+// cause: "max-alerts" (3 unanswered reposts) | "timeout" (4 waking hours)
+function buildAutoDenyEmbed({ contactName, phone, lastMessage, cause }) {
+  const why = cause === "timeout"
+    ? "no approval after 4h"
+    : `after ${MAX_UNKNOWN_ALERTS} unanswered alerts`;
+  return buildNoticeEmbed({
+    severity:    "autodeny",
+    title:       `🚫 Auto-denied ${contactName || `+${phone}`}`,
+    description: `\`+${phone}\` — ${why}`,
+    fields: [
+      { name: "Last message", value: lastMessage ? `"${lastMessage.slice(0, 120)}"` : "" },
+      { name: "Reverse",      value: `\`approve ${phone}\`` },
+    ],
+  });
+}
+
+// kind: "Short code" | "Transactional"
+function buildTransactionalEmbed({ kind, phone, messageText }) {
+  return buildNoticeEmbed({
+    severity:    "transactional",
+    title:       `ℹ️ ${kind} auto-denied`,
+    description: `\`+${phone}\` — no reply path.\n💬 "${(messageText || "").slice(0, 160)}"`,
+    fields:      [{ name: "Wrong call?", value: `\`approve ${phone}\` reverses it.` }],
+  });
+}
+
+function buildExpiryEmbed(contactName, minutes) {
+  return buildNoticeEmbed({
+    severity:    "expiry",
+    title:       "⏳ Draft expired unsent",
+    description: `**${contactName}** — no Send tap within ${minutes} min.`,
+  });
+}
+
+function buildCancelEmbed(contactName, reason = null) {
+  return buildNoticeEmbed({
+    severity:    "expiry",
+    title:       "❌ Draft cancelled",
+    description: `**${contactName}**${reason ? ` — ${reason}` : ""}`,
+  });
+}
+
+// Raw-webhook fallback of the unknown-contact alert (OC gateway down → no
+// buttons anyway). The prebuilt alert content — coalesced quotes, alert count,
+// approve/deny text commands — rides whole as the description.
+function buildUnknownAlertEmbed(content) {
+  return buildNoticeEmbed({
+    severity:    "approval",
+    title:       "⚠️ Unknown contact — approval needed",
+    description: content,
+  });
+}
+
 // In-memory map of unanswered unknown-contact alerts: phone → { messageId, postedAt, alertedAt, alertCount, phone, messageText, contactName, source, enrichment }
 const pendingUnknownAlerts = new Map();
 
@@ -2526,9 +2634,9 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
     }
   }
 
-  // Fallback to raw Discord if OC gateway unavailable
+  // Fallback to raw Discord if OC gateway unavailable — F9: embed (approval orange)
   if (!messageId) {
-    const result = await discordPost(GHOST_CHANNEL, { content });
+    const result = await discordPost(GHOST_CHANNEL, { embeds: [buildUnknownAlertEmbed(content)] });
     messageId = result?.id || null;
     if (messageId) log(`postUnknownAlert: OC gateway unavailable — posted without buttons (fallback). Buttons will not work.`);
   }
@@ -2582,7 +2690,7 @@ async function refreshUnknownAlerts() {
       if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
       pendingUnknownAlerts.delete(phone);
       discordPost(GHOST_CHANNEL, {
-        content: `🚫 Auto-denied **${entry.contactName || `+${n}`}** (\`+${n}\`) after ${MAX_UNKNOWN_ALERTS} unanswered alerts.\n💬 last: "${(entry.messageText || "").slice(0, 120)}"\n\`approve ${n}\` reverses it.`,
+        embeds: [buildAutoDenyEmbed({ contactName: entry.contactName, phone: n, lastMessage: entry.messageText, cause: "max-alerts" })],
       }).catch(() => {});
       continue;
     }
@@ -2611,7 +2719,7 @@ async function sweepStaleUnknownAlerts() {
     addToDenylist(n);
     pendingUnknownAlerts.delete(phone);
     discordPost(GHOST_CHANNEL, {
-      content: `🚫 Auto-denied **${entry.contactName || `+${n}`}** (\`+${n}\`) — no approval after 4h.\n💬 last: "${(entry.messageText || "").slice(0, 120)}"\n\`approve ${n}\` reverses it.`,
+      embeds: [buildAutoDenyEmbed({ contactName: entry.contactName, phone: n, lastMessage: entry.messageText, cause: "timeout" })],
     }).catch(() => {});
   }
 }
@@ -2658,7 +2766,7 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
     log(`Prompt injection detected from ${contactName}: ${(messageText || "").slice(0, 80)}`);
     // Fire-and-forget Discord alert — include message text so Klein can see the attempt
     discordPost(GHOST_CHANNEL, {
-      content: `⚠️ Prompt injection attempt from **${contactName}**: \`${(messageText || "").slice(0, 100)}\`\n→ Action: message dropped, no draft, no reply sent.`,
+      embeds: [buildInjectionEmbed(contactName, messageText)],
     }).catch(() => {});
     return { ok: false, reason: "prompt_injection" };
   }
@@ -2728,7 +2836,7 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
     if (isShortCode || isTransactional) {
       addToDenylist(normalized);
       discordPost(GHOST_CHANNEL, {
-        content: `ℹ️ **${isShortCode ? "Short code" : "Transactional"}** \`+${normalized}\` — no reply path, auto-denied.\n💬 "${(messageText || "").slice(0, 160)}"\n_Wrong call? \`approve ${normalized}\` reverses it._`,
+        embeds: [buildTransactionalEmbed({ kind: isShortCode ? "Short code" : "Transactional", phone: normalized, messageText })],
       }).catch(() => {});
       return { ok: false, reason: "transactional_sender", resolvedName: displayName };
     }
@@ -3173,7 +3281,7 @@ async function doReactionCheck() {
 
       if (action === "cancel") {
         log(`❌ Cancel: ${contactName} (${draftId})`);
-        await discordPost(GHOST_CHANNEL, { content: `❌ Cancelled draft for **${contactName}**.` });
+        await discordPost(GHOST_CHANNEL, { embeds: [buildCancelEmbed(contactName)] });
         logFeedback(draft, "cancelled");
         continue;
       }
@@ -3194,7 +3302,7 @@ async function doReactionCheck() {
       if (expiryMs > 0 && age >= expiryMs) {
         log(`Draft expired unsent for ${contactName} (${draftId}, age ${Math.round(age / 60000)}min) reason=expired`);
         logFeedback(draft, "expired");
-        await discordPost(GHOST_CHANNEL, { content: `⏳ Draft for **${contactName}** expired unsent (no Send tap within ${Math.round(expiryMs / 60000)} min).` });
+        await discordPost(GHOST_CHANNEL, { embeds: [buildExpiryEmbed(contactName, Math.round(expiryMs / 60000))] });
         continue;
       }
 
@@ -3308,7 +3416,7 @@ function createServer() {
           logFeedback(draft, "cancelled");
           drafts.splice(draftIdx, 1);
           savePendingDrafts(drafts);
-          await discordPost(GHOST_CHANNEL, { content: `❌ Cancelled draft for **${draft.contactName}**.` });
+          await discordPost(GHOST_CHANNEL, { embeds: [buildCancelEmbed(draft.contactName)] });
           return send(200, { ok: true, action: "cancelled" });
         }
         if (action === "send") {
@@ -3392,7 +3500,7 @@ function createServer() {
               log(`Klein outgoing — cancelled posted draft ${draft.draftId} for ${draft.contactName}`);
               logFeedback(draft, "auto-cancelled-klein-replied");
               discordPost(GHOST_CHANNEL, {
-                content: `↩️ Cancelled draft for **${draft.contactName}** — Klein already replied.`,
+                embeds: [buildCancelEmbed(draft.contactName, "Klein already replied")],
               }).catch(() => {});
             }
             cancelled = true;
@@ -4223,6 +4331,15 @@ if (require.main !== module) {
     recordRateLimitHit,
     clearRateBackoff,
     hasInternalDriftMarkers,
+    // F9 embed builders (structural tests)
+    EMBED_COLORS,
+    buildNoticeEmbed,
+    buildInjectionEmbed,
+    buildAutoDenyEmbed,
+    buildTransactionalEmbed,
+    buildExpiryEmbed,
+    buildCancelEmbed,
+    buildUnknownAlertEmbed,
     OUTBOUND_BACKOFF_FILE,
     OUTBOUND_RATE_FILE,
     BACKOFF_BASE_MS,
