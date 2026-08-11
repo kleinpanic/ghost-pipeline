@@ -2023,8 +2023,13 @@ async function tryGhostAgentSession(contactName, messageText, systemPrompt, user
 function ocGatewayPost(tool, args, timeoutMs = 15000) {
   return new Promise((resolve) => {
     if (!OC_GATEWAY_TOKEN) { resolve(null); return; }
-    // Route component clicks to ghost agent session (not main agent)
-    const body = JSON.stringify({ tool, args, sessionKey: GHOST_AGENT_SESSION_KEY });
+    // No sessionKey pin: pinning to the ghost session applied the ghost AGENT's tool policy,
+    // and f447db3 removed `message` from it — every card post 404'd "Tool not available" and
+    // buttons silently degraded to the raw fallback (proven in 90-02 attempt #6). Unpinned,
+    // the invoke runs under the default scope which still has `message`; click dispatch never
+    // depended on the posting session anyway — the pre-message hook parses the LABEL
+    // (Clicked "✅ Send · <draftId>".) and calls ghost's localhost HTTP by draftId.
+    const body = JSON.stringify({ tool, args });
     const req = https.request({
       hostname: "127.0.0.1",
       port:     OC_GATEWAY_PORT,
