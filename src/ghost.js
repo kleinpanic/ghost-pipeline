@@ -262,26 +262,60 @@ const CATEGORY_TONE = {
 - Keep it to the point. Don't initiate personal topics.`,
 };
 
-// ── Phase 2: Spark vllm (local, fastest, strongest)
-const SPARK_BASE_URL = env("SPARK_BASE_URL", "http://127.0.0.1:18080/v1");
+// ── Phase 2: Spark vllm (local DGX, reached over the wg-nvidia plane)
+// The address is 10.88.88.1, NOT 10.99.1.1. `ip route get 10.88.88.1` leaves via
+// `dev wg-nvidia`; 10.99.1.1 has no route onto that plane and falls through to the LAN
+// gateway, where nothing listens. Both addresses were floating around as "the Spark
+// address" and the wrong one is what shipped here — which is why the cron-driven learn
+// path could not reach a box the daemon-driven draft path was talking to fine.
+const SPARK_BASE_URL = env("SPARK_BASE_URL", "http://10.88.88.1:18080/v1");
 const SPARK_API_KEY  = readSecret(path.join(HOME, ".openclaw", ".spark-key")) ||
                        env("SPARK_API_KEY");
-const SPARK_MODEL_FAST   = env("SPARK_MODEL_FAST", "openai/gpt-oss-20b");
-const SPARK_MODEL_STRONG = env("SPARK_MODEL_STRONG", "openai/gpt-oss-120b");
+// This deployment serves exactly ONE chat model (`GET /v1/models`:
+// nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4, aliased `nemotron-trtllm`,
+// `nemotron-super-trtllm`, `any`) plus the 1B embed/rerank/TTS/STT models — so the
+// fast/strong split is nominal today and both resolve to the same weights.
+// The previous defaults, openai/gpt-oss-20b and -120b, are NOT downloaded on that server
+// and answer `code: model_loading`. `any` is the router's own alias for "the chat model
+// this deployment serves": pinning a concrete id is exactly how the learn path died (the
+// id went stale and nothing noticed), so the id is resolved at call time and logged from
+// the response instead of being frozen here.
+const SPARK_MODEL_FAST   = env("SPARK_MODEL_FAST", "any");
+const SPARK_MODEL_STRONG = env("SPARK_MODEL_STRONG", "any");
 
 // ── Phase 4: OpenClaw Ghost Agent  (uses full model chain + workspace context)
 const OC_GATEWAY_TOKEN = readSecret(path.join(HOME, ".openclaw", ".gateway-token")) ||
                          env("OC_GATEWAY_TOKEN");
 
 // ── `ghost learn` analysis model (contact summaries + voice profile)
-// KNOWN DEAD as of 2026-08-06: OpenRouter retired the `:free` variant and now answers
-// this slug with 404 "This model is unavailable for free ... use this slug instead:
-// google/gemma-3-27b-it". Commit 404fe2f had already dropped free-tier OR models from
-// the *draft* path in March for the same class of reason; the learn path was never
-// migrated. The replacement is a live operator decision (paid OR vs. the local Spark
-// vllm already wired for drafting), so the slug is left as-is rather than silently
-// repointed — learn now fails loudly instead of papering over it (see buildVoiceProfile).
-const LEARN_MODEL = env("GHOST_LEARN_MODEL", "google/gemma-3-27b-it:free");
+// Was `google/gemma-3-27b-it:free` on OpenRouter until 2026-08-06, when OR retired the
+// `:free` variant and began answering the slug with a permanent 404. Learn now runs on
+// the local Spark box instead: free, on Klein's own hardware, and not one provider
+// pricing decision away from dying again. Override with $GHOST_LEARN_MODEL.
+const LEARN_MODEL = env("GHOST_LEARN_MODEL", "any");
+
+// The draft path's 200-token budget is right for a two-line text reply and wrong for
+// learn: the voice-profile prompt asks for seven `##` sections and the contact prompt for
+// six. A profile generated under a 200-token cap comes back cut off mid-sentence — and a
+// truncated document still reads as a real one, so the emptiness guard would pass it and
+// Ghost would speak as Klein from a fragment. Hence a per-call budget rather than a
+// global bump, which would have made every draft six times more expensive.
+//
+// 3000, not the 1200 first estimated: a live run on 2026-08-13 hit finish_reason=length
+// at 1200 with the truncation guard catching it. Measured on that box, a contact summary
+// (6 sections) costs ~500 tokens / 25 s and generation runs ~20 tok/s, so the 7-section
+// profile needs roughly double the first estimate. This is a ceiling, not a target —
+// unused headroom costs nothing, and the model is local and free.
+const LEARN_MAX_TOKENS = 3000;
+
+// At ~20 tok/s a full-budget generation takes ~150 s, so the 30 s budget that suited a
+// small hosted model would abort a healthy run partway through.
+const LEARN_TIMEOUT_MS = 300000;
+
+// How many `##` sections each learn prompt asks the model to produce. Used as a
+// completeness oracle that does not depend on the provider setting `finish_reason`.
+const VOICE_PROFILE_SECTIONS   = 7;
+const CONTACT_SUMMARY_SECTIONS = 6;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -1538,8 +1572,12 @@ async function resolveChatGuid(phone) {
 //  MODEL GENERATION  (OR claude-haiku → OR gemini-flash → Spark fallback)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Try OpenRouter with a specific model. Returns text or null. */
-function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
+/**
+ * Try OpenRouter with a specific model. Resolves { text, usage, finishReason } or null.
+ * `maxTokens` defaults to the draft budget; callers producing a document rather than a
+ * text reply must raise it explicitly (see LEARN_MAX_TOKENS).
+ */
+function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000, maxTokens = 200) {
   return new Promise((resolve) => {
     if (!OPENROUTER_API_KEY) { resolve(null); return; }
     const body = JSON.stringify({
@@ -1548,7 +1586,7 @@ function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
         { role: "system", content: systemPrompt },
         { role: "user",   content: userContent  },
       ],
-      max_tokens:  200,
+      max_tokens:  maxTokens,
       temperature: 0.75,
     });
     const options = {
@@ -1573,7 +1611,9 @@ function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
           if (text) {
             log(`OR [${model.split("/").pop()}] draft ok`);
             const usage = parsed?.usage || null;
-            resolve({ text, usage });
+            // finish_reason distinguishes "the model was done" from "the model was cut
+            // off at max_tokens". Callers writing a document must reject the latter.
+            resolve({ text, usage, finishReason: parsed?.choices?.[0]?.finish_reason || null });
           } else {
             // Log actual error if present (e.g. 429 rate limit, provider error)
             const errMsg = parsed?.error?.message || parsed?.error || "empty response";
@@ -1598,20 +1638,29 @@ function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
 
 // ── Phase 2: Spark vllm ─────────────────────────────────────────────────────
 
-/** Try Spark vllm (local DGX). model = SPARK_MODEL_FAST | SPARK_MODEL_STRONG */
-function trySparkVllm(model, systemPrompt, userContent, timeoutMs = 15000) {
+/**
+ * Try Spark vllm (local DGX). model = SPARK_MODEL_FAST | SPARK_MODEL_STRONG | LEARN_MODEL.
+ * Resolves { text, finishReason, model } or null.
+ *
+ * `maxTokens` defaults to the draft budget. The learn path passes LEARN_MAX_TOKENS —
+ * a document needs far more room than a two-line reply, and running a document prompt
+ * under the draft budget produces a plausible-looking fragment rather than a failure.
+ */
+function trySparkVllm(model, systemPrompt, userContent, timeoutMs = 15000, maxTokens = 300) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       model,
+      // learn passes no system prompt. Sending `content: ""` puts an empty system turn
+      // through the chat template, so omit the turn entirely instead.
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",   content: userContent  },
+        ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+        { role: "user", content: userContent },
       ],
       // Nemotron serves in reasoning mode by default and a long SOUL prompt can burn the whole
       // token budget as reasoning_content before any reply text emits (90-02 attempt #5, empty
       // drafts at finish_reason=length). enable_thinking:false turns reasoning off at the chat
       // template (verified live: has_reasoning=false, clean content); the larger cap is belt.
-      max_tokens:  300,
+      max_tokens:  maxTokens,
       temperature: 0.72,
       chat_template_kwargs: { enable_thinking: false },
     });
@@ -1633,8 +1682,19 @@ function trySparkVllm(model, systemPrompt, userContent, timeoutMs = 15000) {
         try {
           const parsed = JSON.parse(data);
           const text   = (parsed?.choices?.[0]?.message?.content || "").trim();
-          if (text) { log(`Spark [${model.split("/").pop()}] draft ok`); resolve(text); }
-          else { log(`Spark [${model.split("/").pop()}] empty`); resolve(null); }
+          // `any` is an alias, so log what the router actually resolved it to rather
+          // than the alias we asked for — otherwise the log cannot tell you which
+          // weights produced the artifact.
+          const served = parsed?.model || model;
+          if (text) {
+            log(`Spark [${served.split("/").pop()}] ok`);
+            resolve({ text, finishReason: parsed?.choices?.[0]?.finish_reason || null, model: served });
+          } else {
+            const errMsg = parsed?.error?.message || "empty response";
+            const errCode = parsed?.error?.code ? ` (code ${parsed.error.code})` : "";
+            log(`Spark [${served.split("/").pop()}] failed: ${String(errMsg).slice(0, 120)}${errCode}`);
+            resolve(null);
+          }
         } catch (e) { log(`Spark parse error: ${e.message}`); resolve(null); }
       });
     });
@@ -1827,10 +1887,22 @@ async function probeAvailableModels() {
     }
   }
 
-  // 2. Spark (DGX over the wg path) — operator ruling 2026-08-10 (90-02 option (b)+(d)):
+  // 2. Spark (DGX over the wg-nvidia path) — operator ruling 2026-08-10 (90-02 option (b)+(d)):
   //    spark IS the draft path — free, local, and the only tier not gated on external credits.
-  //    The old "intentionally excluded: style/persona task" exclusion is superseded by that
-  //    ruling; SPARK_MODEL_FAST/STRONG now point at the served Nemotron ids via service env.
+  //    The old "intentionally excluded: style/persona task" exclusion is superseded by that ruling.
+  //
+  //    This comment used to claim SPARK_MODEL_FAST/STRONG "now point at the served Nemotron
+  //    ids via service env". That was false in the durable sense and cost six days: the
+  //    corrected values existed only as exported shell vars in the running daemon's process
+  //    environment. No ghost systemd unit exists, and the 3am learn cron inherits none of it,
+  //    so learn kept using the stale in-code defaults while drafting worked. The values now
+  //    live in the constants above and in .env, which both cron and daemon actually read.
+  //
+  //    NOTE: checkSparkAvailable probes /v1/models, which answers 200 even while the router
+  //    refuses generation (observed 2026-08-13: kv_reuse_isolation_unproven 503 on every
+  //    chat completion while /v1/models and embeddings stayed green). "Spark serves a model"
+  //    and "Spark will generate" are separate questions; this probe only answers the first,
+  //    and the draft path falls through to the OR tiers when generation is refused.
   const sparkUp = await checkSparkAvailable();
   if (sparkUp) {
     available.push("spark-fast");
@@ -2099,9 +2171,9 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
         break;
       }
       case "spark-fast": {
-        log("Draft: Spark gpt-oss-20b...");
-        const t = await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent);
-        const r = safeReturn(t, "spark-20b");
+        log(`Draft: Spark ${SPARK_MODEL_FAST}...`);
+        const t = (await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent))?.text || null;
+        const r = safeReturn(t, "spark-fast");
         if (r) return r;
         if (!t) { log("Draft: Spark fast returned null — invalidating cache"); invalidateSparkCache(); }
         break;
@@ -2120,9 +2192,9 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
         break;
       }
       case "spark-strong": {
-        log("Draft: Spark gpt-oss-120b (last resort)...");
-        const t = await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000);
-        const r = safeReturn(t, "spark-120b");
+        log(`Draft: Spark ${SPARK_MODEL_STRONG} (last resort)...`);
+        const t = (await trySparkVllm(SPARK_MODEL_STRONG, systemPrompt, userContent, 25000))?.text || null;
+        const r = safeReturn(t, "spark-strong");
         if (r) return r;
         if (!t) invalidateSparkCache();
         break;
@@ -3736,6 +3808,60 @@ function findChatGuidForPhone(phone, allChats) {
   return findChatsForPhone(phone, allChats)[0]?.guid || null;
 }
 
+/**
+ * A learn generation can fail in two ways, and only one of them is obvious.
+ *
+ * The obvious one is saying nothing, which the callers already reject. The dangerous one
+ * is being cut off partway: a half-written voice profile still reads like a voice
+ * profile, so it passes an emptiness check, gets stamped with today's date, and Ghost
+ * then speaks as Klein out of a fragment. That is the same defect class as the stub this
+ * session removed, arriving through a different door.
+ *
+ * Two independent signals, because neither is sufficient alone:
+ *   - finish_reason === "length" is the provider saying it ran out of room. Direct, but
+ *     not every provider sets it.
+ *   - the `##` section count is our own oracle, derived from what the prompt asked for.
+ *     It catches a model that stopped early of its own accord, and it does not care
+ *     whether the API bothered to tell us.
+ *
+ * Returns the text so callers can use it as an expression.
+ */
+/**
+ * Count the section headings in a generated document.
+ *
+ * The prompts ask for `## Heading`, and that is what the model usually returns — but
+ * "usually" is not a contract, and rejecting a complete document because it used a
+ * different heading style would be a false alarm that stops the nightly run for no
+ * reason. Accept any markdown heading level, and also a bolded line used as a heading,
+ * which is the common alternative. All that matters for the truncation check is that
+ * headings are counted consistently, not that they use one exact syntax.
+ */
+function countSections(text) {
+  const headings = text.match(/^\s{0,3}#{1,4}\s+\S/gm) || [];
+  if (headings.length) return headings.length;
+  return (text.match(/^\s{0,3}\*\*[^*\n]+\*\*:?\s*$/gm) || []).length;
+}
+
+function assertGeneratedWhole(result, { label, sections }) {
+  if (result?.finishReason === "length") {
+    throw new Error(
+      `${label} was truncated at the ${LEARN_MAX_TOKENS}-token limit ` +
+      `(finish_reason=length) — refusing to write a partial document`,
+    );
+  }
+  const found = countSections(result.text);
+  if (found < sections) {
+    // Include a preview: "incomplete" alone cannot distinguish a truncated document
+    // from one the model chose to format differently, and those need opposite fixes.
+    throw new Error(
+      `${label} is incomplete: ${found} of ${sections} requested sections ` +
+      `— refusing to write a partial document. First 200 chars: ` +
+      JSON.stringify(result.text.slice(0, 200)),
+    );
+  }
+  return result.text;
+}
+
 function isFromKlein(m) {
   // BB direct HTTP uses isFromMe:true; mcporter uses from:"me"
   if (!m || typeof m !== "object") return false;
@@ -3848,13 +3974,12 @@ ${stats.examples}
 Keep it short and practical.`;
 
   log(`Generating contact summary for ${contact.alias}...`);
-  // tryGeminiCli was removed in 404fe2f but these call sites were left dangling —
-  // learn crashed with ReferenceError. Go straight to OR (returns { text } or null).
-  const orSummary = await tryOpenRouter(LEARN_MODEL, "", prompt, 30000);
-  const summary = orSummary?.text || null;
+  // Runs on the local Spark box (see LEARN_MODEL).
+  const result = await trySparkVllm(LEARN_MODEL, "", prompt, LEARN_TIMEOUT_MS, LEARN_MAX_TOKENS);
+  const summary = result?.text || null;
   // D6/O-2: this used to substitute a stats-only stub and write it under a fresh date,
   // which is indistinguishable from real analysis at a glance — six nights of fakes went
-  // unnoticed because of it. tryOpenRouter collapses every failure to null, so the caller
+  // unnoticed because of it. The helper collapses every failure to null, so the caller
   // cannot tell "model retired" from "nothing to say"; treat null as fatal and write
   // nothing, leaving any previously-good file on disk intact.
   if (!summary) {
@@ -3863,6 +3988,10 @@ Keep it short and practical.`;
       `— refusing to write a stats-only stub (see ghost-learn.log for the provider error)`,
     );
   }
+  assertGeneratedWhole(result, {
+    label: `contact summary for ${contact.alias}`,
+    sections: CONTACT_SUMMARY_SECTIONS,
+  });
 
   const filename = `${contact.phone}-${contact.alias.toLowerCase().replace(/\s+/g, "-")}.md`;
   const filepath = path.join(CONTACTS_MEMORY_DIR, filename);
@@ -3920,9 +4049,8 @@ Write a universal voice profile capturing what's consistent ACROSS all relations
 Keep it practical — Ghost reads this before every draft.`;
 
   log("Building voice profile...");
-  // tryGeminiCli removed in 404fe2f (dangling ref crashed learn); OR returns { text } or null
-  const orProfile = await tryOpenRouter(LEARN_MODEL, "", prompt, 30000);
-  const profile = orProfile?.text || null;
+  const result = await trySparkVllm(LEARN_MODEL, "", prompt, LEARN_TIMEOUT_MS, LEARN_MAX_TOKENS);
+  const profile = result?.text || null;
   // D6/O-2: the fallback here was a two-line hardcoded literal, written under today's
   // date every night from 2026-08-06 on. Ghost reads this file before every draft and
   // speaks as Klein, so a stub is not a degraded profile — it is a fabricated identity.
@@ -3933,6 +4061,9 @@ Keep it practical — Ghost reads this before every draft.`;
       `— refusing to write a hardcoded stub (see ghost-learn.log for the provider error)`,
     );
   }
+  // A profile cut off at the token ceiling is worse than none: it looks generated, so
+  // nothing downstream would question it.
+  assertGeneratedWhole(result, { label: "voice profile", sections: VOICE_PROFILE_SECTIONS });
 
   writeFileSafe(VOICE_PROFILE_FILE, `# Klein Voice Profile\n_Updated: ${new Date().toISOString().slice(0, 10)}_\n\n${profile}\n`);
   log(`Voice profile saved: ${VOICE_PROFILE_FILE}`);
@@ -4420,5 +4551,8 @@ if (require.main !== module) {
     // D6/O-2: learn must fail loudly rather than write convincing stubs
     learnContact, buildVoiceProfile, cmdLearn, LEARN_MODEL,
     VOICE_PROFILE_FILE, CONTACTS_MEMORY_DIR,
+    // D6/O-2 cycle 2: the token budget is per-call, so both helpers are exported to pin
+    // that the draft budgets did NOT move when learn's did.
+    tryOpenRouter, trySparkVllm, LEARN_MAX_TOKENS,
   };
 }

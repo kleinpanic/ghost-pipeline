@@ -17,8 +17,11 @@
  * so "did not write" is asserted on content AND on the Updated stamp of a pre-existing
  * file, not just on existence.
  *
- * The 404 body below is the verbatim production payload, so these tests drive the real
- * tryOpenRouter code path rather than a stubbed-out approximation of it.
+ * CYCLE 2 (2026-08-13): learn was repointed off OpenRouter onto the local Spark box, so
+ * the dead-provider case is now driven with Spark's own 503 rather than OR's 404. The
+ * contract under test is unchanged — only which provider is failing. The body below is
+ * the verbatim payload Spark's router returned that night, so these still drive the real
+ * request path rather than a stubbed approximation of it.
  */
 
 "use strict";
@@ -33,6 +36,19 @@ const nock = require("nock");
 // would write to the operator's live workspace-ghost/memory.
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ghost-learn-faillow-"));
 process.env.HOME = tmpHome;
+
+// Pin Spark at a host nock can intercept. Without this the constant resolves from the
+// project .env and every "model unavailable" test spent 5s attempting a REAL connection
+// to the operator's DGX address before failing — passing for a plausible but wrong
+// reason, and coupling the suite to whether a tunnel happened to be up.
+process.env.SPARK_BASE_URL = "http://spark.test:18080/v1";
+// ghost falls back to env() for the key when ~/.openclaw/.spark-key is absent, which
+// under tmpHome it is — and env() would otherwise resolve the OPERATOR'S REAL TOKEN out
+// of the project .env. Force a dummy so no real credential is ever put on the wire.
+process.env.SPARK_API_KEY = "spark-test-dummy";
+
+const SPARK_ORIGIN = "http://spark.test:18080";
+const SPARK_PATH   = "/v1/chat/completions";
 
 const GH_DIR       = path.join(tmpHome, ".openclaw", "workspace-ghost");
 const MEMORY_DIR   = path.join(GH_DIR, "memory");
@@ -67,26 +83,47 @@ jest.mock("child_process", () => {
 const cp    = require("child_process");
 const ghost = require("../../src/ghost.js");
 
-// The exact body OpenRouter returns for the retired slug (ghost-learn.log, 66 hits).
-const RETIRED_SLUG_404 = {
+// The exact body Spark's router returns while generation is gated (observed 2026-08-13:
+// every /v1/chat/completions refused instantly, while /v1/models and embeddings stayed
+// green — so "the box is up" and "the box will generate" are different questions).
+const SPARK_GATED_503 = {
   error: {
-    message: "This model is unavailable for free. The paid version is available now - "
-           + "use this slug instead: google/gemma-3-27b-it",
-    code: 404,
+    message: "KV reuse isolation is not proven for this deployment.",
+    type: "service_unavailable",
+    code: "kv_reuse_isolation_unproven",
   },
 };
 
-function mockOpenRouterDead() {
-  return nock("https://openrouter.ai")
-    .post("/api/v1/chat/completions")
-    .reply(404, RETIRED_SLUG_404);
+function mockModelDead() {
+  return nock(SPARK_ORIGIN).post(SPARK_PATH).reply(503, SPARK_GATED_503);
 }
 
-function mockOpenRouterAlive(text) {
-  return nock("https://openrouter.ai")
-    .post("/api/v1/chat/completions")
-    .reply(200, { choices: [{ message: { content: text } }], usage: { total_tokens: 42 } });
+function mockModelAlive(text) {
+  return nock(SPARK_ORIGIN)
+    .post(SPARK_PATH)
+    .reply(200, { choices: [{ message: { content: text }, finish_reason: "stop" }] });
 }
+
+// Complete documents — the guards added in cycle 2 reject a response carrying fewer
+// sections than the prompt asked for, so the "model responded" fixtures must be whole.
+const FULL_PROFILE = [
+  "## Core Typography\nlowercase, trailing-period-free",
+  "## Universal Vocabulary\nyea, bet, fs",
+  "## Response Length\nshort",
+  "## What Klein Knows / Talks About\nVT, linux",
+  "## How He Deflects\ngoes vague",
+  "## Current Life Context\nVT student",
+  "## What Immediately Sounds Like Klein\nno caps",
+].join("\n\n");
+
+const FULL_SUMMARY = [
+  "## Who They Are\nAlpha is a close friend from VT.",
+  "## Typical Topics\nplans, classes",
+  "## Klein's Tone With Them\nrelaxed",
+  "## Running Threads\nweekend plans",
+  "## Sample Klein Messages\nyea im down",
+  "## Reply Guidelines\nkeep it short",
+].join("\n\n");
 
 /** Make mcporter return canned BB payloads, keyed off the tool name in argv. */
 function mockMcporter({ messages }) {
@@ -128,13 +165,13 @@ afterAll(() => {
 
 describe("buildVoiceProfile — must not fabricate Klein's voice", () => {
   test("throws instead of writing a stub when the model is unavailable", async () => {
-    mockOpenRouterDead();
+    mockModelDead();
     await expect(ghost.buildVoiceProfile({ Alpha: "some summary" }))
       .rejects.toThrow(/refusing to write/i);
   });
 
   test("writes no voice-profile.md at all when the model is unavailable", async () => {
-    mockOpenRouterDead();
+    mockModelDead();
     await expect(ghost.buildVoiceProfile({ Alpha: "some summary" })).rejects.toThrow();
     expect(fs.existsSync(VOICE_FILE)).toBe(false);
   });
@@ -145,7 +182,7 @@ describe("buildVoiceProfile — must not fabricate Klein's voice", () => {
     const original = "# Klein Voice Profile\n_Updated: 2026-01-01_\n\n## Core Typography\nreal generated content\n";
     fs.writeFileSync(VOICE_FILE, original);
 
-    mockOpenRouterDead();
+    mockModelDead();
     await expect(ghost.buildVoiceProfile({ Alpha: "some summary" })).rejects.toThrow();
 
     const after = fs.readFileSync(VOICE_FILE, "utf8");
@@ -158,7 +195,7 @@ describe("buildVoiceProfile — must not fabricate Klein's voice", () => {
   // an empty corpus — it can only invent one, which is worse than the stub because it
   // reads as genuine analysis. Refuse before spending the call.
   test("refuses to synthesise a profile from zero contact summaries", async () => {
-    const scope = mockOpenRouterAlive("## Core Typography\ninvented from nothing");
+    const scope = mockModelAlive("## Core Typography\ninvented from nothing");
     await expect(ghost.buildVoiceProfile({})).rejects.toThrow(/no contact summaries/i);
     expect(fs.existsSync(VOICE_FILE)).toBe(false);
     expect(scope.isDone()).toBe(false); // the model was never even asked
@@ -166,7 +203,7 @@ describe("buildVoiceProfile — must not fabricate Klein's voice", () => {
   });
 
   test("writes the profile when the model actually responds", async () => {
-    mockOpenRouterAlive("## Core Typography\nlowercase, trailing-period-free\n\n## Response Length\nshort");
+    mockModelAlive(FULL_PROFILE);
     await ghost.buildVoiceProfile({ Alpha: "some summary" });
 
     const written = fs.readFileSync(VOICE_FILE, "utf8");
@@ -178,7 +215,7 @@ describe("buildVoiceProfile — must not fabricate Klein's voice", () => {
 describe("learnContact — must not write stats-only stubs", () => {
   test("throws instead of writing a stub when the model is unavailable", async () => {
     mockMcporter({ messages: KLEIN_MSGS });
-    mockOpenRouterDead();
+    mockModelDead();
 
     await expect(ghost.learnContact(CONTACT, [CHAT])).rejects.toThrow(/refusing to write/i);
     expect(fs.readdirSync(CONTACTS_DIR)).toHaveLength(0);
@@ -190,7 +227,7 @@ describe("learnContact — must not write stats-only stubs", () => {
     fs.writeFileSync(file, original);
 
     mockMcporter({ messages: KLEIN_MSGS });
-    mockOpenRouterDead();
+    mockModelDead();
 
     await expect(ghost.learnContact(CONTACT, [CHAT])).rejects.toThrow();
     expect(fs.readFileSync(file, "utf8")).toBe(original);
@@ -198,7 +235,7 @@ describe("learnContact — must not write stats-only stubs", () => {
 
   test("writes the summary when the model actually responds", async () => {
     mockMcporter({ messages: KLEIN_MSGS });
-    mockOpenRouterAlive("## Who They Are\nAlpha is a close friend from VT.");
+    mockModelAlive(FULL_SUMMARY);
 
     const summary = await ghost.learnContact(CONTACT, [CHAT]);
     expect(summary).toContain("close friend from VT");
@@ -220,7 +257,7 @@ describe("learnContact — must not write stats-only stubs", () => {
 describe("cmdLearn — exit contract", () => {
   test("rejects (nonzero exit) when the model is dead for every contact", async () => {
     mockMcporter({ messages: KLEIN_MSGS });
-    nock("https://openrouter.ai").post("/api/v1/chat/completions").times(5).reply(404, RETIRED_SLUG_404);
+    nock(SPARK_ORIGIN).post(SPARK_PATH).times(5).reply(503, SPARK_GATED_503);
 
     // The CLI dispatcher maps a rejection to process.exit(1) (src/ghost.js:4227-4229),
     // so rejecting here IS the nonzero exit.
