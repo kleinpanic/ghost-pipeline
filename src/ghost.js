@@ -273,6 +273,16 @@ const SPARK_MODEL_STRONG = env("SPARK_MODEL_STRONG", "openai/gpt-oss-120b");
 const OC_GATEWAY_TOKEN = readSecret(path.join(HOME, ".openclaw", ".gateway-token")) ||
                          env("OC_GATEWAY_TOKEN");
 
+// ── `ghost learn` analysis model (contact summaries + voice profile)
+// KNOWN DEAD as of 2026-08-06: OpenRouter retired the `:free` variant and now answers
+// this slug with 404 "This model is unavailable for free ... use this slug instead:
+// google/gemma-3-27b-it". Commit 404fe2f had already dropped free-tier OR models from
+// the *draft* path in March for the same class of reason; the learn path was never
+// migrated. The replacement is a live operator decision (paid OR vs. the local Spark
+// vllm already wired for drafting), so the slug is left as-is rather than silently
+// repointed — learn now fails loudly instead of papering over it (see buildVoiceProfile).
+const LEARN_MODEL = env("GHOST_LEARN_MODEL", "google/gemma-3-27b-it:free");
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3840,11 +3850,18 @@ Keep it short and practical.`;
   log(`Generating contact summary for ${contact.alias}...`);
   // tryGeminiCli was removed in 404fe2f but these call sites were left dangling —
   // learn crashed with ReferenceError. Go straight to OR (returns { text } or null).
-  const orSummary = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
-  let summary = orSummary?.text || null;
+  const orSummary = await tryOpenRouter(LEARN_MODEL, "", prompt, 30000);
+  const summary = orSummary?.text || null;
+  // D6/O-2: this used to substitute a stats-only stub and write it under a fresh date,
+  // which is indistinguishable from real analysis at a glance — six nights of fakes went
+  // unnoticed because of it. tryOpenRouter collapses every failure to null, so the caller
+  // cannot tell "model retired" from "nothing to say"; treat null as fatal and write
+  // nothing, leaving any previously-good file on disk intact.
   if (!summary) {
-    summary = `## Who They Are\n${contact.alias} (${contact.name})\n\n## Sample Klein Messages\n${stats.examples}`;
-    log(`All models failed — writing stats-only stub for ${contact.alias}`);
+    throw new Error(
+      `contact summary generation failed for ${contact.alias}: ${LEARN_MODEL} returned no output ` +
+      `— refusing to write a stats-only stub (see ghost-learn.log for the provider error)`,
+    );
   }
 
   const filename = `${contact.phone}-${contact.alias.toLowerCase().replace(/\s+/g, "-")}.md`;
@@ -3860,11 +3877,22 @@ async function buildVoiceProfile(summaries) {
     .map(([name, s]) => `### ${name}\n${s}`)
     .join("\n\n---\n\n");
 
+  // D6/O-2: with no summaries the prompt degraded to "(no summaries yet)" and the model
+  // was asked to describe a person it had been shown nothing about. Whatever came back
+  // was invention, written to disk as fact — and Ghost drafts AS Klein from this file.
+  // An empty corpus is not a degraded input, it is the absence of the input.
+  if (!combined) {
+    throw new Error(
+      "voice profile generation skipped: no contact summaries were produced " +
+      "— refusing to synthesise Klein's voice from an empty corpus",
+    );
+  }
+
   const prompt = `You are writing a voice profile for Ghost — Klein's AI auto-reply system.
 
 Klein is a college student at VT. Here are cross-contact summaries of his texting style:
 
-${combined || "(no summaries yet)"}
+${combined}
 
 Write a universal voice profile capturing what's consistent ACROSS all relationships:
 
@@ -3893,9 +3921,18 @@ Keep it practical — Ghost reads this before every draft.`;
 
   log("Building voice profile...");
   // tryGeminiCli removed in 404fe2f (dangling ref crashed learn); OR returns { text } or null
-  const orProfile = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
-  let profile = orProfile?.text || null;
-  if (!profile) profile = `## Core Typography\nLowercase, no period at end, contractions without apostrophes common.\n\n## Universal Vocabulary\nyea, nah, bet, fs, idk, tbh, lowkey, bruh, bro, lol (sparingly)`;
+  const orProfile = await tryOpenRouter(LEARN_MODEL, "", prompt, 30000);
+  const profile = orProfile?.text || null;
+  // D6/O-2: the fallback here was a two-line hardcoded literal, written under today's
+  // date every night from 2026-08-06 on. Ghost reads this file before every draft and
+  // speaks as Klein, so a stub is not a degraded profile — it is a fabricated identity.
+  // Fail and leave the last real profile (or nothing) in place.
+  if (!profile) {
+    throw new Error(
+      `voice profile generation failed: ${LEARN_MODEL} returned no output ` +
+      `— refusing to write a hardcoded stub (see ghost-learn.log for the provider error)`,
+    );
+  }
 
   writeFileSafe(VOICE_PROFILE_FILE, `# Klein Voice Profile\n_Updated: ${new Date().toISOString().slice(0, 10)}_\n\n${profile}\n`);
   log(`Voice profile saved: ${VOICE_PROFILE_FILE}`);
@@ -3938,18 +3975,40 @@ async function cmdLearn(args) {
 
   log(`Processing ${contacts.length} contact(s)...`);
   const summaries = {};
+  // D6/O-2: failures are collected rather than thrown immediately so one dead contact
+  // does not abort the sweep — but the run must still exit nonzero, because the old
+  // behaviour (stub + "✅ complete" + exit 0) is exactly what hid six days of fakes.
+  const failures = [];
 
   for (const c of contacts) {
-    const s = await learnContact(c, allChats);
-    if (s) summaries[c.alias] = s;
+    try {
+      const s = await learnContact(c, allChats);
+      if (s) summaries[c.alias] = s;
+    } catch (err) {
+      log(`FAILED: ${err.message}`);
+      failures.push(`${c.alias}: ${err.message}`);
+    }
     await new Promise(r => setTimeout(r, 1500)); // small breathe between contacts
   }
 
   if (!targetPhone || args.includes("--voice-profile")) {
-    await buildVoiceProfile(summaries);
+    try {
+      await buildVoiceProfile(summaries);
+    } catch (err) {
+      log(`FAILED: ${err.message}`);
+      failures.push(`voice profile: ${err.message}`);
+    }
   }
 
   const done = Object.keys(summaries).length;
+
+  if (failures.length) {
+    console.error(`\n❌ ghost learn FAILED: ${done}/${contacts.length} contacts produced real analysis, ${failures.length} step(s) failed`);
+    for (const f of failures) console.error(`  - ${f}`);
+    console.error("\nNothing was written for the failed steps — existing files were left untouched.");
+    throw new Error(`learn failed: ${failures.length} step(s) could not be generated`);
+  }
+
   console.log(`\n✅ ghost learn complete: ${done}/${contacts.length} contacts processed`);
   if (done > 0) {
     console.log(`Contact memories: ${CONTACTS_MEMORY_DIR}`);
@@ -4358,5 +4417,8 @@ if (require.main !== module) {
     // 90-03: fail-closed send toggle + style allowlist + expiry-cancel exports
     bbSendMessage, executeSend, ghostSendToggleState, styleAllowlistViolation,
     SEND_TOGGLE_FILE, AUTO_SEND_WINDOW_MS,
+    // D6/O-2: learn must fail loudly rather than write convincing stubs
+    learnContact, buildVoiceProfile, cmdLearn, LEARN_MODEL,
+    VOICE_PROFILE_FILE, CONTACTS_MEMORY_DIR,
   };
 }
