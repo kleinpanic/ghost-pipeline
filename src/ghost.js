@@ -214,6 +214,12 @@ const BB_PORT = parseInt(env("BB_PORT", "1234"));
 // Discord
 const GHOST_CHANNEL = env("GHOST_CHANNEL_ID");
 
+// 98-01: outbound sender identity for /tools/invoke. Blank => omit `agentId` entirely, which
+// resolves to the gateway's DEFAULT agent (main). See ocGatewayPost for why this stays unset.
+// Trimmed so a whitespace-only value is treated as unset rather than sent as a bogus agent id
+// (the gateway would 404 it), matching the GSD-OC sibling fix for the same defect.
+const OC_AGENT_ID = env("GHOST_OC_AGENT_ID").trim();
+
 // Identity
 const OWNER_PHONE_NORMALIZED = env("OWNER_PHONE");
 const KLEIN_DISCORD_USER_ID  = env("KLEIN_DISCORD_USER_ID");
@@ -2111,7 +2117,20 @@ function ocGatewayPost(tool, args, timeoutMs = 15000) {
     // the invoke runs under the default scope which still has `message`; click dispatch never
     // depended on the posting session anyway — the pre-message hook parses the LABEL
     // (Clicked "✅ Send · <draftId>".) and calls ghost's localhost HTTP by draftId.
-    const body = JSON.stringify({ tool, args });
+    //
+    // 98-01: "the default scope" is the DEFAULT AGENT (main) — not a neutral one. So every card
+    // posted here renders "[KleinClaw-Main]" inside ghost's own channel and mints a parasitic
+    // agent:main:discord:channel:<ghost> session. OC_AGENT_ID sends the gateway's sanctioned
+    // `agentId` selector, which redirects BOTH the identity stamp and the delivery-mirror store
+    // (live-proven 2026-08-13 against a different agent's channel).
+    // Left UNSET on purpose: agentId only resolves for an agent that HOLDS the message tool, and
+    // ghost's policy is `profile:"minimal"` with message absent from alsoAllow — so agentId:"ghost"
+    // returns 404 today, exactly like the sessionKey pin above. Granting it is a deliberate
+    // security trade (ghost reads untrusted inbound SMS; message is send-anywhere) and is the
+    // operator's call, not this file's. Unset => byte-identical body to the pre-98-01 behavior.
+    const invoke = { tool, args };
+    if (OC_AGENT_ID) invoke.agentId = OC_AGENT_ID;
+    const body = JSON.stringify(invoke);
     const req = https.request({
       hostname: "127.0.0.1",
       port:     OC_GATEWAY_PORT,
@@ -4542,6 +4561,10 @@ if (require.main !== module) {
     sendLocks,
     // Bind-host export (90-01: loopback confinement support)
     BIND_HOST,
+
+    // 98-01: outbound sender attribution
+    OC_AGENT_ID,
+    ocGatewayPost,
     // Learn-path exports (90-01: mcporter resolution regression)
     MCPORTER_BIN,
     mcporterCallSync,
