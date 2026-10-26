@@ -143,8 +143,8 @@ const SOFT_COMMITMENT_PATTERNS = [
 ];
 
 const NEVER_SAY = [
-  /\bn[\-*]+w+er\b/i,
-  /\bf[\-*]+ck\s+you\b/i,
+  /\bn[-*]+w+er\b/i,
+  /\bf[-*]+ck\s+you\b/i,
   /\bkill\s+yourself\b/i,
   /\byou\s+(should\s+)?die\b/i,
   /\bi\s+(will\s+)?find\s+you\b/i,
@@ -205,6 +205,13 @@ const _env = loadEnvFile(path.join(__dirname, "..", ".env"));
 const env = (key, fallback = "") => process.env[key] || _env[key] || fallback;
 
 const PORT    = parseInt(env("GHOST_PORT", "18790"));
+// Interface the webhook server binds to. 0.0.0.0 because BlueBubbles posts from another host.
+const BIND_HOST = env("GHOST_BIND_HOST", "0.0.0.0");
+// Shared secret for the HTTP API. When set, the BlueBubbles webhook must present it, and
+// non-loopback callers may use the control endpoints with it. Sent as
+// "Authorization: Bearer <t>", "X-Ghost-Token: <t>", or "?token=<t>" (for the BB webhook URL).
+const GHOST_API_TOKEN = env("GHOST_API_TOKEN");
+const MAX_BODY_BYTES  = 1024 * 1024;
 const BB_HOST = env("BB_HOST", "127.0.0.1");
 const BB_PORT = parseInt(env("BB_PORT", "1234"));
 
@@ -1051,9 +1058,24 @@ function isDenied(phone) {
   return Array.isArray(list) && list.includes(n);
 }
 
+// Free-text values written into a CONTACTS.md allowlist line. Newlines, "|" and HTML comment
+// markers would let a crafted name (from /approve-contact or Apple Contacts) inject extra
+// allowlist entries or break the CONTACT_ALLOWLIST block.
+function sanitizeContactField(value) {
+  return String(value ?? "")
+    .replace(/<!--|-->|CONTACT_ALLOWLIST_(START|END)/gi, "")
+    .replace(/[\r\n|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
 function addToAllowlist(phone, name, { source = "manual", emails = [], birthday = null, notes = "" } = {}) {
   const n         = normalizePhone(phone);
-  const displayName = name || "Unknown";
+  if (!n) throw new Error("invalid phone");
+  const displayName = sanitizeContactField(name) || "Unknown";
+  notes    = sanitizeContactField(notes);
+  birthday = birthday ? sanitizeContactField(birthday) : null;
   const sourceNote = source === "apple_contacts"
     ? `From Apple Contacts ${new Date().toISOString().slice(0, 10)}`
     : source === "discord_approve"
@@ -1073,11 +1095,17 @@ function addToAllowlist(phone, name, { source = "manual", emails = [], birthday 
 
 function addToDenylist(phone) {
   const n    = normalizePhone(phone);
+  if (!n) throw new Error("invalid phone");
   const list = loadJson(DENYLIST_FILE, []);
   if (!list.includes(n)) { list.push(n); saveJson(DENYLIST_FILE, list); }
-  // Remove from allowlist — last action wins (deny after approve = denied)
+  // Remove from allowlist — last action wins (deny after approve = denied).
+  // Match the phone field exactly: a substring match on "+<n>" let a short code like
+  // 12345 delete every +12345… contact, and an empty number delete every line with a "+".
   const raw     = readFileSafe(CONTACTS_FILE);
-  const cleaned = raw.split("\n").filter(l => !l.includes(`+${n}`)).join("\n");
+  const cleaned = raw.split("\n").filter(l => {
+    const m = l.match(/^-\s+.+?\s*\|\s*(\+\d+)\s*\|/);
+    return !(m && normalizePhone(m[1]) === n);
+  }).join("\n");
   if (cleaned !== raw) { writeFileSafe(CONTACTS_FILE, cleaned); log(`Removed +${n} from allowlist (deny wins)`); }
   log(`Added +${n} to denylist`);
 }
@@ -1342,17 +1370,18 @@ function isQuietHours(phone) {
 
 function spawnAsync(cmd, args, { timeout = 30000, input } = {}) {
   return new Promise((resolve, reject) => {
-    let stdout = "", stderr = "";
+    let stdout = "", stderr = "", timer = null;
     const proc = spawn(cmd, args, { env: { ...process.env, HOME } });
     proc.stdout?.on("data", d => { stdout += d.toString(); });
     proc.stderr?.on("data", d => { stderr += d.toString(); });
     proc.on("close", code => {
+      clearTimeout(timer);
       if (code === 0) resolve(stdout);
       else reject(new Error(`${cmd} exit ${code}: ${stderr.slice(0, 200)}`));
     });
-    proc.on("error", reject);
+    proc.on("error", err => { clearTimeout(timer); reject(err); });
     if (timeout) {
-      setTimeout(() => { try { proc.kill(); } catch {} reject(new Error(`${cmd} timed out`)); }, timeout);
+      timer = setTimeout(() => { try { proc.kill(); } catch {} reject(new Error(`${cmd} timed out`)); }, timeout);
     }
     if (input != null) { proc.stdin?.write(input); proc.stdin?.end(); }
   });
@@ -1450,7 +1479,22 @@ async function resolveChatGuid(phone) {
 //  MODEL GENERATION  (OR claude-haiku → OR gemini-flash → Spark fallback)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Try OpenRouter with a specific model. Returns text or null. */
+/** Learn-pipeline tier: Gemini CLI one-shot prompt. Returns text or null. */
+async function tryGeminiCli(prompt, { timeoutMs = 30000 } = {}) {
+  try {
+    const stdout = await spawnAsync("gemini", ["-p", prompt], { timeout: timeoutMs });
+    const text   = stdout.trim();
+    if (!text) return null;
+    // Strip known preamble lines from Gemini CLI output
+    const filtered = text.split("\n").filter(l => !l.match(/^(Using model:|Model:|\s*$)/));
+    return filtered.join("\n").trim() || null;
+  } catch (err) {
+    log(`Gemini CLI unavailable: ${err.message.slice(0, 80)}`);
+    return null;
+  }
+}
+
+/** Try OpenRouter with a specific model. Returns { text, usage } or null. */
 function tryOpenRouter(model, systemPrompt, userContent, timeoutMs = 20000) {
   return new Promise((resolve) => {
     if (!OPENROUTER_API_KEY) { resolve(null); return; }
@@ -2136,15 +2180,23 @@ async function postCannotAnswerAlert(contactName, messageText, reason) {
   await discordPost(GHOST_CHANNEL, { content });
 }
 
+// curl reads the auth header from a config on stdin so the bot token never appears in argv
+// (argv is world-readable via `ps` / /proc/<pid>/cmdline).
+function discordAuthCurlConfig() {
+  return `header = "Authorization: Bot ${DISCORD_BOT_TOKEN.replace(/["\\\r\n]/g, "")}"\n`;
+}
+
 async function discordPost(channelId, payload) {
   try {
+    // Message text often quotes inbound iMessages verbatim — never let it ping @everyone/roles/users.
+    const body = { allowed_mentions: { parse: [] }, ...payload };
     const stdout = await spawnAsync("curl", [
       "-s", "-X", "POST",
       `https://discord.com/api/v10/channels/${channelId}/messages`,
-      "-H", `Authorization: Bot ${DISCORD_BOT_TOKEN}`,
+      "--config", "-",
       "-H", "Content-Type: application/json",
-      "-d", JSON.stringify(payload),
-    ], { timeout: 10000 });
+      "-d", JSON.stringify(body),
+    ], { timeout: 10000, input: discordAuthCurlConfig() });
     return tryParseJson(stdout);
   } catch (err) {
     log(`Discord post error: ${err.message}`);
@@ -2157,8 +2209,8 @@ async function discordDelete(channelId, messageId) {
     await spawnAsync("curl", [
       "-s", "-X", "DELETE",
       `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`,
-      "-H", `Authorization: Bot ${DISCORD_BOT_TOKEN}`,
-    ], { timeout: 8000 });
+      "--config", "-",
+    ], { timeout: 8000, input: discordAuthCurlConfig() });
   } catch (err) {
     log(`Discord delete error: ${err.message}`);
   }
@@ -2286,8 +2338,8 @@ async function postDraftToDiscord(draftResult, meta) {
           const dmStdout = await spawnAsync("curl", [
             "-s",
             `https://discord.com/api/v10/channels/${GHOST_CHANNEL}/messages/${messageId}`,
-            "-H", `Authorization: Bot ${DISCORD_BOT_TOKEN}`,
-          ], { timeout: 8000 });
+            "--config", "-",
+          ], { timeout: 8000, input: discordAuthCurlConfig() });
           const dmsg     = tryParseJson(dmStdout);
           // Discord Components v2 (flags:32768): buttons are inside a container (type 17)
           // → action row (type 1) nested within. Flatten all type-2 components across all levels.
@@ -2731,6 +2783,12 @@ async function checkAndDraft(key) {
 //  SEND HELPERS  (used by reaction check)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** "iMessage;-;+15551234567" (any service prefix) → "+15551234567"; null for anything else. */
+function dmPhoneFromChatGuid(chatGuid) {
+  const m = typeof chatGuid === "string" && chatGuid.match(/^[A-Za-z]+;-;(\+?\d+)$/);
+  return m ? m[1] : null;
+}
+
 async function bbSendMessage(chatGuid, message) {
   const normalizedMessage = (message || "").toString().trim();
   if (!normalizedMessage) {
@@ -2743,14 +2801,17 @@ async function bbSendMessage(chatGuid, message) {
     return false;
   }
 
-  // Verify DM recipient is in the Ghost contact allowlist (belt+suspenders against routing bugs)
-  const dmPhoneMatch = chatGuid && chatGuid.match(/^(?:iMessage|SMS|iMessageLite);-;(\+?\d+)$/);
-  if (dmPhoneMatch) {
-    const dmPhone = dmPhoneMatch[1];
-    if (!isAllowed(dmPhone) && normalizePhone(dmPhone) !== OWNER_PHONE_NORMALIZED) {
-      log(`bbSendMessage BLOCKED: recipient ${chatGuid} not in contact allowlist`);
-      return false;
-    }
+  // Verify DM recipient is in the Ghost contact allowlist (belt+suspenders against routing bugs).
+  // Fail closed: a guid that is not a 1:1 phone DM (email handle, group, raw/unknown format)
+  // cannot be checked against the phone-only allowlist, so it is never sent to.
+  const dmPhone = dmPhoneFromChatGuid(chatGuid);
+  if (!dmPhone) {
+    log(`bbSendMessage BLOCKED: ${chatGuid || "unknown-chat"} is not a 1:1 phone chat`);
+    return false;
+  }
+  if (!isAllowed(dmPhone) && normalizePhone(dmPhone) !== OWNER_PHONE_NORMALIZED) {
+    log(`bbSendMessage BLOCKED: recipient ${chatGuid} not in contact allowlist`);
+    return false;
   }
 
   // iMessageLite guids return 405 on send — swap to SMS equivalent immediately
@@ -2824,6 +2885,17 @@ async function _executeSend(draft, reason) {
     log(`[${reason}] BLOCKED while paused for ${contactName}`);
     await discordPost(GHOST_CHANNEL, { content: `⏸ Blocked send to **${contactName}**: Ghost is paused.` });
     logFeedback(draft, "blocked-paused");
+    return true;
+  }
+
+  // The draft was generated for `contact` (their memory + history); never deliver it to a
+  // different thread. A webhook carrying one contact's handle with another chat's guid
+  // would otherwise route that context to the wrong person.
+  const guidPhone = dmPhoneFromChatGuid(chatGuid);
+  if (contact && guidPhone && normalizePhone(guidPhone) !== normalizePhone(contact)) {
+    log(`[${reason}] BLOCKED recipient mismatch for ${contactName}: ${chatGuid} ≠ ${contact}`);
+    await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${contactName}**: chat does not match contact.` });
+    logFeedback(draft, "blocked-recipient-mismatch");
     return true;
   }
 
@@ -2974,9 +3046,13 @@ async function doReactionCheck() {
           }
         }
       } catch {}
-      addToAllowlist(phone, name, { source, ...enrichOpts });
+      try { addToAllowlist(phone, name, { source, ...enrichOpts }); }
+      catch (err) { log(`Approve skipped for "${phone}": ${err.message}`); }
     }
-    for (const phone of denyQ) addToDenylist(phone);
+    for (const phone of denyQ) {
+      try { addToDenylist(phone); }
+      catch (err) { log(`Deny skipped for "${phone}": ${err.message}`); }
+    }
 
     const now  = Date.now();
     const keep = [];
@@ -3055,7 +3131,16 @@ async function doReactionCheck() {
       keep.push(draft);
     }
 
-    savePendingDrafts(keep);
+    // The loop above awaits network calls, so the drafts file may have changed underneath us:
+    // new drafts posted (must not be dropped) or drafts removed by /action send|cancel or an
+    // outgoing-message webhook (must not be resurrected, or they could auto-send again).
+    const snapshotIds = new Set(drafts.map(d => d.draftId));
+    const current     = loadPendingDrafts();
+    const currentIds  = new Set(current.map(d => d.draftId));
+    savePendingDrafts([
+      ...keep.filter(d => currentIds.has(d.draftId)),
+      ...current.filter(d => !snapshotIds.has(d.draftId)),
+    ]);
     saveJson(BUTTON_ACTIONS_FILE, buttonActions.filter((_, i) => !consumed.has(i)));
 
   } finally {
@@ -3067,25 +3152,76 @@ async function doReactionCheck() {
 //  HTTP SERVER
 // ═══════════════════════════════════════════════════════════════════════════
 
+function isLoopbackAddress(addr) {
+  return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
+function requestHasValidToken(req, token = GHOST_API_TOKEN) {
+  if (!token) return false;
+  const auth   = String(req.headers?.authorization || "");
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  let query = "";
+  try { query = new URL(req.url || "/", "http://localhost").searchParams.get("token") || ""; } catch {}
+  const expected = Buffer.from(token);
+  return [bearer, String(req.headers?.["x-ghost-token"] || ""), query].some(candidate => {
+    const got = Buffer.from(candidate);
+    return got.length === expected.length && crypto.timingSafeEqual(got, expected);
+  });
+}
+
+/**
+ * Who may call which endpoint. The server listens on all interfaces (BlueBubbles posts from
+ * another host), so anything on the LAN can reach it.
+ *   "control" (/action, /approve-contact, /deny-contact, /pending): loopback (the local
+ *             OpenClaw hook), or a valid GHOST_API_TOKEN.
+ *   "webhook" (/bluebubbles/message-sent): a valid token when GHOST_API_TOKEN is set;
+ *             open otherwise, for backwards compatibility.
+ */
+function isAuthorizedRequest(req, scope, token = GHOST_API_TOKEN) {
+  if (scope === "control") return isLoopbackAddress(req.socket?.remoteAddress) || requestHasValidToken(req, token);
+  if (scope === "webhook") return !token || requestHasValidToken(req, token);
+  return true;
+}
+
 function createServer() {
   return http.createServer(async (req, res) => {
+    let bodyTooLarge = false;
     const send = (status, body) => {
+      if (res.headersSent) return;
+      if (bodyTooLarge) status = 413;
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(body));
     };
-    const readBody = () => new Promise(resolve => {
-      let b = "";
-      req.on("data", c => { b += c; });
-      req.on("end", () => resolve(b));
+    // Bounded body reader: past MAX_BODY_BYTES the rest is drained and discarded (not buffered).
+    const readBody = () => new Promise((resolve, reject) => {
+      let b = "", size = 0;
+      req.on("data", c => {
+        size += c.length;
+        if (size > MAX_BODY_BYTES) bodyTooLarge = true;
+        else b += c;
+      });
+      req.on("end", () => bodyTooLarge ? reject(new Error("payload too large")) : resolve(b));
+      req.on("error", reject);
     });
 
+    // Route on the path only so the BB webhook URL can carry ?token=…
+    let pathname = "/";
+    try { pathname = new URL(req.url || "/", "http://localhost").pathname; } catch {}
+    const CONTROL_ROUTES = ["/pending", "/approve-contact", "/deny-contact", "/action"];
+    const scope = CONTROL_ROUTES.includes(pathname) ? "control"
+      : pathname === "/bluebubbles/message-sent" ? "webhook" : "public";
+    if (!isAuthorizedRequest(req, scope)) {
+      log(`Rejected unauthorized ${req.method} ${pathname} from ${req.socket?.remoteAddress || "?"}`);
+      return send(401, { ok: false, error: "unauthorized" });
+    }
+
     // GET /health
-    if (req.method === "GET" && req.url === "/health") {
+    if (req.method === "GET" && pathname === "/health") {
       return send(200, { ok: true, service: "ghost-v3", paused: isPaused(), pending: pendingMessages.size });
     }
 
     // GET /pending
-    if (req.method === "GET" && req.url === "/pending") {
+    if (req.method === "GET" && pathname === "/pending") {
       const list = [...pendingMessages.entries()].map(([k, v]) => ({
         key: k, contactName: v.contactName,
         arrivedAt: new Date(v.arrivedAt).toISOString(),
@@ -3095,7 +3231,7 @@ function createServer() {
     }
 
     // POST /approve-contact
-    if (req.method === "POST" && req.url === "/approve-contact") {
+    if (req.method === "POST" && pathname === "/approve-contact") {
       try {
         const { phone, name } = JSON.parse(await readBody());
         if (!phone) throw new Error("phone required");
@@ -3130,7 +3266,7 @@ function createServer() {
     }
 
     // POST /deny-contact
-    if (req.method === "POST" && req.url === "/deny-contact") {
+    if (req.method === "POST" && pathname === "/deny-contact") {
       try {
         const { phone } = JSON.parse(await readBody());
         if (!phone) throw new Error("phone required");
@@ -3143,7 +3279,7 @@ function createServer() {
     }
 
     // POST /action — triggered by pre-message hook for button clicks (both OC and legacy)
-    if (req.method === "POST" && req.url === "/action") {
+    if (req.method === "POST" && pathname === "/action") {
       try {
         const { draftId, action, userId } = JSON.parse(await readBody());
         if (!draftId || !action) return send(400, { ok: false, error: "draftId and action required" });
@@ -3178,9 +3314,9 @@ function createServer() {
     }
 
     // POST /bluebubbles/message-sent  ← main webhook
-    if (req.method === "POST" && req.url === "/bluebubbles/message-sent") {
-      const body = await readBody();
+    if (req.method === "POST" && pathname === "/bluebubbles/message-sent") {
       try {
+        const body = await readBody();
         log(`Webhook recv: ${body.slice(0, 200)}`);
         const event     = parseIncomingEvent(body, req.headers["content-type"]);
         const eventType = (event?.type || "").toLowerCase();
@@ -3553,7 +3689,7 @@ Keep it short and practical.`;
   let summary = await tryGeminiCli(prompt, { timeoutMs: 45000 });
   if (!summary) {
     log(`Gemini CLI failed — trying OR gemma-27b...`);
-    summary = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
+    summary = (await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000))?.text || null;
   }
   if (!summary) {
     summary = `## Who They Are\n${contact.alias} (${contact.name})\n\n## Sample Klein Messages\n${stats.examples}`;
@@ -3606,7 +3742,7 @@ Keep it practical — Ghost reads this before every draft.`;
 
   log("Building voice profile...");
   let profile = await tryGeminiCli(prompt, { timeoutMs: 45000 });
-  if (!profile) profile = await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000);
+  if (!profile) profile = (await tryOpenRouter("google/gemma-3-27b-it:free", "", prompt, 30000))?.text || null;
   if (!profile) profile = `## Core Typography\nLowercase, no period at end, contractions without apostrophes common.\n\n## Universal Vocabulary\nyea, nah, bet, fs, idk, tbh, lowkey, bruh, bro, lol (sparingly)`;
 
   writeFileSafe(VOICE_PROFILE_FILE, `# Klein Voice Profile\n_Updated: ${new Date().toISOString().slice(0, 10)}_\n\n${profile}\n`);
@@ -3800,9 +3936,10 @@ function cmdServe() {
   purgeStaleDrafts();
   pruneStaleDraftsOnStartup().catch(err => log(`Startup preflight error: ${err.message}`));
   const server = createServer();
-  server.listen(PORT, "0.0.0.0", () => {
-    log(`Ghost v3 listening on :${PORT}`);
-    log(`  Webhook : http://10.0.0.27:${PORT}/bluebubbles/message-sent`);
+  server.listen(PORT, BIND_HOST, () => {
+    log(`Ghost v3 listening on ${BIND_HOST}:${PORT}`);
+    log(`  Webhook : http://<this-host>:${PORT}/bluebubbles/message-sent${GHOST_API_TOKEN ? "?token=…" : ""}`);
+    if (!GHOST_API_TOKEN) log(`  WARNING : GHOST_API_TOKEN unset — webhook accepts unauthenticated posts from any host`);
     log(`  Health  : http://127.0.0.1:${PORT}/health`);
     log(`  Pending : http://127.0.0.1:${PORT}/pending`);
     log(`  Reaction check: every ${REACT_CHECK_INTERVAL_MS / 1000}s (embedded)`);
@@ -4051,5 +4188,17 @@ if (require.main !== module) {
     BACKOFF_BASE_MS,
     BACKOFF_MAX_LEVEL,
     sendLocks,
+    // Audit-fix exports
+    addToAllowlist,
+    addToDenylist,
+    dmPhoneFromChatGuid,
+    bbSendMessage,
+    executeSend,
+    discordPost,
+    tryGeminiCli,
+    buildVoiceProfile,
+    isAuthorizedRequest,
+    VOICE_PROFILE_FILE,
+    MAX_BODY_BYTES,
   };
 }

@@ -26,11 +26,13 @@ const http = require("http");
 
 // ─── Repo scope guard ────────────────────────────────────────────────────────
 const REPO = __dirname + "/../..";
-if (process.env.FORCE !== "1") {
+const SCOPE_GUARD = `${REPO}/../../../.openclaw/hooks/repo-scope-guard.sh`;
+// The guard only exists on the dev machine; elsewhere (CI, fresh clones) there is nothing to run.
+if (process.env.FORCE !== "1" && fs.existsSync(SCOPE_GUARD)) {
   const { execSync } = require("child_process");
   try {
     const result = execSync(
-      `${REPO}/../../../.openclaw/hooks/repo-scope-guard.sh dev "${REPO}"`,
+      `${SCOPE_GUARD} dev "${REPO}"`,
       { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
     );
     if (!result.trim().startsWith("SCOPE_OK")) throw new Error(result);
@@ -344,7 +346,14 @@ beforeEach(() => {
   clearState();
   // Re-register nock interceptors for each test (nock.cleanAll runs in afterEach)
   setupNock(serverPort);
-  jest.useRealTimers();
+  // Pin the clock to 2pm local so the quiet-hours gate (22:00/23:00–08:00) doesn't make these
+  // flows depend on when the suite runs. Real timers stay real (same setup as mock-harness).
+  const twopm = new Date();
+  twopm.setHours(14, 0, 0, 0);
+  jest.useFakeTimers({
+    now: twopm.getTime(),
+    doNotFake: ["nextTick", "setImmediate", "Promise", "setTimeout", "setInterval", "clearTimeout", "clearInterval"],
+  });
 });
 
 afterEach(() => {
