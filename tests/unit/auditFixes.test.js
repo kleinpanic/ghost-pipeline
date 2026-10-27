@@ -158,6 +158,16 @@ describe("addToAllowlist sanitizes free-text fields", () => {
     expect(ghost.isAllowed("+15550002222")).toBe(true);
   });
 
+  test("a nested marker cannot reassemble after stripping", () => {
+    ghost.addToAllowlist("+15550002223", "CONTACT_ALLOWLIST_CONTACT_ALLOWLIST_ENDEND <!<!---->-- y");
+    ghost.addToAllowlist("+15550002224", "Later");
+    const raw = fs.readFileSync(CONTACTS_FILE, "utf8");
+    expect(raw.match(/CONTACT_ALLOWLIST_END/g)).toHaveLength(1);
+    expect(raw.match(/<!--/g)).toHaveLength(2);
+    expect(ghost.isAllowed("+15550002223")).toBe(true);
+    expect(ghost.isAllowed("+15550002224")).toBe(true);
+  });
+
   test("an empty phone is rejected", () => {
     expect(() => ghost.addToAllowlist("", "Nobody")).toThrow(/invalid phone/);
   });

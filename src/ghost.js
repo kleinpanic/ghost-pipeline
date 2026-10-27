@@ -1062,8 +1062,14 @@ function isDenied(phone) {
 // markers would let a crafted name (from /approve-contact or Apple Contacts) inject extra
 // allowlist entries or break the CONTACT_ALLOWLIST block.
 function sanitizeContactField(value) {
-  return String(value ?? "")
-    .replace(/<!--|-->|CONTACT_ALLOWLIST_(START|END)/gi, "")
+  let s = String(value ?? "");
+  // Repeat until stable: a single pass lets nested input ("CONTACT_ALLOWLIST_CONTACT_ALLOWLIST_ENDEND")
+  // reassemble the marker it just removed.
+  for (let prev = null; prev !== s; ) {
+    prev = s;
+    s = s.replace(/<!--|-->|CONTACT_ALLOWLIST_(START|END)/gi, "");
+  }
+  return s
     .replace(/[\r\n|]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
