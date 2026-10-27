@@ -67,7 +67,8 @@ npm start               # = node src/ghost.js serve
 ```
 
 Secrets are read from `~/.config/bluebubbles/password`, `~/.config/openrouter/api-key`,
-`~/.config/discord/bot-token` and `~/.openclaw/.gateway-token` (or the matching env vars).
+`~/.config/discord/bot-token` and `~/.openclaw/.gateway-token` (the gateway token can also
+come from `OC_GATEWAY_TOKEN`; the others are file-only).
 
 ### HTTP API access
 
