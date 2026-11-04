@@ -1,14 +1,12 @@
 /**
- * findChatsForPhone / findChatGuidForPhone tests — verifies chat resolution and scoring
- * across all BB protocols.
+ * findChatsForPhone tests — chat resolution and scoring for imsg chats.list rows
+ * ({ id, guid, identifier }) and the older BlueBubbles shape ({ guid, chatIdentifier }).
  *
- * Bugs caught by these tests:
+ * Bug caught by these tests:
  *   - iMessageLite;-;+phone was scored as 6 ("other"), falling below SMS chats.
- *   - findChatGuidForPhone was calling GET /api/v1/chat (404) instead of
- *     POST /api/v1/chat/query — tested via mock in integration suite.
  */
 
-const { findChatsForPhone, findChatGuidForPhone } = require("../../src/ghost.js");
+const { findChatsForPhone } = require("../../src/ghost.js");
 
 const PHONE = "15551234567"; // TestContact
 
@@ -85,16 +83,22 @@ describe("findChatsForPhone — phone number format tolerance", () => {
   });
 });
 
-describe("findChatGuidForPhone — returns best guid", () => {
-  test("returns iMessage guid over SMS for same phone", () => {
-    const chats = [
-      makeChat(`SMS;-;+${PHONE}`, [{ address: `+${PHONE}` }]),
-      makeChat(`iMessage;-;+${PHONE}`, [{ address: `+${PHONE}` }]),
-    ];
-    expect(findChatGuidForPhone(`+${PHONE}`, chats)).toBe(`iMessage;-;+${PHONE}`);
+describe("findChatsForPhone — imsg chats.list rows (NAT-25)", () => {
+  test("matches on identifier, the imsg handle field", () => {
+    const chats = [{ id: 42, guid: `any;-;+${PHONE}`, identifier: `+${PHONE}` }];
+    expect(findChatsForPhone(`+${PHONE}`, chats).map(c => c.id)).toEqual([42]);
   });
 
-  test("returns null when no match", () => {
-    expect(findChatGuidForPhone("+10000000000", [])).toBeNull();
+  test("any;-; (macOS 14+ DM guid) ranks after iMessage;-; and before SMS;-;", () => {
+    const chats = [
+      { id: 1, guid: `SMS;-;+${PHONE}`, identifier: `+${PHONE}` },
+      { id: 2, guid: `any;-;+${PHONE}`, identifier: `+${PHONE}` },
+      { id: 3, guid: `iMessage;-;+${PHONE}`, identifier: `+${PHONE}` },
+    ];
+    expect(findChatsForPhone(`+${PHONE}`, chats).map(c => c.id)).toEqual([3, 2, 1]);
+  });
+
+  test("returns [] when no chat matches", () => {
+    expect(findChatsForPhone("+10000000000", [{ id: 1, guid: "any;-;+15550001111", identifier: "+15550001111" }])).toEqual([]);
   });
 });

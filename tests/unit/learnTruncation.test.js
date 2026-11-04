@@ -72,14 +72,10 @@ fs.writeFileSync(
   ].join("\n"),
 );
 
-jest.mock("child_process", () => {
-  const real = jest.requireActual("child_process");
-  return { ...real, spawnSync: jest.fn() };
-});
-const cp    = require("child_process");
 const ghost = require("../../src/ghost.js");
 
-const CHAT = { guid: "iMessage;-;+15550000001", participants: ["+15550000001"] };
+// imsg chats.list row (NAT-25): the id is what messages.history takes.
+const CHAT = { id: 1, guid: "iMessage;-;+15550000001", identifier: "+15550000001" };
 const CONTACT = { name: "Alpha", alias: "Alpha", phone: "15550000001", category: "close_friend" };
 const KLEIN_MSGS = [
   { isFromMe: true,  text: "yea im down for that" },
@@ -87,16 +83,16 @@ const KLEIN_MSGS = [
   { isFromMe: false, text: "sounds good" },
 ];
 
-function mockMcporter({ messages }) {
-  cp.spawnSync.mockImplementation((bin, args, opts) => {
-    const tool = String(args[1] || "");
-    let payload = {};
-    if (tool.endsWith("bb_contact_query"))          payload = { contacts: [] };
-    else if (tool.endsWith("bb_list_chats"))        payload = { chats: [CHAT] };
-    else if (tool.endsWith("bb_get_chat_messages")) payload = { messages };
-    const out = opts && Array.isArray(opts.stdio) ? opts.stdio[1] : null;
-    if (typeof out === "number") fs.writeSync(out, JSON.stringify(payload));
-    return { status: 0, stdout: null, stderr: "" };
+function mockImsg({ messages }) {
+  // imsg rpc answers with raw payloads; ghost normalizes them (is_from_me → isFromMe).
+  ghost.setTransport({
+    imsgRequest: async (method, params) => {
+      if (method === "chats.list") return { chats: [CHAT] };
+      if (method === "messages.history" && params.chat_id === CHAT.id) {
+        return { messages: messages.map(m => ({ is_from_me: m.isFromMe === true, text: m.text })) };
+      }
+      return {};
+    },
   });
 }
 
@@ -137,7 +133,7 @@ const FULL_SUMMARY = [
 ].join("\n\n");
 
 beforeEach(() => {
-  cp.spawnSync.mockReset();
+  ghost.setTransport({ imsgRequest: async () => { throw new Error("imsg not mocked"); } });
   nock.cleanAll();
   try { fs.unlinkSync(VOICE_FILE); } catch {}
   for (const f of fs.readdirSync(CONTACTS_DIR)) fs.unlinkSync(path.join(CONTACTS_DIR, f));
@@ -317,7 +313,7 @@ describe("completeness is judged on structure, not on one heading syntax", () =>
 
 describe("learnContact — a cut-off summary is not a summary", () => {
   test("throws when the contact summary was truncated", async () => {
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     mockSpark(FULL_SUMMARY.slice(0, 120), "length");
 
     await expect(ghost.learnContact(CONTACT, [CHAT])).rejects.toThrow(/truncat/i);
@@ -325,7 +321,7 @@ describe("learnContact — a cut-off summary is not a summary", () => {
   });
 
   test("throws when the contact summary is missing sections", async () => {
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     mockSpark(sections(2), "stop");
 
     await expect(ghost.learnContact(CONTACT, [CHAT])).rejects.toThrow(/section/i);
@@ -336,7 +332,7 @@ describe("learnContact — a cut-off summary is not a summary", () => {
   // "Who They Are" and "Sample Klein Messages". Even if something reintroduced it, the
   // section guard now rejects it independently of the emptiness guard.
   test("rejects the historical two-section stub shape", async () => {
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     mockSpark("## Who They Are\nAlpha (Alpha)\n\n## Sample Klein Messages\nyea im down", "stop");
 
     await expect(ghost.learnContact(CONTACT, [CHAT])).rejects.toThrow(/section/i);
@@ -344,7 +340,7 @@ describe("learnContact — a cut-off summary is not a summary", () => {
   });
 
   test("writes a complete summary through", async () => {
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     const scope = mockSpark(FULL_SUMMARY, "stop");
 
     const summary = await ghost.learnContact(CONTACT, [CHAT]);

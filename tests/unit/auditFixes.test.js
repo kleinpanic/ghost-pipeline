@@ -9,9 +9,11 @@
  *      allowlist entries into CONTACTS.md.
  *   3. bbSendMessage only allowlist-checked guids matching a fixed service list, so email
  *      handles / "any;-;" guids skipped the check; executeSend never checked that the chat
- *      belonged to the contact the draft was written for.
+ *      belonged to the contact the draft was written for. (NAT-25: the chokepoint is now
+ *      sendIMessage and takes an E.164 handle only.)
  *   4. HTTP API: control endpoints were unauthenticated on 0.0.0.0, the webhook had no
- *      shared-secret option, and request bodies were unbounded.
+ *      shared-secret option, and request bodies were unbounded. (NAT-25: every state-
+ *      changing route is gone; /pending stays loopback-or-token.)
  *   5. doReactionCheck overwrote the drafts file with its start-of-run snapshot, dropping
  *      drafts posted mid-run and resurrecting drafts removed mid-run.
  *   6. Discord bot token was passed to curl in argv (visible in `ps`).
@@ -26,8 +28,6 @@ const http = require("http");
 
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ghost-audit-"));
 process.env.HOME            = tmpHome;
-process.env.BB_HOST         = "127.0.0.1";
-process.env.BB_PORT         = "19235";
 // Local main gates every send behind the 90-03 fail-closed toggle; these tests exercise
 // the routing checks behind it.
 process.env.GHOST_SEND_ENABLED = "1";
@@ -92,16 +92,18 @@ nock.enableNetConnect("127.0.0.1");
 const ghost = require("../../src/ghost");
 
 const spawns    = () => global.__spawns || [];
-const bbSends   = () => spawns().filter(c => c.cmd === "mcporter" && c.args.includes("bluebubbles.bb_send_message"));
+const wireSends = [];
+ghost.setTransport({
+  sendIMessage: async (target, text) => { wireSends.push({ target, text }); return { ok: true }; },
+  imsgRequest:  async () => ({ messages: [] }),
+});
 
 beforeEach(() => {
   writeContacts();
   for (const f of fs.readdirSync(dataDir)) fs.rmSync(path.join(dataDir, f), { force: true });
   global.__spawns = [];
+  wireSends.length = 0;
   global.__spawnHandlers = {
-    mcporter: (args) => args.includes("bluebubbles.bb_send_message")
-      ? { stdout: { status: 200 } }
-      : { stdout: { messages: [] } },
     curl: () => ({ stdout: { id: "discord-msg-1" } }),
   };
   ghost.kleinRepliedRecentlyChats.clear();
@@ -187,17 +189,18 @@ describe("send path only delivers to the allowlisted 1:1 chat of the draft's con
   });
 
   test.each([
-    ["email handle", "iMessage;-;attacker@example.com"],
-    ["non-allowlisted number on an unlisted service prefix", "any;-;+15550009999"],
-    ["group chat", "iMessage;+;chat999"],
-  ])("bbSendMessage refuses %s", async (_label, guid) => {
-    expect(await ghost.bbSendMessage(guid, "hello")).toBe(false);
-    expect(bbSends()).toHaveLength(0);
+    ["email handle", "attacker@example.com"],
+    ["non-allowlisted number", "+15550009999"],
+    ["group chat guid", "iMessage;+;chat999"],
+    ["allowlisted number as a guid", `any;-;+${PHONE_A}`],
+  ])("sendIMessage refuses %s", async (_label, target) => {
+    expect(await ghost.sendIMessage(target, "hello")).toBe(false);
+    expect(wireSends).toHaveLength(0);
   });
 
-  test("bbSendMessage still sends to an allowlisted 1:1 chat", async () => {
-    expect(await ghost.bbSendMessage(`iMessage;-;+${PHONE_A}`, "hello")).toBe(true);
-    expect(bbSends()).toHaveLength(1);
+  test("sendIMessage still sends to an allowlisted E.164 handle", async () => {
+    expect(await ghost.sendIMessage(`+${PHONE_A}`, "hello")).toBe(true);
+    expect(wireSends).toEqual([{ target: `+${PHONE_A}`, text: "hello" }]);
   });
 
   test("executeSend blocks a draft whose chat belongs to a different contact", async () => {
@@ -206,8 +209,8 @@ describe("send path only delivers to the allowlisted 1:1 chat of the draft's con
       chatGuid: `iMessage;-;+${PHONE_B}`, draftText: "yo",
       arrivedAt: new Date(Date.now() - 60_000).toISOString(), postedAt: new Date().toISOString(),
     };
-    expect(await ghost.executeSend(draft, "button:send")).toBe(true);
-    expect(bbSends()).toHaveLength(0);
+    expect(await ghost.executeSend(draft, "approval:allow-once")).toBe(true);
+    expect(wireSends).toHaveLength(0);
   });
 });
 
@@ -224,14 +227,6 @@ describe("HTTP API authorization", () => {
     expect(ghost.isAuthorizedRequest(fakeReq("10.0.0.50", { headers: { authorization: `Bearer ${TOKEN}` } }), "control", TOKEN)).toBe(true);
     expect(ghost.isAuthorizedRequest(fakeReq("10.0.0.50", { headers: { "x-ghost-token": TOKEN } }), "control", TOKEN)).toBe(true);
     expect(ghost.isAuthorizedRequest(fakeReq("10.0.0.50", { headers: { "x-ghost-token": "wrong" } }), "control", TOKEN)).toBe(false);
-  });
-
-  test("webhook: open without a configured token, token-gated with one", () => {
-    expect(ghost.isAuthorizedRequest(fakeReq("10.0.0.50"), "webhook", "")).toBe(true);
-    expect(ghost.isAuthorizedRequest(fakeReq("10.0.0.50"), "webhook", TOKEN)).toBe(false);
-    expect(ghost.isAuthorizedRequest(fakeReq("127.0.0.1"), "webhook", TOKEN)).toBe(false);
-    expect(ghost.isAuthorizedRequest(fakeReq("10.0.0.50", { url: `/bluebubbles/message-sent?token=${TOKEN}` }), "webhook", TOKEN)).toBe(true);
-    expect(ghost.isAuthorizedRequest(fakeReq("10.0.0.50", { url: "/bluebubbles/message-sent?token=nope" }), "webhook", TOKEN)).toBe(false);
   });
 
   describe("over a real socket", () => {
@@ -256,31 +251,31 @@ describe("HTTP API authorization", () => {
       req.end(data);
     });
 
-    const event = { type: "new-message", data: { isFromMe: false, text: "ok", handle: { address: `+${PHONE_A}` }, chatGuid: `iMessage;-;+${PHONE_A}` } };
-
-    test("webhook without the token is rejected with 401", async () => {
-      const r = await post("/bluebubbles/message-sent", event);
-      expect(r.status).toBe(401);
+    const get = (urlPath) => new Promise((resolve, reject) => {
+      http.get({ hostname: "127.0.0.1", port, path: urlPath }, res => {
+        let out = "";
+        res.on("data", c => { out += c; });
+        res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(out || "{}") }));
+      }).on("error", reject);
     });
 
-    test("webhook with ?token= is routed (query string no longer breaks path matching)", async () => {
-      const r = await post(`/bluebubbles/message-sent?token=${TOKEN}`, event);
-      expect(r.status).toBe(200);
-      expect(r.body.ok).toBe(true);
-    });
+    // NAT-25: these routes were the unauthenticated or weakly authenticated control
+    // surface (approve-contact had no auth; /action trusted a public Discord user id).
+    test.each(["/bluebubbles/message-sent", "/action", "/approve-contact", "/deny-contact"])(
+      "removed state-changing route %s answers 404 and changes nothing", async (route) => {
+        const r = await post(route, { phone: "+15550003333", name: "Zed", draftId: "x", action: "send", userId: "1" });
+        expect(r.status).toBe(404);
+        expect(ghost.isAllowed("+15550003333")).toBe(false);
+        expect(wireSends).toHaveLength(0);
+      });
 
-    test("oversized body is refused with 413", async () => {
-      const big = JSON.stringify({ type: "new-message", data: { text: "x".repeat(ghost.MAX_BODY_BYTES + 10) } });
-      const r = await post(`/bluebubbles/message-sent?token=${TOKEN}`, big);
-      expect(r.status).toBe(413);
-    });
-
-    test("/approve-contact rejects an injected name and an empty phone", async () => {
-      const bad = await post("/approve-contact", { phone: "", name: "x" });
-      expect(bad.status).toBe(400);
-      const ok = await post("/approve-contact", { phone: "+15550003333", name: "Zed\n- Evil | +15559990000 | ask | friend | x" });
-      expect(ok.status).toBe(200);
-      expect(ghost.isAllowed("+15559990000")).toBe(false);
+    test("/health and loopback /pending still answer", async () => {
+      const h = await get("/health");
+      expect(h.status).toBe(200);
+      expect(h.body.transport).toBe("imessage-native");
+      const p = await get("/pending");
+      expect(p.status).toBe(200);
+      expect(Array.isArray(p.body.awaitingApproval)).toBe(true);
     });
   });
 });

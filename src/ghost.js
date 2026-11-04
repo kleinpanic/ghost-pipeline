@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 /**
- * ghost.js — Unified Ghost iMessage Pipeline v3
+ * ghost.js — Unified Ghost iMessage Pipeline v3 — native OpenClaw imessage transport (NAT-25, 2026-11-04)
  *
  * Usage:
- *   ghost serve                       run HTTP server + embedded reaction check loop
- *   ghost react                       one-shot reaction check (manual trigger)
+ *   ghost serve                       watch iMessage (imsg rpc) + local health server
  *   ghost learn [--all]               build/update contact memories + voice profile
  *   ghost learn --contact <phone>     process one contact only
  *   ghost status                      show current state
@@ -12,12 +11,9 @@
  *   ghost pause [--until ISO]         pause until timestamp
  *   ghost resume                      resume ghost
  *
- * Replaces:
- *   ~/.openclaw/hooks/bluebubbles-webhook.js
- *   ~/.openclaw/hooks/ghost-reaction-check.sh  (now embedded in `serve`)
- *   ~/.openclaw/workspace-ghost/scripts/check-allowlist.sh
- *   ~/.openclaw/workspace-ghost/scripts/rate-limiter.sh
- *   ~/.openclaw/workspace-ghost/scripts/sanitize-input.sh
+ * Loop: imsg rpc inbound → preflight gates → draft → native approval card (Allow Once /
+ * Deny) → send chokepoint → openclaw message send --channel imessage. Transport details
+ * live in src/imsg.js.
  */
 
 "use strict";
@@ -27,7 +23,8 @@ const https  = require("https");
 const fs     = require("fs");
 const path   = require("path");
 const crypto = require("crypto");
-const { spawnSync, spawn } = require("child_process");
+const { spawn } = require("child_process");
+const imsg   = require("./imsg");
 
 // sqlite-vec embedding DB (lazy-initialized on first use)
 let _memoriesDb = null;
@@ -44,22 +41,21 @@ const DATA_DIR  = path.join(HOME, ".openclaw", "data");
 const CONTACTS_FILE       = path.join(GHOST_DIR, "governance", "CONTACTS.md");
 const DENYLIST_FILE       = path.join(DATA_DIR, "ghost-denylist.json");
 const PENDING_DRAFTS_FILE = path.join(DATA_DIR, "ghost-pending-drafts.json");
-const BUTTON_ACTIONS_FILE   = path.join(DATA_DIR, "ghost-button-actions.json");
 // Separate registry for OC-managed button shortIds (object format, keyed by shortId)
-const BUTTON_REGISTRY_FILE  = path.join(DATA_DIR, "ghost-button-registry.json");
 const PAUSE_FILE          = path.join(DATA_DIR, "ghost-paused.json");
 // 90-03 (GHOST-TOGGLE): master send switch state. Fail-closed — absence means OFF.
 const SEND_TOGGLE_FILE    = path.join(DATA_DIR, "ghost-send-enabled.json");
 const SOUL_FILE           = path.join(GHOST_DIR, "SOUL.md");
 const VOICE_PROFILE_FILE  = path.join(GHOST_DIR, "memory", "voice-profile.md");
 const CONTACTS_MEMORY_DIR = path.join(GHOST_DIR, "memory", "contacts");
-const LOCK_FILE           = path.join(DATA_DIR, "ghost-reaction-check.lock");
 const SPAM_LOG_FILE       = path.join(DATA_DIR, "ghost-spam-log.json");
 const SPAM_RATELIMIT_FILE = path.join(DATA_DIR, "ghost-spam-ratelimit.json");
 const FEEDBACK_FILE       = path.join(DATA_DIR, "ghost-feedback.json");
 const OUTBOUND_RATE_FILE  = path.join(DATA_DIR, "ghost-outbound-rate.json");
 const OUTBOUND_BACKOFF_FILE = path.join(DATA_DIR, "ghost-outbound-backoff.json");
 const EVENT_DEDUP_FILE    = path.join(DATA_DIR, "ghost-event-dedup.json");
+// imsg watch.subscribe resume point (last rowid seen)
+const IMSG_CURSOR_FILE    = path.join(DATA_DIR, "ghost-imsg-cursor.json");
 
 // Per-contact send lock — prevents concurrent sends to the same contact
 const sendLocks = new Map();
@@ -69,11 +65,11 @@ const GHOST_MEMORIES_DB   = path.join(DATA_DIR, "ghost-memories.db");
 const GHOST_CONV_STATE_FILE = path.join(DATA_DIR, "ghost-conv-state.json");
 
 // ── In-memory race-condition guards ─────────────────────────────────────────
-// Prevents /action cancel from racing with doReactionCheck auto-send
+// A draft cancelled while its approval card is still live (Klein replied by hand)
 const cancelledDraftIds = new Set();
 const cancelledDraftTtl = new Map(); // draftId → expiryMs
 
-// Prevents outgoing-message webhook from racing with doReactionCheck auto-send
+// Klein's own recent replies, checked before every send
 const kleinRepliedRecentlyChats = new Map(); // chatGuid|phone → lastReplyMs
 
 // Per-phone alert counter — caps unknown-contact spam at 3 alerts, then auto-deny
@@ -170,7 +166,6 @@ const NEVER_SAY = [
 ];
 
 // Secrets
-const BB_PASSWORD        = readSecret(path.join(HOME, ".config", "bluebubbles", "password"));
 const OPENROUTER_API_KEY = readSecret(path.join(HOME, ".config", "openrouter", "api-key"));
 const DISCORD_BOT_TOKEN  = readSecret(path.join(HOME, ".config", "discord", "bot-token"));
 
@@ -207,34 +202,24 @@ const _env = loadEnvFile(path.join(__dirname, "..", ".env"));
 const env = (key, fallback = "") => process.env[key] || _env[key] || fallback;
 
 const PORT    = parseInt(env("GHOST_PORT", "18790"));
-// Interface the webhook server binds to. 0.0.0.0 because BlueBubbles posts from another host.
-const BIND_HOST = env("GHOST_BIND_HOST", "0.0.0.0");
-// Shared secret for the HTTP API. When set, the BlueBubbles webhook must present it, and
-// non-loopback callers may use the control endpoints with it. Sent as
-// "Authorization: Bearer <t>", "X-Ghost-Token: <t>", or "?token=<t>" (for the BB webhook URL).
+// Interface the local health server binds to. Nothing posts to ghost from another host
+// since the BlueBubbles webhook was removed (NAT-25), so loopback is the default.
+const BIND_HOST = env("GHOST_BIND_HOST", "127.0.0.1");
+// Shared secret for the HTTP API. When set, non-loopback callers may read /pending with it.
+// Sent as "Authorization: Bearer <t>", "X-Ghost-Token: <t>", or "?token=<t>".
 const GHOST_API_TOKEN = env("GHOST_API_TOKEN");
-const MAX_BODY_BYTES  = 1024 * 1024;
-const BB_HOST = env("BB_HOST", "127.0.0.1");
-const BB_PORT = parseInt(env("BB_PORT", "1234"));
 
 // Discord
 const GHOST_CHANNEL = env("GHOST_CHANNEL_ID");
 
-// 98-01: outbound sender identity for /tools/invoke. Blank => omit `agentId` entirely, which
-// resolves to the gateway's DEFAULT agent (main). See ocGatewayPost for why this stays unset.
-// Trimmed so a whitespace-only value is treated as unset rather than sent as a bogus agent id
-// (the gateway would 404 it), matching the GSD-OC sibling fix for the same defect.
-const OC_AGENT_ID = env("GHOST_OC_AGENT_ID").trim();
 
 // Identity
 const OWNER_PHONE_NORMALIZED = env("OWNER_PHONE");
-const KLEIN_DISCORD_USER_ID  = env("KLEIN_DISCORD_USER_ID");
 
 // Timing
 const DRAFT_DELAY_MS          = 30 * 1000;        // generate draft 30s after message (debounce)
-const AUTO_SEND_WINDOW_MS     = 5  * 60 * 1000;  // auto-send 5 min after draft posts (if no Cancel)
+const AUTO_SEND_WINDOW_MS     = 5  * 60 * 1000;  // approval window: an unanswered draft expires unsent
 
-const REACT_CHECK_INTERVAL_MS = 60 * 1000;       // reaction check every 60s
 const QUIET_HOUR_START        = 23;
 const QUIET_HOUR_END          = 8;
 const FAMILY_QUIET_HOUR_START = 22; // family_close + acquaintance quiet at 10pm
@@ -296,8 +281,6 @@ const SPARK_MODEL_FAST   = env("SPARK_MODEL_FAST", "any");
 const SPARK_MODEL_STRONG = env("SPARK_MODEL_STRONG", "any");
 
 // ── Phase 4: OpenClaw Ghost Agent  (uses full model chain + workspace context)
-const OC_GATEWAY_TOKEN = readSecret(path.join(HOME, ".openclaw", ".gateway-token")) ||
-                         env("OC_GATEWAY_TOKEN");
 
 // ── `ghost learn` analysis model (contact summaries + voice profile)
 // Was `google/gemma-3-27b-it:free` on OpenRouter until 2026-08-06, when OR retired the
@@ -532,19 +515,6 @@ function normalizeTs(ts) {
 }
 
 // Button registry helpers
-function loadButtonRegistry() {
-  const d = loadJson(BUTTON_REGISTRY_FILE, {});
-  return (d && typeof d === "object" && !Array.isArray(d)) ? d : {};
-}
-function saveButtonRegistry(registry) {
-  // Trim entries older than 24h on every write
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  const trimmed = {};
-  for (const [k, v] of Object.entries(registry)) {
-    if (!v.postedAt || new Date(v.postedAt).getTime() > cutoff) trimmed[k] = v;
-  }
-  saveJson(BUTTON_REGISTRY_FILE, trimmed);
-}
 
 function normalizePhone(input) {
   if (!input) return "";
@@ -648,54 +618,6 @@ function tryParseJson(text) {
   try { return JSON.parse(t); } catch { return null; }
 }
 
-function extractLastJson(text) {
-  let depth = 0, end = -1;
-  for (let i = text.length - 1; i >= 0; i--) {
-    if      (text[i] === "}") { if (depth === 0) end = i; depth++; }
-    else if (text[i] === "{") {
-      depth--;
-      if (depth === 0 && end !== -1) {
-        try { return JSON.parse(text.slice(i, end + 1)); } catch {}
-        end = -1;
-      }
-    }
-  }
-  return null;
-}
-
-function parseIncomingEvent(body, contentType) {
-  const trimmed = (typeof body === "string" ? body : "").trim();
-  if (!trimmed) throw new Error("empty webhook payload");
-
-  // Direct JSON
-  const direct = tryParseJson(trimmed);
-  if (direct && typeof direct === "object") {
-    if (direct.data && typeof direct.data === "object") return direct;
-    if (direct.event && typeof direct.event === "object") return direct.event;
-  }
-
-  // Form-encoded wrapper
-  const isForm = (contentType || "").toLowerCase().includes("application/x-www-form-urlencoded");
-  if (isForm || trimmed.includes("=")) {
-    const params = new URLSearchParams(trimmed);
-    for (const key of ["payload", "event", "data", "message"]) {
-      const val = tryParseJson(params.get(key));
-      if (val && typeof val === "object") {
-        if (val.data  && typeof val.data  === "object") return val;
-        if (val.event && typeof val.event === "object") return val.event;
-      }
-    }
-  }
-
-  // openclaw JSON buried in mixed stdout
-  const buried = extractLastJson(trimmed);
-  if (buried && typeof buried === "object") {
-    if (buried.data  && typeof buried.data  === "object") return buried;
-    if (buried.event && typeof buried.event === "object") return buried.event;
-  }
-
-  throw new SyntaxError("Unable to parse BlueBubbles payload as JSON event");
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  EMBEDDINGS + MEMORY DB  (sqlite-vec + Google text-embedding-004)
@@ -1412,7 +1334,7 @@ function isPaused() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  90-03 SEND-GATE LAYERS — fail-closed toggle + positive style allowlist
-//  (additive checks consumed at the top of the bbSendMessage chokepoint)
+//  (additive checks consumed at the top of the sendIMessage chokepoint)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Master send switch (GHOST-TOGGLE, 70-research addendum 2026-07-30).
@@ -1524,88 +1446,56 @@ function spawnAsync(cmd, args, { timeout = 30000, input } = {}) {
 //  BLUEBUBBLES API (direct HTTP — fast path for server)
 // ═══════════════════════════════════════════════════════════════════════════
 
-function bbRequest(endpoint, params = {}) {
-  return new Promise((resolve) => {
-    const qs      = new URLSearchParams({ password: BB_PASSWORD, ...params }).toString();
-    const options = { host: BB_HOST, port: BB_PORT, path: `/api/v1/${endpoint}?${qs}`, method: "GET" };
-    const req = http.request(options, (res) => {
-      let data = "";
-      res.on("data", c => { data += c; });
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-    });
-    req.on("error", err => { log(`BB API error (${endpoint}): ${err.message}`); resolve(null); });
-    req.setTimeout(8000, () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
 
-function bbPost(endpoint, body = {}) {
-  return new Promise((resolve) => {
-    const qs      = new URLSearchParams({ password: BB_PASSWORD }).toString();
-    const payload = JSON.stringify(body);
-    const options = {
-      host: BB_HOST, port: BB_PORT,
-      path: `/api/v1/${endpoint}?${qs}`, method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
-    };
-    const req = http.request(options, (res) => {
-      let data = "";
-      res.on("data", c => { data += c; });
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-    });
-    req.on("error", err => { log(`BB POST error (${endpoint}): ${err.message}`); resolve(null); });
-    req.setTimeout(10000, () => { req.destroy(); resolve(null); });
-    req.write(payload);
-    req.end();
-  });
-}
 
-async function fetchRecentMessages(chatGuid, limit = 20) {
-  // Primary path: non-blocking MCP call (mcporterCallAsync — does NOT block event loop)
+/** Newest-first context for one chat (imsg chat_id). [] on any read failure. */
+async function fetchRecentMessages(chatId, limit = 20) {
+  if (!Number.isInteger(chatId)) return [];
   try {
-    const data = await mcporterCallAsync("bb_get_chat_messages", { chat_guid: chatGuid, limit, sort: "DESC" });
-    const msgs = extractBBList(data);
-    if (msgs.length > 0 || data?.status === 200) return msgs;
+    return await imsgHistory(chatId, limit);
   } catch (err) {
-    log(`fetchRecentMessages MCP path failed (${err.message?.slice(0, 60)}); falling back to direct BB`);
+    log(`fetchRecentMessages(chat ${chatId}) failed: ${(err.message || "").slice(0, 120)}`);
+    return [];
   }
-  // Fallback: direct BB HTTP (works even if MCP/SSH tunnel is down)
-  const data = await bbRequest(`chat/${encodeURIComponent(chatGuid)}/message`, { limit, sort: "DESC" });
-  return Array.isArray(data?.data) ? data.data : [];
 }
 
-async function resolveChatGuid(phone) {
-  // When webhook events omit chatGuid, resolve the real "iMessage;-;+E164" guid
-  // via direct BB HTTP (fast, no MCP tunnel dependency).
-  // Paginates ALL chats in batches of 300 — with 1595+ chats the target thread
-  // is often not in the first page, causing false "could not resolve" failures.
-  try {
-    const normalized = normalizePhone(phone);
-    let allChats = [];
-    let offset   = 0;
-    while (true) {
-      const data  = await bbPost("chat/query", { limit: 300, offset, sort: "lastmessage", withLastMessage: false });
-      const batch = extractBBList(data);
-      if (!batch.length) break;
-      allChats.push(...batch);
-      if (batch.length < 300) break;
-      offset += 300;
-    }
-    const guid = findChatGuidForPhone(`+${normalized}`, allChats) ||
-                 findChatGuidForPhone(normalized, allChats);
-    // BUG-2 FIX: if the resolved guid is a group chat, do NOT proceed — require a direct 1:1 match.
-    // Ghost must never send to an individual when the triggering message came from a group chat context.
-    if (guid && guid.includes(";+;")) {
-      log(`resolveChatGuid: resolved guid ${guid} is a group chat — rejecting (groupChatSender protection)`);
-      return null;
-    }
-    if (guid) log(`Resolved chatGuid for +${normalized}: ${guid} (scanned ${allChats.length} chats)`);
-    else log(`resolveChatGuid: no match for +${normalized} in ${allChats.length} chats`);
-    return guid || null;
-  } catch (err) {
-    log(`resolveChatGuid failed for ${phone}: ${err.message?.slice(0, 60)}`);
-    return null;
-  }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NATIVE iMESSAGE TRANSPORT  (src/imsg.js — OpenClaw bundled imessage channel)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The three wires to the outside. Production uses src/imsg.js; tests replace them with
+// setTransport(). imsgRequest null = use the serve-mode watch session, else a one-shot one.
+const transport = {
+  imsgRequest:     null,
+  sendIMessage:    (target, text) => imsg.sendIMessageNative(target, text),
+  requestApproval: (opts) => imsg.requestOwnerApproval(opts),
+};
+function setTransport(overrides) { Object.assign(transport, overrides); }
+
+// Supervised watch.subscribe session while serving; null for CLI commands.
+let imsgWatch = null;
+
+async function imsgRequest(method, params, timeoutMs = 20000) {
+  if (transport.imsgRequest) return transport.imsgRequest(method, params, timeoutMs);
+  const live = imsgWatch && imsgWatch.getClient();
+  if (live) return live.request(method, params, timeoutMs);
+  return imsg.withImsgSession(c => c.request(method, params, timeoutMs));
+}
+
+/** imsg messages.history → normalized messages, newest first. */
+async function imsgHistory(chatId, limit, timeoutMs = 20000) {
+  const r = await imsgRequest("messages.history", { chat_id: chatId, limit, attachments: false }, timeoutMs);
+  return (Array.isArray(r?.messages) ? r.messages : [])
+    .map(imsg.normalizeImsgMessage)
+    .filter(Boolean)
+    .sort((a, b) => b.dateCreated - a.dateCreated);
+}
+
+/** imsg chats.list → raw chat rows ({ id, guid, identifier, ... }). */
+async function imsgChats(limit = 1000) {
+  const r = await imsgRequest("chats.list", { limit }, 60000);
+  return Array.isArray(r?.chats) ? r.chats : [];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1747,53 +1637,6 @@ function trySparkVllm(model, systemPrompt, userContent, timeoutMs = 15000, maxTo
 
 // ── Phase 4: OpenClaw Ghost Agent ────────────────────────────────────────────
 
-/**
- * Run one Ghost agent turn via the OpenClaw CLI.
- * The ghost agent uses its full workspace (SOUL.md + memory + model chain).
- * Returns draft text or null.
- */
-async function tryGhostAgent(contactName, contactPhone, messageText, historyLines) {
-  // Format the message Ghost will receive — tell it exactly what to produce
-  const msg = [
-    `GHOST DRAFT REQUEST`,
-    `Contact: ${contactName}`,
-    `Their message: "${messageText}"`,
-    historyLines ? `Recent conversation:\n${historyLines}` : "",
-    ``,
-    `Output ONLY the reply text Klein would send — no explanation, no quotes around it. Max 2 short texts.`,
-  ].filter(Boolean).join("\n");
-
-  try {
-    const stdout = await spawnAsync("openclaw", [
-      "agent",
-      "--agent",   "ghost",
-      "--message", msg,
-      "--json",
-    ], { timeout: 90000 });  // ghost agent can take 60-90s cold
-
-    // openclaw --json output has mixed log lines; extract last valid JSON
-    const data = extractLastJson(stdout) || tryParseJson(stdout.trim());
-    // reply text lives in different keys depending on version
-    const text = (
-      data?.reply   ||
-      data?.text    ||
-      data?.content ||
-      data?.message ||
-      (Array.isArray(data?.messages) ? data.messages[data.messages.length - 1]?.content : null) ||
-      ""
-    ).trim();
-
-    if (text && text.length > 0 && text.length < 600) {
-      log(`Ghost agent draft ok: "${text.slice(0, 60)}"`);
-      return text;
-    }
-    log(`Ghost agent: unusable response (len=${text.length})`);
-    return null;
-  } catch (err) {
-    log(`Ghost agent failed: ${err.message.slice(0, 100)}`);
-    return null;
-  }
-}
 
 // ── Full draft generation chain ──────────────────────────────────────────────
 
@@ -1858,74 +1701,12 @@ const GHOST_DRAFT_MODELS = [
  *   ghost-agent (if active) → claude-haiku → gemini-flash → gemini-flash-lite → gpt-oss-120b:free
  *
  * Checks:
- * - Ghost agent session: must be active within last 30 min (via OC gateway sessions_list)
  * - Spark: liveness via checkSparkAvailable (5-min cache); leads the list when up
  *   (operator ruling 2026-08-10 — supersedes the old style-task exclusion)
  * - OR models: skipped if OR_COOLDOWN_MAP has a future cooldownUntilMs entry
  */
 async function probeAvailableModels() {
   const available = [];
-
-  // 1. Ghost agent session — check via OC gateway sessions_list
-  if (OC_GATEWAY_TOKEN) {
-    try {
-      const body = JSON.stringify({ tool: "sessions_list", args: {} });
-      const sessionData = await new Promise((resolve) => {
-        const req = https.request({
-          hostname: "127.0.0.1",
-          port:     OC_GATEWAY_PORT,
-          path:     "/tools/invoke",
-          method:   "POST",
-          rejectUnauthorized: false,
-          headers: {
-            "Authorization":  `Bearer ${OC_GATEWAY_TOKEN}`,
-            "Content-Type":   "application/json",
-            "Content-Length": Buffer.byteLength(body),
-          },
-        }, (res) => {
-          let data = "";
-          res.on("data", c => { data += c; });
-          res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-        });
-        req.setTimeout(3000, () => { req.destroy(); resolve(null); });
-        req.on("error", () => resolve(null));
-        req.write(body);
-        req.end();
-      });
-
-      // sessions_list response format: { ok, result: { content: [{ type:"text", text: JSON({sessions:[]}) }] } }
-      let sessions = [];
-      try {
-        const textContent = sessionData?.result?.content?.[0]?.text;
-        if (textContent) {
-          sessions = JSON.parse(textContent).sessions || [];
-        } else if (Array.isArray(sessionData?.result)) {
-          sessions = sessionData.result;
-        } else if (Array.isArray(sessionData)) {
-          sessions = sessionData;
-        }
-      } catch { sessions = []; }
-
-      const ghostSession = sessions.find(
-        s => (s.key || s.sessionKey || s.id || "") === GHOST_AGENT_SESSION_KEY
-      );
-
-      if (ghostSession) {
-        const updatedAt = ghostSession.updatedAt ? new Date(ghostSession.updatedAt).getTime() : 0;
-        const ageMin    = (Date.now() - updatedAt) / 60000;
-        if (ageMin <= 30) {
-          available.push("ghost-agent");
-          log(`probeAvailableModels: ghost-agent active (age ${ageMin.toFixed(1)}min)`);
-        } else {
-          log(`probeAvailableModels: ghost-agent stale (age ${ageMin.toFixed(1)}min > 30min)`);
-        }
-      } else {
-        log("probeAvailableModels: ghost-agent session not found");
-      }
-    } catch (err) {
-      log(`probeAvailableModels: ghost-agent probe failed (${(err.message || "").slice(0, 60)})`);
-    }
-  }
 
   // 2. Spark (DGX over the wg-nvidia path) — operator ruling 2026-08-10 (90-02 option (b)+(d)):
   //    spark IS the draft path — free, local, and the only tier not gated on external credits.
@@ -2050,143 +1831,11 @@ function recentFeedbackSummary(limit = 20) {
 //  GHOST AGENT IPC QUEUE TIER
 // ═══════════════════════════════════════════════════════════════════════════
 
-const GHOST_AGENT_SESSION_KEY = "agent:ghost:main";
-const OC_GATEWAY_PORT         = 18789;  // loopback TLS, confirmed
 
 // Authenticated OC gateway client — all /tools/invoke calls go through here.
 // Adds request ID + timestamp headers for auditability; throws on auth failure.
-async function ocGatewayInvoke(tool, args, timeoutMs = 25000) {
-  if (!OC_GATEWAY_TOKEN) throw new Error("OC gateway token not configured");
-  const requestId = crypto.randomBytes(8).toString("hex");
-  const body = JSON.stringify({ tool, args });
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname:           "127.0.0.1",
-      port:               OC_GATEWAY_PORT,
-      path:               "/tools/invoke",
-      method:             "POST",
-      rejectUnauthorized: false,   // self-signed local cert
-      headers: {
-        "Authorization":  `Bearer ${OC_GATEWAY_TOKEN}`,
-        "Content-Type":   "application/json",
-        "Content-Length": Buffer.byteLength(body),
-        "X-Request-ID":   requestId,
-        "X-Timestamp":    Date.now().toString(),
-      },
-    }, (res) => {
-      if (res.statusCode === 401 || res.statusCode === 403) {
-        res.resume();
-        return reject(new Error(`OC gateway auth failure (${res.statusCode}) req=${requestId}`));
-      }
-      let data = "";
-      res.on("data", c => { data += c; });
-      res.on("end", () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed?.error) return reject(new Error(`OC gateway error: ${JSON.stringify(parsed.error).slice(0, 120)} req=${requestId}`));
-          resolve({ requestId, parsed });
-        } catch (e) {
-          reject(new Error(`OC gateway parse error: ${e.message} req=${requestId}`));
-        }
-      });
-    });
-    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error(`OC gateway timeout req=${requestId}`)); });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
-}
 
-async function tryGhostAgentSession(contactName, messageText, systemPrompt, userContent, timeoutMs = 25000) {
-  if (!OC_GATEWAY_TOKEN) { log("Ghost agent: no gateway token — skipping"); return null; }
 
-  const prompt = [
-    `You are drafting a reply for Klein. Use his texting style from your SOUL.md.`,
-    `Contact: ${contactName}`,
-    systemPrompt ? `\nContext:\n${systemPrompt}` : "",
-    `\n${userContent}`,
-    `\nOutput ONLY the reply text — nothing else. Max 1-2 short texts.`,
-  ].join("\n");
-
-  try {
-    const { requestId, parsed } = await ocGatewayInvoke("sessions_send", {
-      sessionKey:     GHOST_AGENT_SESSION_KEY,
-      message:        prompt,
-      timeoutSeconds: Math.floor(timeoutMs / 1000) - 2,
-    }, timeoutMs);
-
-    const inner   = parsed?.result?.details ?? parsed?.result;
-    const rawText = (typeof inner === "string" ? inner
-      : inner?.reply ?? inner?.text ?? inner?.message ?? inner?.content?.[0]?.text ?? "");
-    let text = rawText.trim();
-    try { const j = JSON.parse(text); text = j.text ?? j.reply ?? j.message ?? text; } catch {}
-
-    if (!text) {
-      log(`Ghost agent session: empty response (req=${requestId})`);
-      return null;
-    }
-    if (hasInternalDriftMarkers(text)) {
-      log(`Ghost agent session: BLOCKED internal marker in response (req=${requestId})`);
-      return null;
-    }
-    log(`Ghost agent session draft ok (req=${requestId}): "${text.slice(0, 40)}"`);
-    return { text: text.trim(), model: "ghost-agent" };
-  } catch (e) {
-    log(`Ghost agent session error: ${e.message}`);
-    return null;
-  }
-}
-
-/**
- * Post a message via the OpenClaw gateway tools/invoke endpoint.
- * Used for posting draft buttons so OC registers the components (prevents 30-min expiry).
- * Returns the parsed JSON response or null on failure.
- */
-function ocGatewayPost(tool, args, timeoutMs = 15000) {
-  return new Promise((resolve) => {
-    if (!OC_GATEWAY_TOKEN) { resolve(null); return; }
-    // No sessionKey pin: pinning to the ghost session applied the ghost AGENT's tool policy,
-    // and f447db3 removed `message` from it — every card post 404'd "Tool not available" and
-    // buttons silently degraded to the raw fallback (proven in 90-02 attempt #6). Unpinned,
-    // the invoke runs under the default scope which still has `message`; click dispatch never
-    // depended on the posting session anyway — the pre-message hook parses the LABEL
-    // (Clicked "✅ Send · <draftId>".) and calls ghost's localhost HTTP by draftId.
-    //
-    // 98-01: "the default scope" is the DEFAULT AGENT (main) — not a neutral one. So every card
-    // posted here renders "[KleinClaw-Main]" inside ghost's own channel and mints a parasitic
-    // agent:main:discord:channel:<ghost> session. OC_AGENT_ID sends the gateway's sanctioned
-    // `agentId` selector, which redirects BOTH the identity stamp and the delivery-mirror store
-    // (live-proven 2026-08-13 against a different agent's channel).
-    // Left UNSET on purpose: agentId only resolves for an agent that HOLDS the message tool, and
-    // ghost's policy is `profile:"minimal"` with message absent from alsoAllow — so agentId:"ghost"
-    // returns 404 today, exactly like the sessionKey pin above. Granting it is a deliberate
-    // security trade (ghost reads untrusted inbound SMS; message is send-anywhere) and is the
-    // operator's call, not this file's. Unset => byte-identical body to the pre-98-01 behavior.
-    const invoke = { tool, args };
-    if (OC_AGENT_ID) invoke.agentId = OC_AGENT_ID;
-    const body = JSON.stringify(invoke);
-    const req = https.request({
-      hostname: "127.0.0.1",
-      port:     OC_GATEWAY_PORT,
-      path:     "/tools/invoke",
-      method:   "POST",
-      rejectUnauthorized: false,
-      headers: {
-        "Authorization":  `Bearer ${OC_GATEWAY_TOKEN}`,
-        "Content-Type":   "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
-    }, (res) => {
-      let data = "";
-      res.on("data", c => { data += c; });
-      res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-    });
-    req.setTimeout(timeoutMs, () => { req.destroy(); resolve(null); });
-    req.on("error", () => resolve(null));
-    req.write(body);
-    req.end();
-  });
-}
 
 /**
  * Phase 1 — Draft Generation
@@ -2217,12 +1866,6 @@ async function generateDraft(systemPrompt, userContent, { contactName, contactPh
 
   for (const modelKey of available) {
     switch (modelKey) {
-      case "ghost-agent": {
-        // ghost-agent tier disabled — consistently times out (~14s); haiku with same SOUL context is equivalent and 15x faster
-        // Re-enable when ghost agent session is tuned for low-latency draft responses
-        log("Draft tier ghost-agent: skipped (disabled — use haiku)");
-        break;
-      }
       case "spark-fast": {
         log(`Draft: Spark ${SPARK_MODEL_FAST}...`);
         const t = (await trySparkVllm(SPARK_MODEL_FAST, systemPrompt, userContent))?.text || null;
@@ -2404,18 +2047,6 @@ async function discordPost(channelId, payload) {
   }
 }
 
-async function discordDelete(channelId, messageId) {
-  try {
-    await spawnAsync("curl", [
-      "-s", "-X", "DELETE",
-      `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`,
-      "--config", "-",
-    ], { timeout: 8000, input: discordAuthCurlConfig() });
-  } catch (err) {
-    log(`Discord delete error: ${err.message}`);
-  }
-}
-
 // ── F9 (2026-08-10 audit): severity-colored embeds for the informational,
 // button-less notice classes. These ride raw discordPost (curl), which carries
 // embeds fine — the OC gateway path (draft cards, unknown-alert buttons) keeps
@@ -2485,7 +2116,7 @@ function buildAutoDenyEmbed({ contactName, phone, lastMessage, cause }) {
     description: `\`+${phone}\` — ${why}`,
     fields: [
       { name: "Last message", value: lastMessage ? `"${lastMessage.slice(0, 120)}"` : "" },
-      { name: "Reverse",      value: `\`approve ${phone}\`` },
+      { name: "Reverse",      value: `remove from data/ghost-denylist.json, then \`ghost retrigger +${phone}\`` },
     ],
   });
 }
@@ -2496,7 +2127,7 @@ function buildTransactionalEmbed({ kind, phone, messageText }) {
     severity:    "transactional",
     title:       `ℹ️ ${kind} auto-denied`,
     description: `\`+${phone}\` — no reply path.\n💬 "${(messageText || "").slice(0, 160)}"`,
-    fields:      [{ name: "Wrong call?", value: `\`approve ${phone}\` reverses it.` }],
+    fields:      [{ name: "Wrong call?", value: `remove from data/ghost-denylist.json, then \`ghost retrigger +${phone}\`` }],
   });
 }
 
@@ -2527,7 +2158,7 @@ function buildUnknownAlertEmbed(content) {
   });
 }
 
-// In-memory map of unanswered unknown-contact alerts: phone → { messageId, postedAt, alertedAt, alertCount, phone, messageText, contactName, source, enrichment }
+// Live unknown-contact approval requests: phone → { messageId, postedAt, alertCount, phone, messageText, contactName, source, recentQuotes }
 const pendingUnknownAlerts = new Map();
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2540,8 +2171,13 @@ function loadPendingDrafts() {
 }
 function savePendingDrafts(drafts) { saveJson(PENDING_DRAFTS_FILE, drafts); }
 
+/**
+ * Post the draft summary to #ghost-openclaw and record it as pending. The decision itself
+ * comes from the native approval card (awaitDraftApproval); this message has no buttons.
+ * Returns the pending draft record, or null when there is no usable draft.
+ */
 async function postDraftToDiscord(draftResult, meta) {
-  const { chatGuid, contact, contactName, messageText, arrivedAt, contextMessages, autoSendMs } = meta;
+  const { chatGuid, chatId, contact, contactName, messageText, arrivedAt, contextMessages, autoSendMs } = meta;
   const draftId    = crypto.randomBytes(4).toString("hex");
   const phone      = `+${normalizePhone(contact)}`;
   const safeName   = contactName.replace(/[*_`]/g, "\\$&");
@@ -2572,7 +2208,7 @@ async function postDraftToDiscord(draftResult, meta) {
   if (ctxMsgs.length) {
     content += `\n**Context** (${ctxMsgs.length})\n`;
     for (const m of ctxMsgs) {
-      const label = (m.isFromMe === true || m.from === "me") ? "You" : contactName;
+      const label = isFromKlein(m) ? "You" : contactName;
       content += `> **${label}**: ${m.text.trim().slice(0, 120)}\n`;
     }
   }
@@ -2582,23 +2218,21 @@ async function postDraftToDiscord(draftResult, meta) {
   const hasUsableDraft  = draftResult && draftResult.text && !isSafetyBlocked && !isExhausted;
 
   if (hasUsableDraft) {
-    const cooldownMin = Math.round((autoSendMs || AUTO_SEND_WINDOW_MS) / 60000 * 10) / 10;
-    const draftLines  = draftResult.text.split("\n").map(l => `> ${l}`).join("\n");
-    // Show token usage + cost from OR response
+    const windowMin  = Math.round((autoSendMs || AUTO_SEND_WINDOW_MS) / 60000 * 10) / 10;
+    const draftLines = draftResult.text.split("\n").map(l => `> ${l}`).join("\n");
     const usage = draftResult.usage;
     let usageStr = "";
     if (usage) {
       const pt = usage.prompt_tokens || 0;
       const ct = usage.completion_tokens || 0;
       const tt = usage.total_tokens || (pt + ct);
-      // OR returns cost in USD as usage.cost (some models) or generation.cost
       const cost = typeof usage.cost === "number" ? usage.cost
         : typeof usage?.["x-ratelimit-cost"] === "number" ? usage["x-ratelimit-cost"] : null;
       const costStr = cost !== null ? ` · $${cost.toFixed(5)}` : "";
       usageStr = ` · ${tt}tok (↑${pt} ↓${ct})${costStr}`;
     }
     content += `\n**Draft** · _${draftResult.model}_${usageStr} · ${convMode}\n${draftLines}\n`;
-    content += `\n⏳ Expires unsent in ${cooldownMin} min — tap ✅ Send to deliver · \`${draftId}\``;
+    content += `\n⏳ Allow Once / Deny on the approval card below — expires unsent in ${windowMin} min · \`${draftId}\``;
   } else if (isSafetyBlocked) {
     content += `\n⚠️ All draft tiers failed content safety — reply manually.`;
   } else if (isExhausted) {
@@ -2611,266 +2245,217 @@ async function postDraftToDiscord(draftResult, meta) {
   // Hard cap at 1900 chars
   if (content.length > 1900) content = content.slice(0, 1897) + "…";
 
-  let messageId = null;
+  const posted = await discordPost(GHOST_CHANNEL, { content });
+  if (!hasUsableDraft) return null;
 
-  if (hasUsableDraft && OC_GATEWAY_TOKEN) {
-    // BUG-1 FIX: post via OC gateway so component registration persists (no 30-min TTL).
-    // discordPost() bypasses OC → buttons expire. OC gateway registers them as reusable.
-    try {
-      const ocResp = await ocGatewayPost("message", {
-        action:     "send",
-        channel:    "discord",
-        target:     `channel:${GHOST_CHANNEL}`,
-        // F10: transport marker — appended only on the OC path; the raw
-        // fallback below reuses bare `content`, where this line would lie.
-        message:    content + "\n_via oc-gateway_",
-        components: {
-          reusable: true,
-          blocks: [{
-            type:    "actions",
-            buttons: [
-              { label: `✅ Send · ${draftId}`, style: "success" },
-              { label: `❌ Cancel · ${draftId}`, style: "danger"  },
-            ],
-          }],
-        },
-      });
-
-      // Parse messageId from OC response envelope
-      try {
-        // Prefer details.result.messageId (avoids JSON control-char parse issues in content text)
-        messageId = ocResp?.result?.details?.result?.messageId
-          || ocResp?.details?.result?.messageId
-          || null;
-        if (!messageId) {
-          try {
-            const textContent = ocResp?.result?.content?.[0]?.text;
-            messageId = JSON.parse(textContent || "{}")?.result?.messageId || null;
-          } catch {}
-        }
-      } catch {}
-
-      if (messageId) {
-        // GET the Discord message to find the OC-generated component custom_ids
-        // Format: occomp:cid=<shortId>   Map label → action
-        try {
-          const dmStdout = await spawnAsync("curl", [
-            "-s",
-            `https://discord.com/api/v10/channels/${GHOST_CHANNEL}/messages/${messageId}`,
-            "--config", "-",
-          ], { timeout: 8000, input: discordAuthCurlConfig() });
-          const dmsg     = tryParseJson(dmStdout);
-          // Discord Components v2 (flags:32768): buttons are inside a container (type 17)
-          // → action row (type 1) nested within. Flatten all type-2 components across all levels.
-          const flattenButtons = (comps) => {
-            const out = [];
-            for (const c of (comps || [])) {
-              if (c.type === 2) out.push(c);
-              if (c.components) out.push(...flattenButtons(c.components));
-            }
-            return out;
-          };
-          const buttons  = flattenButtons(dmsg?.components || []);
-          const registry = loadButtonRegistry();
-          for (const btn of buttons) {
-            const cid = (btn.custom_id || "");
-            if (!cid.startsWith("occomp:cid=")) continue;
-            const shortId = cid.replace("occomp:cid=", "");
-            const label   = (btn.label || "").toLowerCase();
-            const action  = label.includes("send") ? "send" : "cancel";
-            registry[shortId] = {
-              draftId,
-              action,
-              contactName,
-              chatGuid: chatGuid || "",
-              contact:  contact  || "",
-              postedAt: new Date().toISOString(),
-            };
-          }
-          saveButtonRegistry(registry);
-          log(`Button registry updated for draft ${draftId} (shortIds: ${Object.keys(registry).slice(-2).join(", ")})`);
-        } catch (err) {
-          log(`postDraftToDiscord: failed to fetch Discord msg for shortId extraction — ${err.message.slice(0, 80)}`);
-        }
-      } else {
-        log(`postDraftToDiscord: OC gateway returned no messageId — falling back to discordPost (raw buttons will NOT be registered; clicks will show 'expired'). OC resp: ${JSON.stringify(ocResp).slice(0, 200)}`);
-      }
-    } catch (err) {
-      log(`postDraftToDiscord: OC gateway error (${err.message.slice(0, 80)}) — falling back`);
-    }
-  }
-
-  // Fallback: raw Discord API (no-draft case, or if OC gateway failed)
-  // IMPORTANT: do NOT post raw buttons here. They expire and cause "This component has expired".
-  if (!messageId) {
-    const fallbackContent = hasUsableDraft
-      ? `${content}\n⚠️ Controls unavailable (gateway fallback). Auto-send only for this draft.`
-      : content;
-    const result = await discordPost(GHOST_CHANNEL, { content: fallbackContent });
-    messageId = result?.id || null;
-  }
-
-  if (messageId && hasUsableDraft) {
-    const drafts = loadPendingDrafts();
-    drafts.push({
-      messageId,
-      draftId,
-      chatGuid:    chatGuid || "",
-      contact:     contact  || "",
-      contactName: contactName,
-      draftText:   draftResult.text,
-      arrivedAt:   new Date(arrivedAt).toISOString(),
-      postedAt:    new Date().toISOString(),
-    });
-    savePendingDrafts(drafts);
-    log(`Pending draft saved: ${contactName} (${draftId})`);
-  }
+  const draft = {
+    messageId:   posted?.id || null,
+    draftId,
+    chatGuid:    chatGuid || "",
+    chatId:      Number.isInteger(chatId) ? chatId : null,
+    contact:     contact  || "",
+    contactName: contactName,
+    draftText:   draftResult.text,
+    arrivedAt:   new Date(arrivedAt).toISOString(),
+    postedAt:    new Date().toISOString(),
+    autoSendMs:  autoSendMs || AUTO_SEND_WINDOW_MS,
+  };
+  const drafts = loadPendingDrafts();
+  drafts.push(draft);
+  savePendingDrafts(drafts);
+  log(`Pending draft saved: ${contactName} (${draftId})`);
+  return draft;
 }
 
-async function postUnknownAlert(phone, messageText, contactName, { source = "unknown", enrichment = null, alertCount = 1, recentQuotes = null, alertedAt = null } = {}) {
+async function postUnknownAlert(phone, messageText, contactName, { source = "unknown", alertCount = 1, recentQuotes = null } = {}) {
   const n        = normalizePhone(phone);
   const inApple  = source === "apple_contacts";
   const nameDisp = inApple ? `**${contactName}** (+${n})` : `+${n}`;
-  const sourceLine = inApple
-    ? `📒 Found in your Apple Contacts`
-    : `❓ Not in Apple Contacts`;
+  const quotes   = (recentQuotes && recentQuotes.length ? recentQuotes : [messageText]).filter(Boolean).slice(-3);
+
+  // Register first, before any await, so a second message coalesces onto this request.
+  pendingUnknownAlerts.set(n, {
+    messageId: null, postedAt: Date.now(), alertCount,
+    phone: n, messageText, contactName, source, recentQuotes: quotes,
+  });
 
   let content = `⚠️ **Unknown Contact** (${inApple ? "in your Contacts" : "not in Contacts"})\n`;
   content += `📞 ${nameDisp}\n`;
-  content += `${sourceLine}\n`;
-  if (enrichment?.emails?.length) content += `📧 ${enrichment.emails.slice(0,2).join(", ")}\n`;
-  const quotes = (recentQuotes && recentQuotes.length ? recentQuotes : [messageText]);
+  content += inApple ? "📒 Found in your Apple Contacts\n" : "❓ Not in Apple Contacts\n";
   for (const q of quotes) content += `💬 "${(q || "").slice(0, 200)}"\n`;
   content = content.trimEnd();
-  if (alertCount > 1) content += `\n_Alert #${alertCount} — ${3 - alertCount + 1} remaining before auto-deny_`;
-  // Text command fallback — buttons click visually but don't route to agent session
-  // Typing in this channel DOES reach the ghost agent. Use text commands as the real action path.
-  content += `\n\`approve ${n}\` · \`deny ${n}\``;
+  if (alertCount > 1) content += `\n_Request #${alertCount} — ${MAX_UNKNOWN_ALERTS - alertCount} more unanswered before auto-deny_`;
+  content += "\nAllow Once adds the number to the allowlist; Deny adds it to the denylist (approval card below).";
 
-  // Post via OC gateway with reusable=true so buttons never expire.
-  // Labels encode the phone so handler.js can parse them without a registry lookup.
-  let messageId = null;
-  if (OC_GATEWAY_TOKEN) {
-    try {
-      const ocResp = await ocGatewayPost("message", {
-        action:  "send",
-        channel: "discord",
-        target:  `channel:${GHOST_CHANNEL}`,
-        message: content,
-        components: {
-          reusable: true,
-          blocks: [{
-            type:    "actions",
-            buttons: [
-              { label: `✅ Approve · ${n}`, style: "success" },
-              { label: `❌ Deny · ${n}`,    style: "danger"  },
-            ],
-          }],
-        },
-      });
-      messageId = ocResp?.result?.details?.result?.messageId
-        || ocResp?.details?.result?.messageId
-        || null;
-      if (!messageId) {
-        try {
-          const tc = ocResp?.result?.content?.[0]?.text;
-          messageId = JSON.parse(tc || "{}")?.result?.messageId || null;
-        } catch {}
-      }
-    } catch (err) {
-      log(`postUnknownAlert: OC gateway failed (${err.message.slice(0, 80)}) — falling back`);
-    }
-  }
+  const posted = await discordPost(GHOST_CHANNEL, { embeds: [buildUnknownAlertEmbed(content)] });
+  const entry  = pendingUnknownAlerts.get(n);
+  if (entry) entry.messageId = posted?.id || null;
 
-  // Fallback to raw Discord if OC gateway unavailable — F9: embed (approval orange)
-  if (!messageId) {
-    const result = await discordPost(GHOST_CHANNEL, { embeds: [buildUnknownAlertEmbed(content)] });
-    messageId = result?.id || null;
-    if (messageId) log(`postUnknownAlert: OC gateway unavailable — posted without buttons (fallback). Buttons will not work.`);
-  }
-
-  // Track for repost limiting (max MAX_UNKNOWN_ALERTS per phone, then auto-deny)
-  if (messageId) {
-    const nowTs   = Date.now();
-    // ocGateway=true → buttons are reusable, no need to refresh them
-    const ocGateway = !!(OC_GATEWAY_TOKEN && messageId);
-    pendingUnknownAlerts.set(n, {
-      // alertedAt carries through a coalesced repost so a chatty sender can't reset the 4h clock
-      messageId, postedAt: nowTs, alertedAt: alertedAt || nowTs,
-      alertCount,
-      ocGateway,
-      phone: n, messageText, contactName, source, enrichment,
-      recentQuotes: quotes,
-    });
-  }
+  const title = `Ghost: allow drafting for ${inApple ? contactName.slice(0, 30) : `+${n}`}?`.slice(0, imsg.APPROVAL_TITLE_MAX);
+  const description = [
+    `+${n} · ${inApple ? `${contactName} (in Contacts)` : "not in Contacts"}`,
+    ...quotes.map(q => `"${(q || "").slice(0, 200)}"`),
+  ].join("\n").slice(0, imsg.APPROVAL_DESCRIPTION_MAX);
+  const { decision, error } = await transport.requestApproval({
+    title, description, timeoutMs: UNKNOWN_APPROVAL_MS, channelId: GHOST_CHANNEL,
+  });
+  if (error) log(`Unknown-contact approval for +${n} failed: ${error}`);
+  return resolveUnknownContactDecision(n, decision);
 }
 
-// Max times we'll re-alert for the same unknown number before auto-denying them
+// ═══════════════════════════════════════════════════════════════════════════
+//  OWNER APPROVAL  (native plugin approvals — Discord card in #ghost-openclaw, /approve)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const APPROVAL_MIN_WINDOW_MS = 60 * 1000;
+
+/**
+ * Ask the owner about one draft and act on the answer. The approval description is the
+ * exact draft text: the owner approves the string that is sent, never a draft id that
+ * could resolve to something else later. A draft longer than the card allows is refused,
+ * not truncated.
+ */
+async function awaitDraftApproval(draft) {
+  const text = draft.draftText || "";
+  if (text.length > imsg.APPROVAL_DESCRIPTION_MAX) {
+    return resolveDraftDecision(draft.draftId, null, null, "too-long");
+  }
+  const target = `+${normalizePhone(draft.contact)}`;
+  const name   = (draft.contactName || target).slice(0, 30);
+  const title  = `Ghost: send to ${name} (${target})?`.slice(0, imsg.APPROVAL_TITLE_MAX);
+  const windowMs = Math.max(draft.autoSendMs || AUTO_SEND_WINDOW_MS, APPROVAL_MIN_WINDOW_MS);
+  const { decision, error } = await transport.requestApproval({
+    title, description: text, timeoutMs: windowMs, channelId: GHOST_CHANNEL,
+  });
+  if (error) log(`Approval request for draft ${draft.draftId} failed: ${error}`);
+  return resolveDraftDecision(draft.draftId, decision, text, error ? "approval-error" : null);
+}
+
+/**
+ * Apply one owner decision. Fail-closed rules (a live approval cannot be withdrawn from
+ * another connection, so a late "allow-once" must be safe):
+ *   - the draft must still be pending: superseded, cancelled (Klein replied by hand) or
+ *     paused drafts are gone from the pending file, and are not sent;
+ *   - one approval gives one send attempt: the draft leaves the pending file first;
+ *   - the approved text must equal the pending draft text;
+ *   - no decision (expiry, error, oversized draft) is never a send (AUTOSEND-FAILCLOSED).
+ */
+async function resolveDraftDecision(draftId, decision, approvedText, note = null) {
+  const draft = loadPendingDrafts().find(d => d.draftId === draftId);
+  if (!draft) {
+    log(`Decision ${decision || "none"} for ${draftId}: draft no longer pending (superseded, cancelled or paused) — not sent`);
+    return { action: "stale" };
+  }
+  savePendingDrafts(loadPendingDrafts().filter(d => d.draftId !== draftId));
+
+  if (cancelledDraftIds.has(draftId)) {
+    cancelledDraftIds.delete(draftId);
+    cancelledDraftTtl.delete(draftId);
+    logFeedback(draft, "cancelled");
+    return { action: "cancelled" };
+  }
+
+  if (decision === "allow-once") {
+    if (approvedText !== draft.draftText) {
+      log(`Approval for ${draftId} does not match the pending text — not sent`);
+      logFeedback(draft, "blocked-text-mismatch");
+      await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${draft.contactName}**: approved text differs from the draft.` });
+      return { action: "text_mismatch" };
+    }
+    log(`✅ Approved: ${draft.contactName} (${draftId})`);
+    const ok = await executeSend({ ...draft, draftText: approvedText }, "approval:allow-once");
+    return { action: ok ? "handled" : "send_failed" };
+  }
+
+  if (decision === "deny") {
+    log(`❌ Denied: ${draft.contactName} (${draftId})`);
+    logFeedback(draft, "cancelled");
+    await discordPost(GHOST_CHANNEL, { embeds: [buildCancelEmbed(draft.contactName)] });
+    return { action: "cancelled" };
+  }
+
+  if (note === "too-long") {
+    log(`Draft ${draftId} for ${draft.contactName} exceeds the approval card (${imsg.APPROVAL_DESCRIPTION_MAX} chars) — refused`);
+    logFeedback(draft, "refused-too-long");
+    await discordPost(GHOST_CHANNEL, {
+      content: `⚠️ Draft for **${draft.contactName}** is longer than the approval card allows (${imsg.APPROVAL_DESCRIPTION_MAX} chars) — not sent. Reply manually.`,
+    });
+    return { action: "refused_too_long" };
+  }
+
+  const minutes = Math.round((draft.autoSendMs || AUTO_SEND_WINDOW_MS) / 60000);
+  log(`Draft expired unsent for ${draft.contactName} (${draftId}) reason=${note || "expired"}`);
+  logFeedback(draft, "expired");
+  await discordPost(GHOST_CHANNEL, { embeds: [buildExpiryEmbed(draft.contactName, minutes)] });
+  return { action: "expired" };
+}
+
+/**
+ * An approval lives in the process that requested it. After a restart no pending draft
+ * can be approved any more, so each one expires unsent and the owner is told.
+ */
+function expireOrphanedDraftsOnStartup() {
+  const drafts = loadPendingDrafts();
+  if (!drafts.length) return;
+  savePendingDrafts([]);
+  for (const d of drafts) logFeedback(d, "expired-restart");
+  const names = [...new Set(drafts.map(d => d.contactName))].join(", ");
+  log(`Startup: ${drafts.length} pending draft(s) lost their approval on restart — expired unsent`);
+  discordPost(GHOST_CHANNEL, {
+    content: `⚠️ **Ghost restarted** — ${drafts.length} pending draft(s) expired unsent; their approval cards no longer act.\nAffected: ${names || "unknown"}\nReply manually if needed.`,
+  }).catch(() => {});
+}
+
+/** Act on the owner's answer to "let ghost draft for this unknown number?". */
+async function resolveUnknownContactDecision(phone, decision) {
+  const n     = normalizePhone(phone);
+  const entry = pendingUnknownAlerts.get(n) || { contactName: `+${n}`, alertCount: 1 };
+  pendingUnknownAlerts.delete(n);
+
+  if (decision === "allow-once") {
+    const name = entry.source === "apple_contacts" ? entry.contactName : "Unknown";
+    try {
+      addToAllowlist(`+${n}`, name, { source: "discord_approve" });
+    } catch (err) {
+      log(`Approve skipped for +${n}: ${err.message}`);
+      return { action: "error" };
+    }
+    unknownAlertCounts.delete(n);
+    await discordPost(GHOST_CHANNEL, { content: `✅ Approved **${entry.contactName || `+${n}`}** — added to allowlist.` });
+    return { action: "approved" };
+  }
+
+  if (decision === "deny") {
+    addToDenylist(n);
+    unknownAlertCounts.delete(n);
+    await discordPost(GHOST_CHANNEL, { content: `🚫 Denied \`+${n}\` — added to denylist.` });
+    return { action: "denied" };
+  }
+
+  const count = entry.alertCount || 1;
+  unknownAlertCounts.set(n, count);
+  if (count >= MAX_UNKNOWN_ALERTS) {
+    log(`Unknown contact +${n}: ${count} unanswered approval requests — auto-denying`);
+    addToDenylist(n);
+    unknownAlertCounts.delete(n);
+    discordPost(GHOST_CHANNEL, {
+      embeds: [buildAutoDenyEmbed({ contactName: entry.contactName, phone: n, lastMessage: entry.messageText, cause: "max-alerts" })],
+    }).catch(() => {});
+    return { action: "auto_denied" };
+  }
+  log(`Unknown contact +${n}: approval expired unanswered (${count}/${MAX_UNKNOWN_ALERTS})`);
+  return { action: "expired" };
+}
+
+// Unanswered approval requests for one unknown number before it is auto-denied
 const MAX_UNKNOWN_ALERTS = 3;
+// An unknown-contact approval stays open for the plugin-approval maximum
+const UNKNOWN_APPROVAL_MS = imsg.APPROVAL_TIMEOUT_MAX_MS;
 
 // Refresh unknown-contact alerts before Discord's 15-min interaction token expires.
 // Runs every 12 min; deletes stale message + reposts fresh one for any unanswered alert.
 // After MAX_UNKNOWN_ALERTS reposts, auto-denies the contact to stop the spam loop.
-async function refreshUnknownAlerts() {
-  if (!pendingUnknownAlerts.size) return;
-  const REFRESH_MS = 12 * 60 * 1000; // 12 minutes
-  const now = Date.now();
-  // Snapshot stale entries BEFORE iterating — prevents re-visiting newly added entries
-  // Skip entries posted via OC gateway: reusable=true buttons persist indefinitely, no refresh needed
-  const stale = [...pendingUnknownAlerts.entries()].filter(([, e]) => {
-    if (e.ocGateway) return false;  // OC reusable buttons — never need refreshing
-    return now - e.postedAt >= REFRESH_MS;
-  });
-  for (const [phone, entry] of stale) {
-    const n = normalizePhone(phone);
-    // If the contact was added to the allowlist since the alert was first posted, cancel it
-    if (isAllowed(`+${n}`)) {
-      log(`Unknown-contact alert for +${n} is now on allowlist — cancelling stale alert`);
-      if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
-      pendingUnknownAlerts.delete(phone);
-      continue;
-    }
-    const nextCount = (entry.alertCount || 1) + 1;
-    // Max alerts reached — auto-deny to stop the spam loop
-    if (nextCount > MAX_UNKNOWN_ALERTS) {
-      log(`Unknown contact +${n} hit max alert limit (${MAX_UNKNOWN_ALERTS}) — auto-denying`);
-      addToDenylist(n);
-      if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
-      pendingUnknownAlerts.delete(phone);
-      discordPost(GHOST_CHANNEL, {
-        embeds: [buildAutoDenyEmbed({ contactName: entry.contactName, phone: n, lastMessage: entry.messageText, cause: "max-alerts" })],
-      }).catch(() => {});
-      continue;
-    }
-    log(`Refreshing unknown-contact alert for +${n} (alert #${nextCount}/${MAX_UNKNOWN_ALERTS})`);
-    if (entry.messageId) await discordDelete(GHOST_CHANNEL, entry.messageId).catch(() => {});
-    pendingUnknownAlerts.delete(phone);
-    // Repost fresh — re-adds to the map with a new postedAt and incremented alertCount
-    await postUnknownAlert(phone, entry.messageText, entry.contactName, {
-      source: entry.source, enrichment: entry.enrichment, alertCount: nextCount,
-    });
-  }
-}
 
-/**
- * sweepStaleUnknownAlerts — auto-deny unknown contacts that haven't been approved in 4 waking hours.
- * Called every 30 minutes via setInterval in cmdServe().
- */
-async function sweepStaleUnknownAlerts() {
-  if (!pendingUnknownAlerts.size) return;
-  const WAKING_HOURS_MS = 4 * 60 * 60 * 1000;
-  const now = Date.now();
-  const stale = [...pendingUnknownAlerts.entries()].filter(([, e]) => now - e.alertedAt > WAKING_HOURS_MS);
-  for (const [phone, entry] of stale) {
-    const n = normalizePhone(phone);
-    log(`Unknown contact ${n} timed out — auto-denying`);
-    addToDenylist(n);
-    pendingUnknownAlerts.delete(phone);
-    discordPost(GHOST_CHANNEL, {
-      embeds: [buildAutoDenyEmbed({ contactName: entry.contactName, phone: n, lastMessage: entry.messageText, cause: "timeout" })],
-    }).catch(() => {});
-  }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  PHASE 0 — PREFLIGHT
@@ -2887,18 +2472,18 @@ async function sweepStaleUnknownAlerts() {
  *   { ok: true,  context: { messages, contactName, category } }
  *   { ok: false, reason: string, ...extra }
  */
-const MAX_MESSAGE_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours — BB replays old msgs on reconnect
+const MAX_MESSAGE_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours — drops backlog replayed after a resume
 
 async function runPreflight(contact, messageText, chatGuid, eventData) {
   const normalized = normalizePhone(contact);
 
   // -2. Reaction-event guard — skip tapback/emoji reactions without further processing
-  // BlueBubbles may emit standalone reaction events where text == reaction label (e.g. "liked")
+  // (imsg watch.subscribe runs with include_reactions, so tapbacks arrive as messages)
   if (eventData?.type === "reaction" || eventData?.isReaction === true) {
     return { ok: false, reason: "reaction_event" };
   }
 
-  // -1. Age gate — skip messages older than 2 hours (BB replays stale msgs on reconnect)
+  // -1. Age gate — skip messages older than 2 hours (a since_rowid resume replays backlog)
   const msgDateCreated = eventData?.dateCreated ?? eventData?.date_created ?? 0;
   const msgAgeMs = msgDateCreated ? (Date.now() - normalizeTs(msgDateCreated)) : 0;
   if (msgDateCreated && msgAgeMs > MAX_MESSAGE_AGE_MS) {
@@ -2945,32 +2530,11 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
 
   // 4. isAllowed check + unknown contact flow
   if (!isAllowed(contact)) {
-    // Apple Contacts enrichment (best-effort, 3s timeout)
-    let appleContactName = null;
-    let appleEnrichment  = null;
-    let alertSource      = "unknown";
-    try {
-      const cqResult = await Promise.race([
-        mcporterCallAsync("bb_contact_query", { addresses: [`+${normalized}`] }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
-      ]);
-      const cqData = cqResult?.data?.[0] || cqResult?.data || null;
-      if (cqData) {
-        appleContactName = cqData.displayName ||
-          [`${cqData.firstName || ""}`, `${cqData.lastName || ""}`].filter(Boolean).join(" ").trim() ||
-          null;
-        if (appleContactName) {
-          alertSource    = "apple_contacts";
-          appleEnrichment = {
-            emails:   (cqData.emails || []).map(e => e.address).filter(Boolean),
-            birthday: cqData.birthday || null,
-          };
-          log(`runPreflight: Apple Contacts match for +${normalized}: "${appleContactName}"`);
-        }
-      }
-    } catch (err) {
-      log(`runPreflight: Apple Contacts lookup failed for +${normalized}: ${(err.message || "").slice(0, 60)}`);
-    }
+    // Apple Contacts name: imsg resolves the sender against Contacts (sender_name). A
+    // sender_name that is only the number again means "not in Contacts".
+    const senderName = typeof eventData?.senderName === "string" ? eventData.senderName.trim() : "";
+    const appleContactName = senderName && normalizePhone(senderName) !== normalized ? senderName : null;
+    const alertSource = appleContactName ? "apple_contacts" : "unknown";
     const { numToAlias } = loadContactsMap();
     const displayName = appleContactName || numToAlias[normalized] || `+${normalized}`;
 
@@ -2989,25 +2553,21 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
       return { ok: false, reason: "transactional_sender", resolvedName: displayName };
     }
 
-    // F1 — coalesce: one live alert card per contact. A new message from a contact that
-    // already has a pending alert replaces the old card (delete+repost) with the recent
-    // quotes stacked, instead of a second card. alertedAt is preserved so the 4h
-    // auto-deny clock is not reset by a chatty sender.
+    // F1 — coalesce: one live approval request per contact. A live request cannot be
+    // edited, so a further message only joins its quotes; the next request (after this
+    // one expires) carries them.
     const existing = pendingUnknownAlerts.get(normalized);
-    if (existing?.messageId) await discordDelete(GHOST_CHANNEL, existing.messageId).catch(() => {});
-    const recentQuotes = [
-      ...(existing?.recentQuotes || (existing?.messageText ? [existing.messageText] : [])),
-      messageText,
-    ].filter(Boolean).slice(-3);
+    if (existing) {
+      existing.recentQuotes = [...(existing.recentQuotes || []), messageText].filter(Boolean).slice(-3);
+      return { ok: false, reason: "unknown_contact", resolvedName: displayName, source: alertSource, coalesced: true };
+    }
 
-    // Fire-and-forget — alert Klein without blocking the webhook response
+    // Fire-and-forget — the approval request blocks for up to 10 minutes
     postUnknownAlert(normalized, messageText, displayName, {
       source:     alertSource,
-      enrichment: appleEnrichment,
-      alertCount: existing?.alertCount || 1,
-      recentQuotes,
-      alertedAt:  existing?.alertedAt,
-    }).catch(() => {});
+      alertCount: (unknownAlertCounts.get(normalized) || 0) + 1,
+      recentQuotes: [messageText],
+    }).catch(err => log(`postUnknownAlert error for +${normalized}: ${err.message}`));
     return { ok: false, reason: "unknown_contact", resolvedName: displayName, source: alertSource };
   }
 
@@ -3023,7 +2583,7 @@ async function runPreflight(contact, messageText, chatGuid, eventData) {
   }
 
   // 7. fetchRecentMessages — build context upfront, attach to pending entry
-  const messages = chatGuid ? await fetchRecentMessages(chatGuid, 10) : [];
+  const messages = await fetchRecentMessages(eventData?.chatId, 10);
   const { numToName, numToAlias, numToCategory } = loadContactsMap();
   const contactName = numToAlias[normalized] || numToName[normalized] || `+${normalized}`;
   const category    = numToCategory[normalized] || "friend";
@@ -3056,7 +2616,7 @@ const pendingMessages = new Map();
 async function checkAndDraft(key) {
   const entry = pendingMessages.get(key);
   if (!entry) return;
-  let { contact, contactName, messageText, sanitizedText, chatGuid, arrivedAt, autoSendMs } = entry;
+  const { contact, contactName, messageText, sanitizedText, chatGuid, chatId, arrivedAt, autoSendMs } = entry;
   // Use sanitized text for model (strips links, media, secrets) — show original in Discord
   const modelText = sanitizedText || messageText;
   pendingMessages.delete(key);
@@ -3069,32 +2629,25 @@ async function checkAndDraft(key) {
     return;
   }
 
-  // BUG-2 guard: if chatGuid looks like a raw phone number (no semicolons),
-  // resolve the real iMessage guid before proceeding.
-  if (chatGuid && !chatGuid.includes(";")) {
-    log(`chatGuid "${chatGuid}" looks like a raw phone — resolving...`);
-    const resolved = await resolveChatGuid(chatGuid);
-    if (resolved) {
-      chatGuid = resolved;
-    } else {
-      log(`Could not resolve chatGuid for ${contactName} — draft aborted`);
-      await discordPost(GHOST_CHANNEL, {
-        content: `⚠️ **${contactName}**: could not resolve iMessage chatGuid — message not sent. Reply manually.`,
-      });
-      return;
-    }
+  // Every read and the send-time collision check need the imsg chat id. Without it the
+  // send would be blocked anyway (kleinRepliedSince fails closed), so do not draft.
+  if (!Number.isInteger(chatId)) {
+    log(`checkAndDraft: no imsg chat id for ${contactName} — draft aborted`);
+    await discordPost(GHOST_CHANNEL, {
+      content: `⚠️ **${contactName}**: the iMessage thread could not be identified — no draft. Reply manually.`,
+    });
+    return;
   }
 
   // Collision check — did Klein reply during the window?
-  // normalizeTs: BB timestamps may be in seconds or ms; compare consistently in ms.
-  const recent = await fetchRecentMessages(chatGuid, 10);
-  if (recent.some(m => (m.isFromMe === true || m.from === "me") && normalizeTs(m.dateCreated || 0) > arrivedAt)) {
+  const recent = await fetchRecentMessages(chatId, 10);
+  if (recent.some(m => isFromKlein(m) && normalizeTs(m.dateCreated || 0) > arrivedAt)) {
     log(`Klein already replied to ${contactName} — skipping draft`);
     return;
   }
 
-  // Phase 3: live BB context — last 20 messages fetched at draft time
-  const contextMessages = await fetchRecentMessages(chatGuid, 20);
+  // Phase 3: live context — last 20 messages fetched at draft time
+  const contextMessages = await fetchRecentMessages(chatId, 20);
 
   // Index fetched messages into embedding DB (non-blocking)
   for (const m of contextMessages) {
@@ -3127,13 +2680,14 @@ async function checkAndDraft(key) {
     return;
   }
 
-  await postDraftToDiscord(draftResult, {
-    chatGuid, contact, contactName, messageText, arrivedAt, contextMessages, autoSendMs,
+  const draft = await postDraftToDiscord(draftResult, {
+    chatGuid, chatId, contact, contactName, messageText, arrivedAt, contextMessages, autoSendMs,
   });
+  if (draft) await awaitDraftApproval(draft);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SEND HELPERS  (used by reaction check)
+//  SEND HELPERS  (used after an owner approval)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** "iMessage;-;+15551234567" (any service prefix) → "+15551234567"; null for anything else. */
@@ -3142,99 +2696,64 @@ function dmPhoneFromChatGuid(chatGuid) {
   return m ? m[1] : null;
 }
 
-async function bbSendMessage(chatGuid, message) {
-  // ── 90-03 additive layers: fail-closed toggle + positive style allowlist ──
-  // Both checks sit at the top of the single outbound chokepoint (G10) so the
-  // mcporter path AND the direct-BB fallback are equally covered. They are
-  // ADDITIVE: every pre-existing gate below runs unchanged when they pass.
-  // Layer 1 — master send toggle: absent/off/unparseable state ⇒ no send.
-  // Layer 2 — positive style allowlist: casual-text shape only; the structural
-  // close for what the hasInternalDriftMarkers denylist cannot enumerate.
+async function sendIMessage(target, message) {
+  // ── G10: the single outbound chokepoint ──
+  // Layer order is the phase 90 contract: send toggle → style allowlist → empty →
+  // drift markers → recipient allowlist. Only then does the native channel send.
   const toggle = ghostSendToggleState();
   if (!toggle.enabled) {
-    log(`bbSendMessage BLOCKED fail-closed: send toggle ${toggle.reason || "off"} for ${chatGuid || "unknown-chat"}`);
+    log(`sendIMessage BLOCKED fail-closed: send toggle ${toggle.reason || "off"} for ${target || "unknown-target"}`);
     return false;
   }
   const styleViolation = styleAllowlistViolation(message);
   if (styleViolation) {
-    log(`bbSendMessage BLOCKED style-allowlist (${styleViolation}) for ${chatGuid || "unknown-chat"}`);
+    log(`sendIMessage BLOCKED style-allowlist (${styleViolation}) for ${target || "unknown-target"}`);
     return false;
   }
 
   const normalizedMessage = (message || "").toString().trim();
   if (!normalizedMessage) {
-    log("bbSendMessage blocked: empty outbound message");
+    log("sendIMessage blocked: empty outbound message");
     return false;
   }
 
   if (hasInternalDriftMarkers(normalizedMessage)) {
-    log(`bbSendMessage BLOCKED internal/pipeline marker for ${chatGuid || "unknown-chat"}`);
+    log(`sendIMessage BLOCKED internal/pipeline marker for ${target || "unknown-target"}`);
     return false;
   }
 
-  // Verify DM recipient is in the Ghost contact allowlist (belt+suspenders against routing bugs).
-  // Fail closed: a guid that is not a 1:1 phone DM (email handle, group, raw/unknown format)
-  // cannot be checked against the phone-only allowlist, so it is never sent to.
-  const dmPhone = dmPhoneFromChatGuid(chatGuid);
-  if (!dmPhone) {
-    log(`bbSendMessage BLOCKED: ${chatGuid || "unknown-chat"} is not a 1:1 phone chat`);
+  // Recipient allowlist, mandatory. Only an E.164 handle that is on the ghost allowlist,
+  // or the owner, can receive. A chat id, guid, email handle or group cannot be checked
+  // against the phone-only allowlist, so it is never sent to.
+  if (typeof target !== "string" || !imsg.E164.test(target)) {
+    log(`sendIMessage BLOCKED: target ${String(target).slice(0, 40)} is not an E.164 handle`);
     return false;
   }
-  if (!isAllowed(dmPhone) && normalizePhone(dmPhone) !== OWNER_PHONE_NORMALIZED) {
-    log(`bbSendMessage BLOCKED: recipient ${chatGuid} not in contact allowlist`);
+  if (!isAllowed(target) && normalizePhone(target) !== OWNER_PHONE_NORMALIZED) {
+    log(`sendIMessage BLOCKED: recipient ${target} not in contact allowlist`);
     return false;
   }
 
-  // iMessageLite guids return 405 on send — swap to SMS equivalent immediately
-  if (chatGuid && chatGuid.startsWith("iMessageLite;-;")) {
-    const smsGuid = chatGuid.replace("iMessageLite;-;", "SMS;-;");
-    log(`bbSendMessage: iMessageLite → swapping to ${smsGuid}`);
-    chatGuid = smsGuid;
-  }
-
-  // Primary: mcporter → BB MCP (SSH tunnel)
-  try {
-    const argsJson = JSON.stringify({ chat_guid: chatGuid, message });
-    const stdout   = await spawnAsync("mcporter", [
-      "call", "bluebubbles.bb_send_message", "--args", argsJson,
-    ], { timeout: 20000 });
-    const resp = tryParseJson(stdout);
-    if (resp?.status === 200) return true;
-    log(`bbSendMessage MCP returned non-200: ${JSON.stringify(resp?.error || resp?.status)}`);
-  } catch (err) {
-    log(`bbSendMessage MCP failed (${err.message.slice(0, 80)}); trying direct BB...`);
-  }
-
-  // Fallback: direct BB HTTP API
-  try {
-    const result = await bbPost(`chat/${encodeURIComponent(chatGuid)}/message`, { message, method: "apple-script" });
-    if (result?.status === 200) { log(`bbSendMessage direct BB ok`); return true; }
-    log(`bbSendMessage direct BB returned: ${result?.status}`);
-    return false;
-  } catch (err) {
-    log(`bbSendMessage direct BB error: ${err.message.slice(0, 80)}`);
-    return false;
-  }
+  const r = await transport.sendIMessage(target, message);
+  if (r && r.ok) return true;
+  log(`sendIMessage native send failed for ${target}: ${(r && r.error) || "unknown error"}`);
+  return false;
 }
 
-async function kleinRepliedSince(chatGuid, sinceIso) {
-  // Collision guard before auto-send: check BB for any message from owner since draft was posted
+async function kleinRepliedSince(chatId, sinceIso) {
+  // Collision guard before a send. Fail closed: a thread that cannot be read counts as
+  // "Klein replied", so nothing is sent on top of a reply ghost could not see.
+  if (!Number.isInteger(chatId)) {
+    log("kleinRepliedSince: no chat id — blocking send");
+    return true;
+  }
   try {
-    const sinceMs  = new Date(sinceIso).getTime() - 30000; // 30s buffer (was 10s)
-    const argsJson = JSON.stringify({ chat_guid: chatGuid, limit: 30, sort: "DESC" });
-    const stdout   = await spawnAsync("mcporter", [
-      "call", "bluebubbles.bb_get_chat_messages", "--args", argsJson,
-    ], { timeout: 15000 });
-    const data     = tryParseJson(stdout);
-    // mcporter (MCP path) returns { messages: [...] } — use extractBBList to handle all formats
-    // BB direct HTTP returns { data: [...] } — extractBBList handles that too
-    const messages = extractBBList(data);
-    // BB direct HTTP uses isFromMe:true; mcporter/MCP uses from:"me"
-    // normalizeTs: BB timestamps may be in seconds or ms; compare consistently in ms.
-    return messages.some(m => (m.isFromMe === true || m.from === "me") && normalizeTs(m.dateCreated || 0) > sinceMs);
+    const sinceMs  = new Date(sinceIso).getTime() - 30000; // 30s buffer
+    const messages = await imsgHistory(chatId, 30, 15000);
+    return messages.some(m => m.isFromMe && m.dateCreated > sinceMs);
   } catch (err) {
-    log(`kleinRepliedSince check failed (blocking send): ${err.message.slice(0, 80)}`);
-    return true; // Can't verify → don't send
+    log(`kleinRepliedSince check failed (blocking send): ${(err.message || "").slice(0, 80)}`);
+    return true;
   }
 }
 
@@ -3244,7 +2763,7 @@ async function executeSend(draft, reason) {
 }
 
 async function _executeSend(draft, reason) {
-  const { contactName, chatGuid, draftText, arrivedAt, postedAt, contact } = draft;
+  const { contactName, chatGuid, chatId, draftText, arrivedAt, postedAt, contact } = draft;
 
   if (!draftText) {
     log(`[${reason}] Empty draft for ${contactName} — skipping`);
@@ -3277,16 +2796,19 @@ async function _executeSend(draft, reason) {
     return true;
   }
 
-  // Quiet hours guard — applies to auto-send too, not just incoming messages
-  if (reason === "auto-send" && isQuietHours(contact || chatGuid)) {
-    log(`[${reason}] Quiet hours — holding draft for ${contactName} until morning`);
-    // Keep in pending; it will fire when quiet hours lift
-    return false;
+  // Recipient check before the rate gate: the target is the draft's own contact as an
+  // E.164 handle, and it must be allowlisted (or the owner). sendIMessage repeats this.
+  const target = `+${normalizePhone(contact || "")}`;
+  if (!imsg.E164.test(target) || (!isAllowed(target) && normalizePhone(target) !== OWNER_PHONE_NORMALIZED)) {
+    log(`[${reason}] BLOCKED recipient ${target} for ${contactName}: not an allowlisted E.164 handle`);
+    await discordPost(GHOST_CHANNEL, { content: `🚫 Blocked send to **${contactName}**: recipient is not an allowlisted phone number.` });
+    logFeedback(draft, "blocked-recipient");
+    return true;
   }
 
   // ── In-memory collision check (fix #6: prevents "cancelled but sent anyway" race) ──────
-  // Check before hitting mcporter — faster and catches the race where outgoing webhook
-  // fires concurrently with a running reaction check.
+  // Cheaper than the history read below, and catches an is_from_me row that arrived
+  // while the approval card was open.
   const chatKey  = chatGuid || "";
   const normKey  = normalizePhone(contact || "");
   const inMemTs  = kleinRepliedRecentlyChats.get(chatKey) || kleinRepliedRecentlyChats.get(normKey);
@@ -3299,7 +2821,7 @@ async function _executeSend(draft, reason) {
   // Late collision check — use arrivedAt (when contact's message arrived) so we catch
   // cases where Klein replied manually BEFORE ghost even generated the draft.
   const collisionAnchor = arrivedAt || postedAt;
-  if (collisionAnchor && await kleinRepliedSince(chatGuid, collisionAnchor)) {
+  if (collisionAnchor && await kleinRepliedSince(chatId, collisionAnchor)) {
     log(`[${reason}] Klein already replied to ${contactName} — skipping`);
     await discordPost(GHOST_CHANNEL, { content: `ℹ️ Skipped **${contactName}** — Klein already replied.` });
     return true;
@@ -3333,7 +2855,7 @@ async function _executeSend(draft, reason) {
   }
 
   log(`[${reason}] Sending to ${contactName}: "${draftText.slice(0, 60)}..."`);
-  const ok = await bbSendMessage(chatGuid, draftText);
+  const ok = await sendIMessage(target, draftText);
 
   if (ok) {
     await discordPost(GHOST_CHANNEL, { content: `✅ Sent to **${contactName}**: "${draftText}"` });
@@ -3343,160 +2865,14 @@ async function _executeSend(draft, reason) {
     // Update conversation state machine
     onGhostSend(contact);
     return true;
-  } else {
-    const retries = (draft.retries || 0) + 1;
-    if (retries >= 3) {
-      await discordPost(GHOST_CHANNEL, { content: `❌ Gave up after 3 failures for **${contactName}** — BB/MCP unavailable.` });
-      return true;
-    }
-    draft.retries = retries;
-    log(`Send failed for ${contactName} (attempt ${retries}/3)`);
-    return false; // keep in pending
   }
+  // One approval, one attempt: a failed send is reported, never retried.
+  log(`Send failed for ${contactName} — not retried`);
+  logFeedback(draft, "send-failed");
+  await discordPost(GHOST_CHANNEL, { content: `❌ Send to **${contactName}** failed — not retried. Reply manually.` });
+  return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  REACTION CHECK  (embedded — replaces ghost-reaction-check.sh cron)
-// ═══════════════════════════════════════════════════════════════════════════
-
-async function doReactionCheck() {
-  // File lock — skip if another check is still running
-  let lockFd;
-  try { lockFd = fs.openSync(LOCK_FILE, "wx"); } catch { return; }
-
-  try {
-    if (isPaused()) { log("Ghost paused — skipping reaction check"); return; }
-
-    const drafts        = loadPendingDrafts();
-    if (!drafts.length) return;
-
-    const buttonActions = loadJson(BUTTON_ACTIONS_FILE, []);
-    const actionMap     = {};   // draftId → "send" | "cancel"
-    const consumed      = new Set();
-    const approveQ      = [], denyQ = [];
-
-    for (let i = 0; i < buttonActions.length; i++) {
-      const ba  = buttonActions[i];
-      const cid = (ba.custom_id || "").toString();
-      const did = ba.draftId || "";
-      const act = (ba.action || "").toLowerCase();
-
-      if (cid.startsWith("approve_")) { approveQ.push(cid.replace("approve_", "")); consumed.add(i); continue; }
-      if (cid.startsWith("deny_"))    { denyQ.push(cid.replace("deny_", ""));       consumed.add(i); continue; }
-      if (cid.startsWith("GHOST_SEND:"))   { const id = cid.split(":")[1]; if (id) { actionMap[id] = "send";   consumed.add(i); } continue; }
-      if (cid.startsWith("GHOST_CANCEL:")) { const id = cid.split(":")[1]; if (id) { actionMap[id] = "cancel"; consumed.add(i); } continue; }
-      if (did && act) { actionMap[did] = act; consumed.add(i); }
-    }
-
-    // Contact management — enrich from Apple Contacts on approve
-    // Clear any pending unknown-alert refresh entries for acted-on phones
-    for (const phone of [...approveQ, ...denyQ]) pendingUnknownAlerts.delete(phone);
-
-    for (const phone of approveQ) {
-      let name = "Unknown";
-      let source = "discord_approve";  // BUG-4 FIX: writes "Approved via Discord" note to CONTACTS.md
-      let enrichOpts = {};
-      try {
-        const r = spawnSync("mcporter", [
-          "call", "bluebubbles.bb_contact_query",
-          "--args", JSON.stringify({ addresses: [`+${normalizePhone(phone)}`] }),
-        ], { encoding: "utf8", timeout: 4000, env: { ...process.env, HOME } });
-        const cqData = (() => { try { return JSON.parse(r.stdout)?.data?.[0]; } catch { return null; } })();
-        if (cqData) {
-          const resolved = cqData.displayName ||
-            [`${cqData.firstName || ""}`, `${cqData.lastName || ""}`].filter(Boolean).join(" ").trim();
-          if (resolved) {
-            name   = resolved;
-            // Keep source as "discord_approve" — always write "Approved via Discord" to CONTACTS.md.
-            // Still pull name/emails/birthday from Apple Contacts for richer entries.
-            enrichOpts = {
-              emails:   (cqData.emails || []).map(e => e.address).filter(Boolean),
-              birthday: cqData.birthday || null,
-            };
-            log(`Approve enriched: +${normalizePhone(phone)} → "${name}" from Apple Contacts`);
-          }
-        }
-      } catch {}
-      try { addToAllowlist(phone, name, { source, ...enrichOpts }); }
-      catch (err) { log(`Approve skipped for "${phone}": ${err.message}`); }
-    }
-    for (const phone of denyQ) {
-      try { addToDenylist(phone); }
-      catch (err) { log(`Deny skipped for "${phone}": ${err.message}`); }
-    }
-
-    const now  = Date.now();
-    const keep = [];
-
-    const sortedDrafts = [...drafts].sort((a, b) => new Date(b.arrivedAt || 0) - new Date(a.arrivedAt || 0));
-    for (const draft of sortedDrafts) {
-      const { draftId, contactName, postedAt } = draft;
-      const age     = now - new Date(postedAt || now).getTime();
-      const expired = age > 24 * 60 * 60 * 1000;
-
-      if (expired) { log(`Expired draft for ${contactName} — removing`); continue; }
-
-      const action = actionMap[draftId];
-
-      // ── In-memory cancel guard (race fix #1) ──────────────────────────────
-      // Prune expired TTLs first
-      for (const [id, exp] of cancelledDraftTtl.entries()) {
-        if (Date.now() > exp) { cancelledDraftIds.delete(id); cancelledDraftTtl.delete(id); }
-      }
-      if (cancelledDraftIds.has(draftId)) {
-        log(`doReactionCheck: draft ${draftId} was in-memory cancelled (HTTP /action) — skipping auto-send`);
-        logFeedback(draft, "cancelled");
-        cancelledDraftIds.delete(draftId);
-        cancelledDraftTtl.delete(draftId);
-        continue;
-      }
-
-      if (action === "cancel") {
-        log(`❌ Cancel: ${contactName} (${draftId})`);
-        await discordPost(GHOST_CHANNEL, { embeds: [buildCancelEmbed(contactName)] });
-        logFeedback(draft, "cancelled");
-        continue;
-      }
-
-      if (action === "send") {
-        log(`✅ Send button: ${contactName}`);
-        const ok = await executeSend(draft, "button:send");
-        if (!ok) keep.push(draft);
-        continue;
-      }
-
-      // No button action yet — AUTOSEND-FAILCLOSED (90-03, binding, 90-RESEARCH
-      // :377-386): the window clock may NEVER be the thing that sends. An
-      // unanswered draft EXPIRES UNSENT when its window elapses — even with the
-      // master send toggle enabled. Only an explicit operator tap (Send button /
-      // G4-auth'd /action) reaches executeSend.
-      const expiryMs = draft.autoSendMs || AUTO_SEND_WINDOW_MS;
-      if (expiryMs > 0 && age >= expiryMs) {
-        log(`Draft expired unsent for ${contactName} (${draftId}, age ${Math.round(age / 60000)}min) reason=expired`);
-        logFeedback(draft, "expired");
-        await discordPost(GHOST_CHANNEL, { embeds: [buildExpiryEmbed(contactName, Math.round(expiryMs / 60000))] });
-        continue;
-      }
-
-      keep.push(draft);
-    }
-
-    // The loop above awaits network calls, so the drafts file may have changed underneath us:
-    // new drafts posted (must not be dropped) or drafts removed by /action send|cancel or an
-    // outgoing-message webhook (must not be resurrected, or they could auto-send again).
-    const snapshotIds = new Set(drafts.map(d => d.draftId));
-    const current     = loadPendingDrafts();
-    const currentIds  = new Set(current.map(d => d.draftId));
-    savePendingDrafts([
-      ...keep.filter(d => currentIds.has(d.draftId)),
-      ...current.filter(d => !snapshotIds.has(d.draftId)),
-    ]);
-    saveJson(BUTTON_ACTIONS_FILE, buttonActions.filter((_, i) => !consumed.has(i)));
-
-  } finally {
-    try { fs.closeSync(lockFd); fs.unlinkSync(LOCK_FILE); } catch {}
-  }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  HTTP SERVER
@@ -3519,401 +2895,205 @@ function requestHasValidToken(req, token = GHOST_API_TOKEN) {
   });
 }
 
-/**
- * Who may call which endpoint. The server listens on all interfaces (BlueBubbles posts from
- * another host), so anything on the LAN can reach it.
- *   "control" (/action, /approve-contact, /deny-contact, /pending): loopback (the local
- *             OpenClaw hook), or a valid GHOST_API_TOKEN.
- *   "webhook" (/bluebubbles/message-sent): a valid token when GHOST_API_TOKEN is set;
- *             open otherwise, for backwards compatibility.
- */
 function isAuthorizedRequest(req, scope, token = GHOST_API_TOKEN) {
   if (scope === "control") return isLoopbackAddress(req.socket?.remoteAddress) || requestHasValidToken(req, token);
-  if (scope === "webhook") return !token || requestHasValidToken(req, token);
   return true;
 }
 
+/**
+ * Local status server. Inbound arrives over imsg rpc and decisions over native approvals,
+ * so nothing here changes state: /health is public, /pending is loopback or token.
+ */
 function createServer() {
   return http.createServer(async (req, res) => {
-    let bodyTooLarge = false;
     const send = (status, body) => {
-      if (res.headersSent) return;
-      if (bodyTooLarge) status = 413;
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(body));
     };
-    // Bounded body reader: past MAX_BODY_BYTES the rest is drained and discarded (not buffered).
-    const readBody = () => new Promise((resolve, reject) => {
-      let b = "", size = 0;
-      req.on("data", c => {
-        size += c.length;
-        if (size > MAX_BODY_BYTES) bodyTooLarge = true;
-        else b += c;
-      });
-      req.on("end", () => bodyTooLarge ? reject(new Error("payload too large")) : resolve(b));
-      req.on("error", reject);
-    });
-
-    // Route on the path only so the BB webhook URL can carry ?token=…
     let pathname = "/";
     try { pathname = new URL(req.url || "/", "http://localhost").pathname; } catch {}
-    const CONTROL_ROUTES = ["/pending", "/approve-contact", "/deny-contact", "/action"];
-    const scope = CONTROL_ROUTES.includes(pathname) ? "control"
-      : pathname === "/bluebubbles/message-sent" ? "webhook" : "public";
+    const scope = pathname === "/pending" ? "control" : "public";
     if (!isAuthorizedRequest(req, scope)) {
       log(`Rejected unauthorized ${req.method} ${pathname} from ${req.socket?.remoteAddress || "?"}`);
       return send(401, { ok: false, error: "unauthorized" });
     }
 
-    // GET /health
     if (req.method === "GET" && pathname === "/health") {
-      return send(200, { ok: true, service: "ghost-v3", paused: isPaused(), sendEnabled: ghostSendToggleState().enabled, pending: pendingMessages.size });
+      return send(200, {
+        ok: true, service: "ghost-v3", transport: "imessage-native",
+        imsg: imsgWatch ? (imsgWatch.getClient() ? "connected" : "reconnecting") : "off",
+        paused: isPaused(), sendEnabled: ghostSendToggleState().enabled,
+        pending: pendingMessages.size, awaitingApproval: loadPendingDrafts().length,
+      });
     }
 
-    // GET /pending
     if (req.method === "GET" && pathname === "/pending") {
       const list = [...pendingMessages.entries()].map(([k, v]) => ({
         key: k, contactName: v.contactName,
         arrivedAt: new Date(v.arrivedAt).toISOString(),
         firesAt:   new Date(v.arrivedAt + DRAFT_DELAY_MS).toISOString(),
       }));
-      return send(200, { ok: true, pending: list });
-    }
-
-    // POST /approve-contact
-    if (req.method === "POST" && pathname === "/approve-contact") {
-      try {
-        const { phone, name } = JSON.parse(await readBody());
-        if (!phone) throw new Error("phone required");
-        // Enrich from Apple Contacts (best-effort, 4s timeout)
-        let resolvedName = name && name !== "Unknown" ? name : null;
-        let enrichOpts   = {};
-        try {
-          const r = spawnSync("mcporter", [
-            "call", "bluebubbles.bb_contact_query",
-            "--args", JSON.stringify({ addresses: [`+${normalizePhone(phone)}`] }),
-          ], { encoding: "utf8", timeout: 4000, env: { ...process.env, HOME } });
-          const cqData = (() => { try { return JSON.parse(r.stdout)?.data?.[0]; } catch { return null; } })();
-          if (cqData) {
-            const fullName = cqData.displayName ||
-              [`${cqData.firstName || ""}`, `${cqData.lastName || ""}`].filter(Boolean).join(" ").trim();
-            if (fullName) {
-              resolvedName = fullName;
-              enrichOpts = {
-                emails:   (cqData.emails || []).map(e => e.address).filter(Boolean),
-                birthday: cqData.birthday || null,
-              };
-              log(`/approve-contact: enriched +${normalizePhone(phone)} → "${fullName}"`);
-            }
-          }
-        } catch {}
-        addToAllowlist(phone, resolvedName || "Unknown", { source: "discord_approve", ...enrichOpts });
-        // Remove from pending unknown alerts map
-        pendingUnknownAlerts.delete(normalizePhone(phone));
-        await discordPost(GHOST_CHANNEL, { content: `✅ Approved **${resolvedName || phone}** — added to allowlist.` });
-        return send(200, { ok: true, action: "approved", phone, name: resolvedName || "Unknown" });
-      } catch (e) { return send(400, { ok: false, error: e.message }); }
-    }
-
-    // POST /deny-contact
-    if (req.method === "POST" && pathname === "/deny-contact") {
-      try {
-        const { phone } = JSON.parse(await readBody());
-        if (!phone) throw new Error("phone required");
-        addToDenylist(phone);
-        // Remove from pending unknown alerts map — stops refresh loop
-        pendingUnknownAlerts.delete(normalizePhone(phone));
-        await discordPost(GHOST_CHANNEL, { content: `🚫 Denied \`+${normalizePhone(phone)}\` — added to denylist.` });
-        return send(200, { ok: true, action: "denied", phone });
-      } catch (e) { return send(400, { ok: false, error: e.message }); }
-    }
-
-    // POST /action — triggered by pre-message hook for button clicks (both OC and legacy)
-    if (req.method === "POST" && pathname === "/action") {
-      try {
-        const { draftId, action, userId } = JSON.parse(await readBody());
-        if (!draftId || !action) return send(400, { ok: false, error: "draftId and action required" });
-        // Require userId to match when KLEIN_DISCORD_USER_ID is configured — absent userId also fails
-        if (KLEIN_DISCORD_USER_ID && userId !== KLEIN_DISCORD_USER_ID) {
-          return send(403, { ok: false, error: "unauthorized" });
-        }
-        const drafts   = loadPendingDrafts();
-        const draftIdx = drafts.findIndex(d => d.draftId === draftId);
-        if (draftIdx === -1) return send(404, { ok: false, error: "draft not found" });
-        const draft = drafts[draftIdx];
-        if (action === "cancel") {
-          // Register in-memory cancellation FIRST — prevents doReactionCheck auto-send race
-          cancelledDraftIds.add(draftId);
-          cancelledDraftTtl.set(draftId, Date.now() + 10 * 60 * 1000); // 10-min TTL
-          logFeedback(draft, "cancelled");
-          drafts.splice(draftIdx, 1);
-          savePendingDrafts(drafts);
-          await discordPost(GHOST_CHANNEL, { embeds: [buildCancelEmbed(draft.contactName)] });
-          return send(200, { ok: true, action: "cancelled" });
-        }
-        if (action === "send") {
-          const ok = await executeSend(draft, "button:send");
-          if (ok) {
-            const updated = loadPendingDrafts().filter(d => d.draftId !== draftId);
-            savePendingDrafts(updated);
-          }
-          return send(200, { ok: true, action: ok ? "sent" : "send_failed" });
-        }
-        return send(400, { ok: false, error: `unknown action: ${action}` });
-      } catch (e) { return send(400, { ok: false, error: e.message }); }
-    }
-
-    // POST /bluebubbles/message-sent  ← main webhook
-    if (req.method === "POST" && pathname === "/bluebubbles/message-sent") {
-      try {
-        const body = await readBody();
-        log(`Webhook recv: ${body.slice(0, 200)}`);
-        const event     = parseIncomingEvent(body, req.headers["content-type"]);
-        const eventType = (event?.type || "").toLowerCase();
-        const eventData = (event?.data && typeof event.data === "object") ? event.data : {};
-
-        const isFromMe  = eventData?.isFromMe === true;
-        const chatGuid  = typeof eventData.chatGuid === "string" ? eventData.chatGuid : "";
-        const contact   = extractContactPhone(eventData);
-
-        if (!["new-message", "message-send", "message-receive"].includes(eventType)) {
-          return send(200, { ok: true, action: "ignored", type: eventType });
-        }
-
-        // Drop group chats
-        if (isGroupChatGuid(chatGuid, eventData)) {
-          log(`Group chat — skipping (chatGuid: ${chatGuid || "none"})`);
-          return send(200, { ok: true, action: "ignored", reason: "group_chat" });
-        }
-
-        const normalized = normalizePhone(contact);
-
-        if (isDuplicateInboundEvent(eventType, eventData)) {
-          log(`Duplicate webhook event dropped (${eventType}) for ${normalized || chatGuid || "unknown"}`);
-          return send(200, { ok: true, action: "ignored", reason: "duplicate_event" });
-        }
-
-        // Outgoing: Klein sent a message — cancel pending draft for this chat
-        if (isFromMe || normalized === OWNER_PHONE_NORMALIZED) {
-          const key = chatGuid || normalized;
-          let cancelled = false;
-
-          // Update in-memory reply tracker (prevents executeSend race condition — fix #6)
-          const replyTs = Date.now();
-          if (key)        kleinRepliedRecentlyChats.set(key, replyTs);
-          if (normalized) kleinRepliedRecentlyChats.set(normalized, replyTs);
-          // Prune entries older than 30 min
-          for (const [k, ts] of kleinRepliedRecentlyChats.entries()) {
-            if (replyTs - ts > 30 * 60 * 1000) kleinRepliedRecentlyChats.delete(k);
-          }
-
-          // 1. Cancel in-memory pending (pre-draft, within 30s window)
-          if (key && pendingMessages.has(key)) {
-            clearTimeout(pendingMessages.get(key).timeoutId);
-            pendingMessages.delete(key);
-            log(`Klein replied to ${key} — cancelled in-memory pending draft`);
-            cancelled = true;
-          }
-
-          // 2. Cancel any already-posted draft for this chat (in ghost-pending-drafts.json)
-          //    This fires when Klein replies AFTER the draft was already posted to Discord.
-          const postedDrafts = loadPendingDrafts();
-          const toCancel = postedDrafts.filter(d =>
-            d.chatGuid === key ||
-            d.chatGuid === chatGuid ||
-            normalizePhone(d.contact) === normalized
-          );
-          if (toCancel.length > 0) {
-            const remaining = postedDrafts.filter(d => !toCancel.includes(d));
-            savePendingDrafts(remaining);
-            for (const draft of toCancel) {
-              // Register in-memory cancellation — closes the race with doReactionCheck
-              cancelledDraftIds.add(draft.draftId);
-              log(`Klein outgoing — cancelled posted draft ${draft.draftId} for ${draft.contactName}`);
-              logFeedback(draft, "auto-cancelled-klein-replied");
-              discordPost(GHOST_CHANNEL, {
-                embeds: [buildCancelEmbed(draft.contactName, "Klein already replied")],
-              }).catch(() => {});
-            }
-            cancelled = true;
-          }
-
-          return send(200, { ok: true, action: cancelled ? "draft_cancelled" : "outgoing_noop" });
-        }
-
-        if (!contact || !normalized) return send(200, { ok: true, action: "drop", reason: "no_contact" });
-
-        const messageText = extractMessageText(eventData);
-
-        // Phase 0: Preflight — requiresReply, spam, denied, allowed, group, quiet hours, fetch context
-        const preflight = await runPreflight(contact, messageText, chatGuid, eventData);
-        if (!preflight.ok) {
-          log(`Preflight skip: ${preflight.reason} for ${normalized}`);
-          if (preflight.reason === "unknown_contact") {
-            return send(200, { ok: true, action: "unknown_contact_alert", resolvedName: preflight.resolvedName, source: preflight.source });
-          }
-          if (preflight.reason === "spam") {
-            // Auto-deny known spam callers that slipped through (short-codes, etc.)
-            if (!isAllowed(contact)) { addToDenylist(normalized); log(`Auto-denied spam: ${normalized}`); }
-            return send(200, { ok: true, action: "drop", reason: "auto_deny_spam" });
-          }
-          return send(200, { ok: true, action: preflight.reason });
-        }
-
-        if (isPaused()) { log(`Paused — skipping ${normalized}`); return send(200, { ok: true, action: "paused" }); }
-
-        const { contactName } = preflight.context;
-        const arrivedAt     = Date.now();
-        const key           = chatGuid || normalized;
-
-        // If a posted draft already exists for this contact/chat, don't queue another.
-        // This prevents duplicate draft cards when multiple messages arrive before action is taken.
-        const postedDrafts = loadPendingDrafts();
-        const activeDraft = postedDrafts.find(d =>
-          normalizePhone(d.contact) === normalized || d.chatGuid === key || d.chatGuid === chatGuid
-        );
-        if (activeDraft) {
-          log(`Existing posted draft ${activeDraft.draftId} for ${contactName} — skipping re-queue`);
-          return send(200, {
-            ok: true,
-            action: "draft_already_posted",
-            contactName,
-            chatGuid: key,
-            draftId: activeDraft.draftId,
-          });
-        }
-
-        // Replace existing pending for same chat (debounce rapid messages)
-        // ISSUE-8 fix: also remove old draft from ghost-pending-drafts.json so it doesn't auto-send stale context
-        if (pendingMessages.has(key)) {
-          clearTimeout(pendingMessages.get(key).timeoutId);
-          log(`Debounced pending for ${key}`);
-          // Remove the stale draft from persistent pending and notify Discord
-          const staleDrafts = loadPendingDrafts();
-          const staleEntry  = staleDrafts.find(d => d.contact === normalized || d.chatGuid === key);
-          if (staleEntry) {
-            savePendingDrafts(staleDrafts.filter(d => d.draftId !== staleEntry.draftId));
-            discordPost(GHOST_CHANNEL, {
-              content: `⚠️ Draft superseded for **${contactName}** — new message arrived, regenerating. Old draft discarded.`,
-            }).catch(() => {});
-            log(`Removed stale draft ${staleEntry.draftId} for ${contactName} (superseded)`);
-          }
-        }
-
-        // Update conversation state machine — contact sent us a message
-        onContactMessage(contact);
-        // Index incoming message into embedding DB (non-blocking)
-        indexMessage(contact, arrivedAt, "them", messageText);
-
-        const cooldownMs = getCooldownMs(contact);
-        const timeoutId = setTimeout(() => checkAndDraft(key), DRAFT_DELAY_MS);
-        pendingMessages.set(key, { contact, contactName, messageText, sanitizedText: preflight.context.sanitizedText, chatGuid: chatGuid || key, arrivedAt, timeoutId, contextMessages: preflight.context.messages, autoSendMs: cooldownMs });
-        log(`Draft queued for ${contactName} — fires in ${DRAFT_DELAY_MS / 60000}min (cooldown: ${Math.round(cooldownMs/1000)}s)`);
-
-        return send(200, {
-          ok: true, action: "draft_scheduled",
-          contactName, chatGuid: key,
-          draftFiresAt: new Date(arrivedAt + DRAFT_DELAY_MS).toISOString(),
-          autoSendAt:   new Date(arrivedAt + DRAFT_DELAY_MS + cooldownMs).toISOString(),
-        });
-
-      } catch (err) {
-        log(`Webhook error: ${err.message}`);
-        return send(400, { ok: false, error: err.message });
-      }
+      const drafts = loadPendingDrafts().map(d => ({ draftId: d.draftId, contactName: d.contactName, postedAt: d.postedAt }));
+      return send(200, { ok: true, pending: list, awaitingApproval: drafts });
     }
 
     send(404, { ok: false, error: "Not found" });
   });
 }
 
+/**
+ * One inbound iMessage (normalized by imsg.normalizeImsgMessage) through the gates.
+ * Returns the outcome object the old webhook route answered with.
+ */
+async function handleInboundMessage(msg) {
+  try {
+    const eventData = (msg && typeof msg === "object") ? msg : {};
+    const isFromMe  = eventData.isFromMe === true;
+    const chatGuid  = typeof eventData.chatGuid === "string" ? eventData.chatGuid : "";
+    const chatId    = Number.isInteger(eventData.chatId) ? eventData.chatId : null;
+    const contact   = extractContactPhone(eventData);
+
+    if (isGroupChatGuid(chatGuid, eventData)) {
+      log(`Group chat — skipping (chatGuid: ${chatGuid || "none"})`);
+      return { ok: true, action: "ignored", reason: "group_chat" };
+    }
+
+    const normalized = normalizePhone(contact);
+
+    if (isDuplicateInboundEvent("imsg", eventData)) {
+      log(`Duplicate inbound event dropped for ${normalized || chatGuid || "unknown"}`);
+      return { ok: true, action: "ignored", reason: "duplicate_event" };
+    }
+
+    // Outgoing: Klein sent a message — cancel pending work for this chat
+    if (isFromMe || normalized === OWNER_PHONE_NORMALIZED) {
+      const key = chatGuid || normalized;
+      let cancelled = false;
+
+      const replyTs = Date.now();
+      if (key)        kleinRepliedRecentlyChats.set(key, replyTs);
+      if (normalized) kleinRepliedRecentlyChats.set(normalized, replyTs);
+      for (const [k, ts] of kleinRepliedRecentlyChats.entries()) {
+        if (replyTs - ts > 30 * 60 * 1000) kleinRepliedRecentlyChats.delete(k);
+      }
+
+      // 1. Cancel in-memory pending (pre-draft, within the debounce window)
+      if (key && pendingMessages.has(key)) {
+        clearTimeout(pendingMessages.get(key).timeoutId);
+        pendingMessages.delete(key);
+        log(`Klein replied to ${key} — cancelled in-memory pending draft`);
+        cancelled = true;
+      }
+
+      // 2. Cancel any posted draft for this chat. Its approval card stays live until it
+      //    expires, but resolveDraftDecision finds no pending draft and sends nothing.
+      const postedDrafts = loadPendingDrafts();
+      const toCancel = postedDrafts.filter(d =>
+        d.chatGuid === key ||
+        (chatGuid && d.chatGuid === chatGuid) ||
+        (normalized && normalizePhone(d.contact) === normalized)
+      );
+      if (toCancel.length > 0) {
+        savePendingDrafts(postedDrafts.filter(d => !toCancel.includes(d)));
+        for (const draft of toCancel) {
+          cancelledDraftIds.add(draft.draftId);
+          cancelledDraftTtl.set(draft.draftId, Date.now() + 30 * 60 * 1000);
+          log(`Klein outgoing — cancelled posted draft ${draft.draftId} for ${draft.contactName}`);
+          logFeedback(draft, "auto-cancelled-klein-replied");
+          discordPost(GHOST_CHANNEL, {
+            embeds: [buildCancelEmbed(draft.contactName, "Klein already replied")],
+          }).catch(() => {});
+        }
+        cancelled = true;
+      }
+
+      return { ok: true, action: cancelled ? "draft_cancelled" : "outgoing_noop" };
+    }
+
+    if (!contact || !normalized) return { ok: true, action: "drop", reason: "no_contact" };
+
+    const messageText = extractMessageText(eventData);
+
+    const preflight = await runPreflight(contact, messageText, chatGuid, eventData);
+    if (!preflight.ok) {
+      log(`Preflight skip: ${preflight.reason} for ${normalized}`);
+      if (preflight.reason === "unknown_contact") {
+        return { ok: true, action: "unknown_contact_alert", resolvedName: preflight.resolvedName, source: preflight.source };
+      }
+      if (preflight.reason === "spam") {
+        if (!isAllowed(contact)) { addToDenylist(normalized); log(`Auto-denied spam: ${normalized}`); }
+        return { ok: true, action: "drop", reason: "auto_deny_spam" };
+      }
+      return { ok: true, action: preflight.reason };
+    }
+
+    if (isPaused()) { log(`Paused — skipping ${normalized}`); return { ok: true, action: "paused" }; }
+
+    const { contactName } = preflight.context;
+    const arrivedAt = Date.now();
+    const key       = chatGuid || normalized;
+
+    // One posted draft per contact at a time.
+    const postedDrafts = loadPendingDrafts();
+    const activeDraft = postedDrafts.find(d =>
+      normalizePhone(d.contact) === normalized || d.chatGuid === key || (chatGuid && d.chatGuid === chatGuid)
+    );
+    if (activeDraft) {
+      log(`Existing posted draft ${activeDraft.draftId} for ${contactName} — skipping re-queue`);
+      return { ok: true, action: "draft_already_posted", contactName, chatGuid: key, draftId: activeDraft.draftId };
+    }
+
+    // Debounce rapid messages: replace the queued entry for this chat
+    if (pendingMessages.has(key)) {
+      clearTimeout(pendingMessages.get(key).timeoutId);
+      log(`Debounced pending for ${key}`);
+    }
+
+    onContactMessage(contact);
+    indexMessage(contact, arrivedAt, "them", messageText);
+
+    const cooldownMs = getCooldownMs(contact);
+    const timeoutId  = setTimeout(() => {
+      checkAndDraft(key).catch(err => log(`checkAndDraft error: ${err.message}`));
+    }, DRAFT_DELAY_MS);
+    pendingMessages.set(key, {
+      contact, contactName, messageText, sanitizedText: preflight.context.sanitizedText,
+      chatGuid: chatGuid || key, chatId, arrivedAt, timeoutId,
+      contextMessages: preflight.context.messages, autoSendMs: cooldownMs,
+    });
+    log(`Draft queued for ${contactName} — fires in ${DRAFT_DELAY_MS / 1000}s (approval window: ${Math.round(cooldownMs / 1000)}s)`);
+
+    return {
+      ok: true, action: "draft_scheduled",
+      contactName, chatGuid: key,
+      draftFiresAt: new Date(arrivedAt + DRAFT_DELAY_MS).toISOString(),
+      approvalExpiresAt: new Date(arrivedAt + DRAFT_DELAY_MS + cooldownMs).toISOString(),
+    };
+  } catch (err) {
+    log(`Inbound error: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  LEARNING PIPELINE  (Phase 1)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// mcporter lives in the npm global prefix, which cron's minimal PATH omits —
-// bare-name resolution ENOENT'd every nightly learn run (90-01 regression).
-// Resolve to the absolute binary when present; fall back to PATH lookup.
-const MCPORTER_BIN = (() => {
-  const candidates = [
-    path.join(HOME, ".local", "share", "npm", "bin", "mcporter"),
-    path.join(HOME, ".local", "bin", "mcporter"),
-  ];
-  for (const c of candidates) {
-    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch {}
-  }
-  return "mcporter";
-})();
-
-async function mcporterCallSync(tool, argsObj) {
-  // Sync variant for learn CLI ONLY — do NOT use in the webhook/serve path (blocks event loop).
-  // stdout is captured via a temp-file fd, NOT a pipe: mcporter's async pipe writes are
-  // dropped at child exit for large payloads (~145KB truncation, reproduced 2026-08-06);
-  // file fds get synchronous writes, so the full result always lands.
-  const tmp = path.join(require("os").tmpdir(), `ghost-mcp-${process.pid}-${Date.now()}.json`);
-  const fd = fs.openSync(tmp, "w");
-  let result;
-  try {
-    result = spawnSync(MCPORTER_BIN, [
-      "call", `bluebubbles.${tool}`, "--args", JSON.stringify(argsObj),
-    ], { stdio: ["ignore", fd, "pipe"], encoding: "utf8", timeout: 60000, env: { ...process.env, HOME } });
-  } finally {
-    fs.closeSync(fd);
-  }
-  let stdout = "";
-  try { stdout = fs.readFileSync(tmp, "utf8"); } finally { try { fs.unlinkSync(tmp); } catch {} }
-  if (result.status !== 0) {
-    const reason = result.stderr?.slice(0, 200) || result.error?.message || `exit ${result.status}`;
-    throw new Error(`mcporter ${tool}: ${reason}`);
-  }
-  return JSON.parse(stdout);
-}
-
-async function mcporterCallAsync(tool, argsObj) {
-  // Non-blocking async variant — use this in the webhook/serve path.
-  const stdout = await spawnAsync("mcporter", [
-    "call", `bluebubbles.${tool}`, "--args", JSON.stringify(argsObj),
-  ], { timeout: 60000 });
-  return JSON.parse(stdout);
-}
-
-/** Normalize the array payload out of a BB MCP response regardless of key name. */
-function extractBBList(data) {
-  if (!data) return [];
-  // bb_list_chats returns { chats: [...] }
-  // bb_get_chat_messages returns { messages: [...] } or { data: [...] }
-  if (Array.isArray(data))             return data;
-  if (Array.isArray(data.chats))       return data.chats;
-  if (Array.isArray(data.messages))    return data.messages;
-  if (Array.isArray(data.data))        return data.data;
-  if (Array.isArray(data.contacts))    return data.contacts;
-  return [];
-}
-
 /**
- * Returns true if the chatGuid (or event data) indicate a group chat.
- * Direct messages use ";-;" separator across all protocols (iMessage, SMS, iMessageLite, RCS).
- * Group chats use ";+;" separator (e.g. "iMessage;+;chat123456789").
- *
- * BB sometimes fires group-chat webhooks with the individual sender's handle rather than
- * the group chatGuid — so we also check participants, chats array, and groupName field.
+ * True when the chat guid or the message marks a group chat. Direct chats use ";-;",
+ * groups ";+;". imsg sets is_group (normalized to isGroup), which is what the Gateway
+ * gates on. The participants-count rule is kept for legacy shapes only: imsg payloads
+ * carry their participant list as participantHandles, so it does not apply to them.
  */
 function isGroupChatGuid(chatGuid, eventData = {}) {
-  // Primary: chatGuid format (most reliable when present)
   if (chatGuid && chatGuid.includes(";+;")) return true;
-
-  // Secondary: participants list on the event itself (> 1 means group)
+  if (eventData.isGroup === true) return true;
   if (Array.isArray(eventData.participants) && eventData.participants.length > 1) return true;
-
-  // Tertiary: BB sometimes embeds a `chats` array — if any entry is a group chat, block it
   if (Array.isArray(eventData.chats)) {
     if (eventData.chats.some(c => (c.guid || c.chatGuid || "").includes(";+;"))) return true;
     if (eventData.chats.some(c => Array.isArray(c.participants) && c.participants.length > 1)) return true;
   }
-
-  // Quaternary: explicit group name field (BB sets this for named group chats)
   if (eventData.groupName || eventData.group_name) return true;
-
   return false;
 }
 
@@ -3929,28 +3109,25 @@ function findChatsForPhone(phone, allChats) {
         if (normalizePhone(addr) === n) { matched = true; break; }
       }
     }
-    if (!matched && normalizePhone(chat.chatIdentifier || "") === n) matched = true;
+    // imsg chats.list carries the handle as "identifier"; BlueBubbles used "chatIdentifier".
+    if (!matched && normalizePhone(chat.identifier || chat.chatIdentifier || "") === n) matched = true;
     if (!matched && typeof chat.guid === "string" && chat.guid.includes(`;-;+${n.slice(-10)}`)) matched = true;
     if (matched) hits.push(chat);
   }
 
-  // Score: iMessage;-; > SMS;-;/RCS;-; > iMessageLite;-; (405s on send) > group > other
+  // Score: iMessage;-; > any;-; (macOS 14+ guids) > SMS;-;/RCS;-; > iMessageLite;-; > group > other
   const score = (c) => {
     const g = c.guid || "";
     const is1on1 = (c.participants || []).length <= 1;
-    if (g.startsWith("iMessage;-;"))     return is1on1 ? 0 : 3;
-    if (g.startsWith("SMS;-;") || g.startsWith("RCS;-;")) return is1on1 ? 1 : 4;
-    if (g.startsWith("iMessageLite;-;")) return is1on1 ? 2 : 5; // last resort — BB returns 405 on send
-    if (g.includes(";+;"))               return 6;
-    return 7;
+    if (g.startsWith("iMessage;-;"))     return is1on1 ? 0 : 4;
+    if (g.startsWith("any;-;"))          return is1on1 ? 1 : 4;
+    if (g.startsWith("SMS;-;") || g.startsWith("RCS;-;")) return is1on1 ? 2 : 5;
+    if (g.startsWith("iMessageLite;-;")) return is1on1 ? 3 : 6;
+    if (g.includes(";+;"))               return 7;
+    return 8;
   };
   hits.sort((a, b) => score(a) - score(b));
   return hits;
-}
-
-// Legacy single-result wrapper
-function findChatGuidForPhone(phone, allChats) {
-  return findChatsForPhone(phone, allChats)[0]?.guid || null;
 }
 
 /**
@@ -4008,7 +3185,7 @@ function assertGeneratedWhole(result, { label, sections }) {
 }
 
 function isFromKlein(m) {
-  // BB direct HTTP uses isFromMe:true; mcporter uses from:"me"
+  // imsg (normalized) and BlueBubbles HTTP use isFromMe:true; the retired MCP used from:"me"
   if (!m || typeof m !== "object") return false;
   return m.isFromMe === true || m.from === "me";
 }
@@ -4031,42 +3208,18 @@ function analyzeKleinMessages(messages) {
 async function learnContact(contact, allChats) {
   log(`Learning: ${contact.alias} (${contact.phone})`);
 
-  // Enrich from Apple Contacts first
-  let appleContactSection = "";
-  try {
-    const cqData = await mcporterCallSync("bb_contact_query", { addresses: [contact.phone] });
-    const ac = extractBBList(cqData)[0];
-    if (ac) {
-      const fullName = ac.displayName ||
-        [`${ac.firstName || ""}`, `${ac.lastName || ""}`].filter(Boolean).join(" ").trim();
-      const emailList = (ac.emails || []).map(e => e.address).filter(Boolean);
-      const altNums   = (ac.phoneNumbers || []).slice(1).map(p => p.address).filter(Boolean);
-      appleContactSection = [
-        `## Apple Contacts Record`,
-        fullName ? `- Full name: ${fullName}` : "",
-        emailList.length ? `- Emails: ${emailList.join(", ")}` : "",
-        ac.birthday ? `- Birthday: ${ac.birthday}` : "",
-        altNums.length ? `- Alternate numbers: ${altNums.join(", ")}` : "",
-      ].filter(Boolean).join("\n") + "\n\n";
-      log(`  Apple Contacts enriched: ${fullName || "(name from allowlist)"}`);
-    }
-  } catch (err) {
-    log(`  Apple Contacts enrichment skipped: ${(err.message || "").slice(0, 60)}`);
-  }
-
   const candidateChats = findChatsForPhone(contact.phone, allChats);
   if (!candidateChats.length) { log(`No chat found for ${contact.alias}`); return null; }
 
   // Try each chat in ranked order until we get actual messages
-  let messages = [], chatGuid = null;
+  let messages = [];
   for (const chat of candidateChats) {
-    log(`Trying chatGuid: ${chat.guid}`);
+    log(`Trying chat ${chat.id} (${chat.guid})`);
     try {
       // Use higher limit for family_close contacts (high message frequency)
       const msgLimit = (contact.category === "family_close") ? 750 : 500;
-      const data = await mcporterCallSync("bb_get_chat_messages", { chat_guid: chat.guid, limit: msgLimit, sort: "DESC" });
-      const msgs = extractBBList(data);
-      if (msgs.length > 0) { messages = msgs; chatGuid = chat.guid; break; }
+      const msgs = Number.isInteger(chat.id) ? await imsgHistory(chat.id, msgLimit, 60000) : [];
+      if (msgs.length > 0) { messages = msgs; break; }
       log(`  → 0 messages, trying next`);
     } catch (err) { log(`  → fetch error: ${err.message.slice(0,80)}`); }
   }
@@ -4141,7 +3294,7 @@ Keep it short and practical.`;
   const filename = `${contact.phone}-${contact.alias.toLowerCase().replace(/\s+/g, "-")}.md`;
   const filepath = path.join(CONTACTS_MEMORY_DIR, filename);
   fs.mkdirSync(CONTACTS_MEMORY_DIR, { recursive: true });
-  writeFileSafe(filepath, `# Contact Memory: ${contact.alias}\n_Updated: ${new Date().toISOString().slice(0, 10)}_\n\n${appleContactSection}${summary}\n`);
+  writeFileSafe(filepath, `# Contact Memory: ${contact.alias}\n_Updated: ${new Date().toISOString().slice(0, 10)}_\n\n${summary}\n`);
   log(`Saved: ${filepath}`);
   return summary;
 }
@@ -4219,23 +3372,14 @@ async function cmdLearn(args) {
   log("ghost learn starting...");
   fs.mkdirSync(CONTACTS_MEMORY_DIR, { recursive: true });
 
-  log("Fetching chats from BlueBubbles via mcporter...");
+  log("Fetching chats from Messages via imsg rpc...");
   let allChats = [];
   try {
-    // Paginate through all chats to guarantee we find direct iMessage;-; threads
-    let offset = 0;
-    while (true) {
-      const data  = await mcporterCallSync("bb_list_chats", { limit: 300, offset });
-      const batch = extractBBList(data);
-      if (!batch.length) break;
-      allChats.push(...batch);
-      if (batch.length < 300) break;
-      offset += 300;
-    }
-    log(`Got ${allChats.length} chats (paginated)`);
+    allChats = await imsgChats(5000);
+    log(`Got ${allChats.length} chats`);
   } catch (err) {
     console.error(`Failed to fetch chats: ${err.message}`);
-    console.error("Make sure mcporter and BlueBubbles are running.");
+    console.error("imsg on KleinBookPro needs Full Disk Access for the SSH context (owner step 1 in 128-25-GHOST.md).");
     process.exit(1);
   }
 
@@ -4380,78 +3524,24 @@ function cmdResume() {
 //  SERVE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function purgeStaleDrafts() {
-  // On startup, nuke drafts older than 1h to prevent auto-send firehose after restart.
-  // Any draft older than 1h means the service was down for a while; Klein may have already
-  // replied manually. Discard and notify Discord rather than risk ghost-texting stale replies.
-  try {
-    const drafts = loadPendingDrafts();
-    const cutoff = Date.now() - 60 * 60 * 1000; // 1 hour
-    const clean  = drafts.filter(d => d.draftText && new Date(d.postedAt || 0).getTime() > cutoff);
-    const purged = drafts.length - clean.length;
-    if (purged > 0) {
-      savePendingDrafts(clean);
-      log(`Purged ${purged} stale/empty drafts on startup (>1h old)`);
-      // Async-notify Discord so Klein knows ghost had pending drafts that were dropped
-      const contacts = [...new Set(drafts.filter(d => new Date(d.postedAt || 0).getTime() <= cutoff).map(d => d.contactName))].join(", ");
-      discordPost(GHOST_CHANNEL, {
-        content: `⚠️ **Ghost restarted** — purged **${purged}** stale draft(s) (>1h old, not sent).\nAffected: ${contacts || "unknown"}\nCheck if manual replies are needed.`
-      }).catch(() => {});
-    }
-  } catch {}
-}
 
-async function pruneStaleDraftsOnStartup() {
-  const drafts = loadPendingDrafts();
-  if (!drafts.length) return;
-  const keep = [];
-  for (const draft of drafts) {
-    const alreadyReplied = await kleinRepliedSince(draft.chatGuid, draft.arrivedAt || draft.postedAt);
-    if (alreadyReplied) {
-      log(`Startup: Klein already replied to ${draft.contactName} — discarding stale draft ${draft.draftId}`);
-    } else {
-      keep.push(draft);
-    }
-  }
-  savePendingDrafts(keep);
-  if (keep.length < drafts.length) {
-    log(`Startup: pruned ${drafts.length - keep.length} stale draft(s) where Klein already replied`);
-  }
-}
 
 function cmdServe() {
-  // Clear any stale lock from a prior crash before starting reaction check loop
-  try { fs.unlinkSync(LOCK_FILE); } catch {}
-  purgeStaleDrafts();
-  pruneStaleDraftsOnStartup().catch(err => log(`Startup preflight error: ${err.message}`));
+  expireOrphanedDraftsOnStartup();
   const server = createServer();
   server.listen(PORT, BIND_HOST, () => {
-    log(`Ghost v3 listening on ${BIND_HOST}:${PORT}`);
-    log(`  Webhook : http://<this-host>:${PORT}/bluebubbles/message-sent${GHOST_API_TOKEN ? "?token=…" : ""}`);
-    if (!GHOST_API_TOKEN) log(`  WARNING : GHOST_API_TOKEN unset — webhook accepts unauthenticated posts from any host`);
+    log(`Ghost v3 listening on ${BIND_HOST}:${PORT} (status only)`);
     log(`  Health  : http://127.0.0.1:${PORT}/health`);
     log(`  Pending : http://127.0.0.1:${PORT}/pending`);
-    log(`  Reaction check: every ${REACT_CHECK_INTERVAL_MS / 1000}s (embedded)`);
+    log(`  Inbound : imsg rpc via ${imsg.IMSG_CLI}`);
+    log(`  Send    : ${imsg.OPENCLAW_BIN} message send --channel imessage (after native approval)`);
   });
 
-  // Embedded reaction-check loop (no external cron needed)
-  setInterval(() => {
-    doReactionCheck().catch(err => log(`Reaction check error: ${err.message}`));
-  }, REACT_CHECK_INTERVAL_MS);
-
-  // Auto-refresh unknown-contact alerts every 12 min so buttons never go stale
-  const UNKNOWN_REFRESH_MS = 12 * 60 * 1000;
-  setInterval(() => {
-    refreshUnknownAlerts().catch(err => log(`Unknown alert refresh error: ${err.message}`));
-  }, UNKNOWN_REFRESH_MS);
-
-  // Sweep stale unknown contacts every 30 min — auto-deny after 4 waking hours
-  setInterval(() => {
-    sweepStaleUnknownAlerts().catch(err => log(`Sweep stale unknown alerts error: ${err.message}`));
-  }, 30 * 60 * 1000);
+  imsgWatch = imsg.startImsgWatch({ onMessage: handleInboundMessage, log, cursorFile: IMSG_CURSOR_FILE });
 
   process.on("SIGTERM", () => {
     log("SIGTERM — shutting down...");
+    if (imsgWatch) imsgWatch.stop();
     for (const [key, entry] of pendingMessages) {
       clearTimeout(entry.timeoutId);
       log(`  Cancelled pending: ${entry.contactName} (${key})`);
@@ -4469,49 +3559,29 @@ async function cmdRetrigger(args) {
   const scan = args.includes("--scan");
 
   if (scan) {
-    // Fetch recent BB chats, find messages from unknowns, alert for each
-    console.log("Scanning recent BB messages for unknown contacts...");
-    let allChats = [];
-    let offset = 0;
-    while (true) {
-      const data  = await bbPost("chat/query", { limit: 300, offset, sort: "lastmessage", withLastMessage: false });
-      const batch = extractBBList(data);
-      if (!batch.length) break;
-      allChats.push(...batch);
-      if (batch.length < 300) break;
-      offset += 300;
-    }
-    console.log(`Scanned ${allChats.length} chats`);
-
-    // Look at direct (non-group) chats only — iMessage;-; pattern
-    const directChats = allChats.filter(c =>
-      typeof c.guid === "string" && c.guid.startsWith("iMessage;-;+")
-    );
-
+    console.log("Scanning Messages chats for unknown contacts...");
+    const chats = await imsgChats(1000);
+    console.log(`Scanned ${chats.length} chats`);
     let found = 0;
-    for (const chat of directChats) {
-      const phone = chat.guid.replace("iMessage;-;", "");
-      const norm  = normalizePhone(phone);
-      if (isAllowed(norm) || isDenied(norm)) continue;
-
-      // Fetch most recent message from this chat
+    for (const chat of chats) {
+      if (typeof chat.guid !== "string" || !chat.guid.includes(";-;")) continue;
+      const norm = normalizePhone(chat.identifier || chat.guid.split(";").pop());
+      if (!norm || norm.length < 7 || norm === OWNER_PHONE_NORMALIZED) continue;
+      if (isAllowed(norm) || isDenied(norm) || pendingUnknownAlerts.has(norm)) continue;
       let lastMsg = "(no recent message)";
-      try {
-        const data = await bbRequest(`chat/${encodeURIComponent(chat.guid)}/message`, { limit: 1, sort: "DESC" });
-        const msgs = extractBBList(data);
-        if (msgs.length) lastMsg = msgs[0].text || lastMsg;
-      } catch {}
-
-      console.log(`  Alerting for unknown: ${phone}`);
-      await postUnknownAlert(phone, lastMsg, chat.displayName || phone, { source: "unknown" });
+      const msgs = await fetchRecentMessages(chat.id, 1);
+      if (msgs.length && msgs[0].text) lastMsg = msgs[0].text;
+      console.log(`  Asking about unknown: +${norm}`);
+      postUnknownAlert(norm, lastMsg, `+${norm}`, { source: "unknown" })
+        .then(r => console.log(`  +${norm}: ${r.action}`))
+        .catch(err => console.error(`  +${norm}: ${err.message}`));
       found++;
-      await new Promise(r => setTimeout(r, 500)); // small delay between posts
     }
-    console.log(`Done — fired ${found} alert(s)`);
+    console.log(`Asked about ${found} unknown contact(s); waiting for the approval cards...`);
+    while (pendingUnknownAlerts.size) await new Promise(r => setTimeout(r, 1000));
     return;
   }
 
-  // Single phone mode: ghost retrigger +15551234567
   const phone = args.find(a => a.startsWith("+") || /^\d{10,}$/.test(a));
   if (!phone) {
     console.error("Usage: ghost retrigger <+phone>  OR  ghost retrigger --scan");
@@ -4520,26 +3590,24 @@ async function cmdRetrigger(args) {
 
   const norm = normalizePhone(phone);
   if (isAllowed(norm)) {
-    console.log(`+${norm} is already in the allowlist — no alert needed.`);
+    console.log(`+${norm} is already in the allowlist — no request needed.`);
     return;
   }
   if (isDenied(norm)) {
-    console.log(`+${norm} is in the denylist — remove it first if you want to re-evaluate.`);
+    console.log(`+${norm} is in the denylist — remove it from data/ghost-denylist.json first to re-evaluate.`);
     return;
   }
 
-  // Fetch their most recent message for context
   let lastMsg = "(no recent message)";
   try {
-    const chatGuid = `iMessage;-;+${norm}`;
-    const data = await bbRequest(`chat/${encodeURIComponent(chatGuid)}/message`, { limit: 1, sort: "DESC" });
-    const msgs = extractBBList(data);
-    if (msgs.length) lastMsg = msgs[0].text || lastMsg;
+    const chat = findChatsForPhone(`+${norm}`, await imsgChats(1000))[0];
+    const msgs = chat ? await fetchRecentMessages(chat.id, 1) : [];
+    if (msgs.length && msgs[0].text) lastMsg = msgs[0].text;
   } catch {}
 
-  console.log(`Firing unknown-contact alert for +${norm}...`);
-  await postUnknownAlert(`+${norm}`, lastMsg, `+${norm}`, { source: "unknown" });
-  console.log("Alert posted to Discord.");
+  console.log(`Asking the owner about +${norm} (approval card in #ghost-openclaw)...`);
+  const r = await postUnknownAlert(`+${norm}`, lastMsg, `+${norm}`, { source: "unknown" });
+  console.log(`Result: ${r.action}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4553,11 +3621,6 @@ const [,, cmd = "serve", ...cmdArgs] = process.argv;
 switch (cmd) {
   case "serve":
     cmdServe();
-    break;
-  case "react":
-    doReactionCheck()
-      .then(() => process.exit(0))
-      .catch(err => { console.error(err.message); process.exit(1); });
     break;
   case "learn":
     cmdLearn(cmdArgs)
@@ -4583,18 +3646,17 @@ switch (cmd) {
     break;
   default:
     console.error(`Unknown command: ${cmd}`);
-    console.log("Usage: ghost [serve|react|learn|status|pause|resume|schedule|retrigger]");
+    console.log("Usage: ghost [serve|learn|status|pause|resume|schedule|retrigger]");
     console.log("");
-    console.log("  serve                  webhook server + embedded reaction loop");
-    console.log("  react                  one-shot reaction check");
+    console.log("  serve                  watch iMessage (imsg rpc) + local status server");
     console.log("  learn [--all]          build contact memories + voice profile   (Phase 1)");
     console.log("  learn --contact <num>  learn one contact");
     console.log("  status                 show server/memory/draft state");
     console.log("  pause [--hours N]      pause ghost");
     console.log("  resume                 resume ghost");
     console.log("  schedule               print nightly learn cron line            (Phase 5)");
-    console.log("  retrigger <+phone>     re-fire an unknown-contact alert (fresh Approve/Deny buttons)");
-    console.log("  retrigger --scan       scan recent BB messages and alert for any unknowns");
+    console.log("  retrigger <+phone>     ask the owner about an unknown number (native approval card)");
+    console.log("  retrigger --scan       scan Messages chats and ask about every unknown number");
     process.exit(1);
 }
 } // end require.main === module guard
@@ -4605,7 +3667,6 @@ if (require.main !== module) {
     normalizePhone,
     isFromKlein,
     requiresReply,
-    extractBBList,
     isQuietHours,
     loadAllowlist,
     loadContactsMap,
@@ -4614,7 +3675,6 @@ if (require.main !== module) {
     isAllowed,
     isGroupChatGuid,
     findChatsForPhone,
-    findChatGuidForPhone,
     // New exports for testing
     scanForInjection,
     passesContentSafety,
@@ -4635,25 +3695,20 @@ if (require.main !== module) {
     CATEGORY_AUTO_SEND_MS,
     // Bug-fix exports
     normalizeTs,
-    loadButtonRegistry,
-    saveButtonRegistry,
-    BUTTON_REGISTRY_FILE,
     // Integration test exports
     createServer,
     runPreflight,
     logFeedback,
-    doReactionCheck,
-    sweepStaleUnknownAlerts,
     pendingUnknownAlerts,
     pendingMessages,
     loadPendingDrafts,
     savePendingDrafts,
     checkAndDraft,
+    cmdServe,
     DATA_DIR,
     GHOST_DIR,
     GHOST_CHANNEL,
     DRAFT_DELAY_MS,
-    KLEIN_DISCORD_USER_ID,
     postCannotAnswerAlert,
     buildSystemPrompt,
     postDraftToDiscord,
@@ -4689,14 +3744,8 @@ if (require.main !== module) {
     // Bind-host export (90-01: loopback confinement support)
     BIND_HOST,
 
-    // 98-01: outbound sender attribution
-    OC_AGENT_ID,
-    ocGatewayPost,
-    // Learn-path exports (90-01: mcporter resolution regression)
-    MCPORTER_BIN,
-    mcporterCallSync,
     // 90-03: fail-closed send toggle + style allowlist + expiry-cancel exports
-    bbSendMessage, executeSend, ghostSendToggleState, styleAllowlistViolation,
+    sendIMessage, executeSend, ghostSendToggleState, styleAllowlistViolation,
     SEND_TOGGLE_FILE, AUTO_SEND_WINDOW_MS,
     // D6/O-2: learn must fail loudly rather than write convincing stubs
     learnContact, buildVoiceProfile, cmdLearn, LEARN_MODEL,
@@ -4710,6 +3759,18 @@ if (require.main !== module) {
     dmPhoneFromChatGuid,
     discordPost,
     isAuthorizedRequest,
-    MAX_BODY_BYTES,
+    // NAT-25: native iMessage transport (imsg rpc, plugin approvals, native send)
+    setTransport,
+    handleInboundMessage,
+    awaitDraftApproval,
+    resolveDraftDecision,
+    resolveUnknownContactDecision,
+    postUnknownAlert,
+    expireOrphanedDraftsOnStartup,
+    fetchRecentMessages,
+    kleinRepliedSince,
+    IMSG_CURSOR_FILE,
+    MAX_UNKNOWN_ALERTS,
+    UNKNOWN_APPROVAL_MS,
   };
 }

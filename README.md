@@ -1,85 +1,93 @@
 # ghost-pipeline
 
-Klein's iMessage auto-reply agent. Reads incoming texts via BlueBubbles webhook, generates drafts mimicking Klein's voice, posts them to Discord for review, and auto-sends after a per-contact cooldown (1.5–7.5 min depending on relationship category and conversation activity) unless cancelled.
+Klein's iMessage drafting agent. Watches incoming texts through OpenClaw's native iMessage
+transport (`imsg rpc`), drafts a reply in Klein's voice, posts it to Discord, and asks the owner
+through a native OpenClaw approval card. It sends only after **Allow Once**; an unanswered card
+expires unsent. Nothing sends on a timer.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  ghost-pipeline (this repo)                                  │
-│  ~/codeWS/JavaScript/ghost-pipeline/src/ghost.js             │
-│  ← symlinked from ~/.openclaw/hooks/ghost.js                 │
-│                                                              │
-│  Webhook server (port 18790):                                │
-│    POST /bluebubbles/message-sent  ← BB webhook              │
-│    POST /action                    ← send/cancel draft       │
-│    POST /approve-contact           ← approve unknown         │
-│    POST /deny-contact              ← deny unknown            │
-│    GET  /pending, /health          ← status                  │
-└───────────┬─────────────────────────────┬────────────────────┘
-            │                             │
-            ▼                             ▼
-┌───────────────────────┐  ┌─────────────────────────────────┐
-│  BlueBubbles MCP      │  │  OC pre-message hook             │
-│  ~/code/bluebubbles-  │  │  ~/.openclaw/hooks/pre-message/  │
-│  mcp (on Collins)     │  │  handler.js                      │
-│  SSH fwd: 18800→18801 │  │  Routes Discord button clicks    │
-│  20 iMessage tools    │  │  to ghost HTTP /action endpoint  │
-│  via mcporter         │  │  (also: autonomous intent        │
-└───────────────────────┘  │   detection — unrelated to ghost)│
-                           └─────────────────────────────────┘
+ Mac signed into Messages (imsg)          broklein
+ ┌──────────────────────────┐     ssh     ┌────────────────────────────────────────────┐
+ │ imsg rpc  (JSON-RPC 2.0) │◀───────────▶│ ghost.js serve                             │
+ │ chat.db + Messages.app   │  imsg-ssh   │   watch.subscribe → preflight → draft      │
+ └──────────────────────────┘             │   messages.history (context, collisions)   │
+                                          │                                            │
+                                          │   openclaw gateway call                    │
+                                          │     plugin.approval.request ──▶ Discord    │
+                                          │     card: Allow Once / Deny                │
+                                          │                                            │
+                                          │   openclaw message send                    │
+                                          │     --channel imessage --target +E164      │
+                                          │                                            │
+                                          │   GET /health, /pending (127.0.0.1:PORT)   │
+                                          └────────────────────────────────────────────┘
 ```
 
+- **Read**: `src/imsg.js` runs `~/.openclaw/tools/imsg-ssh rpc` (override: `GHOST_IMSG_CLI`),
+  the same wrapper and methods the Gateway's imessage channel uses. Only the argument `rpc`
+  crosses SSH; all data travels on stdin, because the remote shell parses the wrapper's argv.
+  The last rowid seen is kept in `data/ghost-imsg-cursor.json`.
+- **Ask**: one blocking `plugin.approval.request` per draft (and per unknown number), routed to
+  the ghost Discord channel. The approval binds to that connection, so a restart loses it:
+  drafts pending at startup expire unsent.
+- **Send**: the Gateway's own imessage channel. The target is always the contact's E.164
+  handle; ghost refuses anything else before a process starts.
+
+### Fail-closed send rules
+
+A send happens only when all of these hold, in this order: send toggle on
+(`data/ghost-send-enabled.json` `{"enabled": true}` or `GHOST_SEND_ENABLED=1`), not paused,
+the draft is still pending, the approved text equals the draft text, the recipient is an
+allowlisted E.164 handle (or the owner), Klein has not replied in the thread, no internal-text
+markers, and the per-contact rate gate and send lock allow it. One approval gives one attempt;
+a failed send is reported, never retried.
+
 ### Dependencies
-- **BlueBubbles server** on a macOS host (configured via `BB_HOST`/`BB_PORT` in `.env`)
-- **BB MCP server** forwarded via SSH tunnel (configured in `.env`)
-- **OpenClaw pre-message hook** (handler.js) bridges Discord button clicks → ghost /action
+- **A Mac signed into Messages with `imsg`** (Homebrew), reachable as the `imsg-ssh` wrapper's
+  host. The SSH context needs Full Disk Access (reads) and Messages Automation (sends).
+- **OpenClaw Gateway** with the bundled `imessage` channel enabled and owner-only admission,
+  and Discord native approvals for the ghost channel.
 - **OpenRouter API** for draft generation (model waterfall)
 - **Node.js ≥ 20** (`better-sqlite3` ships prebuilt binaries for current LTS releases)
-- **Discord** channel for draft review (configured via `GHOST_CHANNEL_ID` in `.env`)
+- **Discord** channel for draft review (`GHOST_CHANNEL_ID` in `.env`)
 
 ## Pipeline Flow
 
 ```
-BlueBubbles on macOS host ──webhook──▶ ghost.js :18790
-                                       │
-                              allowlist + quiet hours check
-                                       │
-                              draft generation chain (OpenRouter,
-                              first success that passes content safety):
-                                gpt-oss-120b:free
-                                → gemini-3.1-flash-lite-preview
-                                → gemini-3-flash-preview
-                                → claude-haiku-4.5
-                                       │
-                              Discord #ghost-openclaw
-                              [✅ Send] [❌ Cancel] (per-contact cooldown)
-                                       │
-                              auto-send via BlueBubbles MCP
+imsg watch.subscribe ──▶ ghost.js
+                           │
+                  group / reaction / age / spam / injection / allowlist / quiet hours
+                           │   (unknown number → approval card: allowlist or deny)
+                           │
+                  30 s debounce, then draft generation chain (OpenRouter,
+                  first success that passes content safety)
+                           │
+                  Discord #ghost-openclaw: draft + native approval card
+                           │
+                  Allow Once ──▶ openclaw message send --channel imessage
+                  Deny / no answer ──▶ nothing sent
 ```
 
 ## Setup
 
 ```bash
 npm ci                  # install (Node ≥ 20)
-cp .env.example .env    # then fill in BB_HOST, GHOST_CHANNEL_ID, OWNER_PHONE, …
+cp .env.example .env    # then fill in GHOST_CHANNEL_ID, OWNER_PHONE, …
 npm start               # = node src/ghost.js serve
 ```
 
-Secrets are read from `~/.config/bluebubbles/password`, `~/.config/openrouter/api-key`,
-`~/.config/discord/bot-token` and `~/.openclaw/.gateway-token` (the gateway token can also
-come from `OC_GATEWAY_TOKEN`; the others are file-only).
+Secrets are read from `~/.config/openrouter/api-key` and `~/.config/discord/bot-token`
+(file-only). `openclaw` is resolved from the npm global prefix (override: `GHOST_OPENCLAW_BIN`),
+because the systemd unit's PATH does not include it.
 
 ### HTTP API access
 
-The server binds `GHOST_BIND_HOST` (default `0.0.0.0`, since BlueBubbles posts from another host).
-
-- `/action`, `/approve-contact`, `/deny-contact`, `/pending` accept requests from loopback
-  (the local OpenClaw hook) only, unless the caller presents `GHOST_API_TOKEN`.
-- `/bluebubbles/message-sent` requires `GHOST_API_TOKEN` when it is set — configure the
-  BlueBubbles webhook URL as `http://<ghost-host>:18790/bluebubbles/message-sent?token=<token>`.
-  **Set it**: without a token anyone on the network can inject fake inbound messages.
-- The token may be sent as `Authorization: Bearer <token>`, `X-Ghost-Token: <token>` or `?token=<token>`.
+The status server binds `GHOST_BIND_HOST` (default `127.0.0.1`). Nothing posts to ghost; the
+only routes are `GET /health` and `GET /pending`. `/pending` answers loopback callers, or a
+caller presenting `GHOST_API_TOKEN` (`Authorization: Bearer <token>`, `X-Ghost-Token` or
+`?token=`).
 
 ## Symlink Layout
 
@@ -120,10 +128,10 @@ Then add a contact memory file: `workspace/memory/contacts/1XXXXXXXXXX-name.md`
 ## Service Management
 
 ```bash
-systemctl --user start   bluebubbles-webhook.service
-systemctl --user stop    bluebubbles-webhook.service
-systemctl --user restart bluebubbles-webhook.service
-systemctl --user status  bluebubbles-webhook.service
+systemctl --user start   ghost.service
+systemctl --user stop    ghost.service
+systemctl --user restart ghost.service
+systemctl --user status  ghost.service
 
 node src/ghost.js status   # live status + pending drafts
 node src/ghost.js pause    # pause indefinitely
@@ -148,8 +156,8 @@ text Klein's mom at 1:25am (MCP returns `from:"me"` not `isFromMe:true`).
 
 ## Known Limits
 
-- **BlueBubbles required**: must be running on `collins` (BB_HOST:BB_PORT (see .env))
-- **MCP tunnel dependency**: SSH LocalForward `localhost:18800 → macOS-host:18791` must be up for MCP path; falls back to direct BB HTTP if tunnel is down
-- **PinePhone (Emmet)**: BlueBubbles iMessage delivery to PinePhone numbers is intermittent
+- **Mac permissions**: without Full Disk Access for the SSH context, `imsg rpc` fails with
+  code 23; ghost logs it once and retries with a capped backoff (inbound is off meanwhile).
+- **Restart drops approvals**: pending drafts expire unsent at startup; reply manually.
 - **No group chat replies**: ghost only handles 1-on-1 iMessage threads; group chats are skipped
-- **Apple Contacts enrichment**: requires `mcporter` + `bb_contact_query` — degrades gracefully if unavailable
+- **Contact names**: an unknown number's name comes from imsg's Contacts lookup (`sender_name`) when the Mac has it.

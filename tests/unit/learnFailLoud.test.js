@@ -76,11 +76,6 @@ fs.writeFileSync(
   ].join("\n"),
 );
 
-jest.mock("child_process", () => {
-  const real = jest.requireActual("child_process");
-  return { ...real, spawnSync: jest.fn() };
-});
-const cp    = require("child_process");
 const ghost = require("../../src/ghost.js");
 
 // The exact body Spark's router returns while generation is gated (observed 2026-08-13:
@@ -125,21 +120,22 @@ const FULL_SUMMARY = [
   "## Reply Guidelines\nkeep it short",
 ].join("\n\n");
 
-/** Make mcporter return canned BB payloads, keyed off the tool name in argv. */
-function mockMcporter({ messages }) {
-  cp.spawnSync.mockImplementation((bin, args, opts) => {
-    const tool = String(args[1] || "");
-    let payload = {};
-    if (tool.endsWith("bb_contact_query"))      payload = { contacts: [] };
-    else if (tool.endsWith("bb_list_chats"))    payload = { chats: [CHAT] };
-    else if (tool.endsWith("bb_get_chat_messages")) payload = { messages };
-    const out = opts && Array.isArray(opts.stdio) ? opts.stdio[1] : null;
-    if (typeof out === "number") fs.writeSync(out, JSON.stringify(payload));
-    return { status: 0, stdout: null, stderr: "" };
+/** Make imsg rpc return canned chats and history. */
+function mockImsg({ messages }) {
+  // imsg rpc answers with raw payloads; ghost normalizes them (is_from_me → isFromMe).
+  ghost.setTransport({
+    imsgRequest: async (method, params) => {
+      if (method === "chats.list") return { chats: [CHAT] };
+      if (method === "messages.history" && params.chat_id === CHAT.id) {
+        return { messages: messages.map(m => ({ is_from_me: m.isFromMe === true, text: m.text })) };
+      }
+      return {};
+    },
   });
 }
 
-const CHAT = { guid: "iMessage;-;+15550000001", participants: ["+15550000001"] };
+// imsg chats.list row (NAT-25): the id is what messages.history takes.
+const CHAT = { id: 1, guid: "iMessage;-;+15550000001", identifier: "+15550000001" };
 
 const KLEIN_MSGS = [
   { isFromMe: true,  text: "yea im down for that" },
@@ -152,7 +148,7 @@ const KLEIN_MSGS = [
 const CONTACT = { name: "Alpha", alias: "Alpha", phone: "15550000001", category: "close_friend" };
 
 beforeEach(() => {
-  cp.spawnSync.mockReset();
+  ghost.setTransport({ imsgRequest: async () => { throw new Error("imsg not mocked"); } });
   nock.cleanAll();
   try { fs.unlinkSync(VOICE_FILE); } catch {}
   for (const f of fs.readdirSync(CONTACTS_DIR)) fs.unlinkSync(path.join(CONTACTS_DIR, f));
@@ -214,7 +210,7 @@ describe("buildVoiceProfile — must not fabricate Klein's voice", () => {
 
 describe("learnContact — must not write stats-only stubs", () => {
   test("throws instead of writing a stub when the model is unavailable", async () => {
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     mockModelDead();
 
     await expect(ghost.learnContact(CONTACT, [CHAT])).rejects.toThrow(/refusing to write/i);
@@ -226,7 +222,7 @@ describe("learnContact — must not write stats-only stubs", () => {
     const original = "# Contact Memory: Alpha\n_Updated: 2026-03-17_\n\n## Typical Topics\nreal generated prose\n";
     fs.writeFileSync(file, original);
 
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     mockModelDead();
 
     await expect(ghost.learnContact(CONTACT, [CHAT])).rejects.toThrow();
@@ -234,7 +230,7 @@ describe("learnContact — must not write stats-only stubs", () => {
   });
 
   test("writes the summary when the model actually responds", async () => {
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     mockModelAlive(FULL_SUMMARY);
 
     const summary = await ghost.learnContact(CONTACT, [CHAT]);
@@ -247,7 +243,7 @@ describe("learnContact — must not write stats-only stubs", () => {
   // Not a model failure — genuinely nothing to analyse. Must stay a quiet skip (null),
   // otherwise a contact with no history would break the whole nightly sweep.
   test("returns null without throwing when the contact has no sent messages", async () => {
-    mockMcporter({ messages: [{ isFromMe: false, text: "hey" }] });
+    mockImsg({ messages: [{ isFromMe: false, text: "hey" }] });
     const result = await ghost.learnContact(CONTACT, [CHAT]);
     expect(result).toBeNull();
     expect(fs.readdirSync(CONTACTS_DIR)).toHaveLength(0);
@@ -256,7 +252,7 @@ describe("learnContact — must not write stats-only stubs", () => {
 
 describe("cmdLearn — exit contract", () => {
   test("rejects (nonzero exit) when the model is dead for every contact", async () => {
-    mockMcporter({ messages: KLEIN_MSGS });
+    mockImsg({ messages: KLEIN_MSGS });
     nock(SPARK_ORIGIN).post(SPARK_PATH).times(5).reply(503, SPARK_GATED_503);
 
     // The CLI dispatcher maps a rejection to process.exit(1) (src/ghost.js:4227-4229),

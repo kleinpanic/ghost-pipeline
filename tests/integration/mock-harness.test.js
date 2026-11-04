@@ -5,15 +5,16 @@
  *
  * Covers all 24 spec edge cases across 6 groups:
  *   Group 1: Preflight gates (9 cases)
- *   Group 2: Draft generation + button registry (3 cases)
- *   Group 3: Button actions (3 cases)
+ *   Group 2: Draft generation + native approval card (4 cases)
+ *   Group 3: Owner decisions (3 cases)
  *   Group 4: Collision detection (3 cases)
  *   Group 5: Unknown contact flow (3 cases)
  *   Group 6: State machine + feedback (3 cases)
  *
  * Mock strategy:
- *   - child_process.spawn  → intercepts curl (Discord API) + mcporter (BB MCP)
- *   - nock                 → intercepts https (OC Gateway, OpenRouter) + http (BB direct)
+ *   - child_process.spawn  → intercepts curl (Discord API)
+ *   - ghost.setTransport   → imsg rpc reads, native send and native approvals (NAT-25)
+ *   - nock                 → intercepts https (OpenRouter, embeddings, Spark)
  *   - jest fake timers     → advances 30s draft-delay window where needed
  *   - Temp HOME            → isolates all file I/O (DATA_DIR, CONTACTS.md, etc.)
  */
@@ -21,15 +22,11 @@
 const fs   = require("fs");
 const path = require("path");
 const os   = require("os");
-const http = require("http");
 
 // ─── Temp workspace ───────────────────────────────────────────────────────────
 // Must be set BEFORE ghost.js is required so its module-level constants pick it up.
 const tmpHome   = fs.mkdtempSync(path.join(os.tmpdir(), "ghost-harness-"));
 process.env.HOME               = tmpHome;
-process.env.BB_HOST            = "127.0.0.1";
-process.env.BB_PORT            = "19234";
-process.env.KLEIN_DISCORD_USER_ID = "KLEIN_USER_123";
 // 90-03: bbSendMessage is fail-closed by default. Enable the master send toggle
 // for the pre-existing gate/flow tests; toggle-specific behavior is pinned in
 // tests/unit/sendToggleStyleGate.test.js.
@@ -48,7 +45,6 @@ fs.mkdirSync(path.join(tmpHome, ".config", "discord"), { recursive: true });
 fs.mkdirSync(path.join(tmpHome, ".openclaw"), { recursive: true });
 fs.writeFileSync(path.join(tmpHome, ".config", "openrouter", "api-key"), "test-openrouter-key-mock");
 fs.writeFileSync(path.join(tmpHome, ".config", "discord", "bot-token"), "test-discord-token-mock");
-fs.writeFileSync(path.join(tmpHome, ".openclaw", ".gateway-token"), "test-gateway-token-mock");
 
 const ALLOWED_PHONE = "15551234567";
 const DENIED_PHONE  = "15559999999";
@@ -68,13 +64,12 @@ fs.writeFileSync(
 // Minimal SOUL.md
 fs.writeFileSync(path.join(ghostWsDir, "SOUL.md"), "You are Klein. Be brief.");
 
-// ─── Mock child_process.spawn (curl + mcporter) ───────────────────────────────
+// ─── Mock child_process.spawn (curl → Discord) ────────────────────────────────
 // Must be declared before require('../../src/ghost') is called.
 // jest.mock() calls are hoisted, but the factory body runs at mock-setup time.
 
 let mockMessages    = {};  // chatGuid → message array
 let spawnCallLog    = [];  // capture all spawn calls for assertions
-let bbSendCallLog   = [];  // capture BB send calls specifically
 let discordPostLog  = [];  // capture Discord posts
 
 jest.mock("child_process", () => {
@@ -97,27 +92,13 @@ jest.mock("child_process", () => {
     return child;
   };
 
-  /** Discord message response: Components v2 container → action row → buttons with occomp:cid= custom_ids */
-  const discordMsgResponse = () => ({
-    id: `msg-${Date.now()}`,
-    components: [{
-      type: 17,                   // Container (v2)
-      components: [{
-        type: 1,                  // Action row
-        components: [
-          { type: 2, custom_id: "occomp:cid=shortId1", label: "✅ Send Now", style: 3 },
-          { type: 2, custom_id: "occomp:cid=shortId2", label: "❌ Cancel",   style: 4 },
-        ],
-      }],
-    }],
-  });
+  const discordMsgResponse = () => ({ id: `msg-${Date.now()}` });
 
   return {
     ...actual,
     spawn: jest.fn((cmd, args, _opts) => {
       // Record call (module-level arrays filled via closure below)
       global.__ghostSpawnLog  = global.__ghostSpawnLog  || [];
-      global.__ghostBBLog     = global.__ghostBBLog     || [];
       global.__ghostDiscordLog = global.__ghostDiscordLog || [];
       global.__ghostSpawnLog.push({ cmd, args: [...(args || [])] });
 
@@ -129,44 +110,7 @@ jest.mock("child_process", () => {
 
         if (isDelete) return createChild("");
 
-        // GET (fetching message to extract button custom_ids) or POST (sending message)
         return createChild(discordMsgResponse());
-      }
-
-      // ── mcporter → BB MCP ────────────────────────────────────────────
-      if (cmd === "mcporter") {
-        const callIdx    = args.indexOf("call");
-        const tool       = callIdx !== -1 ? (args[callIdx + 1] || "") : "";
-        const argsJsonIdx = args.indexOf("--args");
-        let toolArgs = {};
-        if (argsJsonIdx !== -1) {
-          try { toolArgs = JSON.parse(args[argsJsonIdx + 1]); } catch {}
-        }
-
-        if (tool === "bluebubbles.bb_get_chat_messages") {
-          const msgs = (global.__ghostMockMessages || {})[toolArgs.chat_guid] || [];
-          return createChild({ messages: msgs });
-        }
-
-        if (tool === "bluebubbles.bb_send_message") {
-          global.__ghostBBLog.push({ chat_guid: toolArgs.chat_guid, message: toolArgs.message });
-          return createChild({ status: 200, message: "Message sent successfully" });
-        }
-
-        if (tool === "bluebubbles.bb_contact_query") {
-          return createChild({ data: [] });
-        }
-
-        if (tool === "bluebubbles.bb_list_chats") {
-          return createChild({ chats: [] });
-        }
-
-        return createChild({});
-      }
-
-      // ── openclaw → ghost agent CLI ────────────────────────────────────
-      if (cmd === "openclaw") {
-        return createChild({ reply: "Sure, sounds good!" });
       }
 
       return createChild("{}");
@@ -183,43 +127,6 @@ nock.disableNetConnect();  // block ALL real network calls (re-enabled per test 
 function setupNock(testServerPort) {
   // Allow connections to the test ghost server only
   nock.enableNetConnect(`127.0.0.1:${testServerPort}`);
-  // OC Gateway HTTPS (127.0.0.1:18789) — sessions_list + message (draft post)
-  nock("https://127.0.0.1:18789")
-    .persist()
-    .post("/tools/invoke")
-    .reply(200, (_uri, body) => {
-      // nock may deliver body as parsed object (Content-Type: application/json) or string
-      const parsed = typeof body === "string" ? ((() => { try { return JSON.parse(body); } catch { return {}; } })()) : (body || {});
-      const tool = parsed.tool || "";
-      if (tool === "sessions_list") {
-        return {
-          ok: true,
-          result: {
-            details: { sessions: [] },
-            content: [{ type: "text", text: JSON.stringify({ sessions: [] }) }],
-          },
-        };
-      }
-      if (tool === "message") {
-        // Draft post via OC gateway → return messageId
-        return {
-          ok: true,
-          result: {
-            details: {
-              ok: true,
-              result: { messageId: "mock-msg-oc-123", channelId: "test-channel" },
-              components: true,
-            },
-            content: [{
-              type: "text",
-              text: JSON.stringify({ ok: true, result: { messageId: "mock-msg-oc-123", channelId: "test-channel" }, components: true }),
-            }],
-          },
-        };
-      }
-      return { ok: true, result: {} };
-    });
-
   // OpenRouter — haiku / gemini-flash failover → always return a draft
   nock("https://openrouter.ai")
     .persist()
@@ -232,14 +139,6 @@ function setupNock(testServerPort) {
     .post(/embedContent/)
     .replyWithError("not-available-in-tests");
 
-  // BB direct HTTP (fallback path)
-  nock(`http://127.0.0.1:19234`)
-    .persist()
-    .get(/\/api\/v1\//)
-    .reply(200, { status: 200, data: [] })
-    .post(/\/api\/v1\//)
-    .reply(200, { status: "200", message: "Message sent successfully" });
-
   // Spark vllm — simulate offline
   nock("http://127.0.0.1:18080")
     .persist()
@@ -250,25 +149,57 @@ function setupNock(testServerPort) {
 // ─── Require ghost AFTER workspace + mocks are configured ────────────────────
 const ghost = require("../../src/ghost");
 
-// ─── HTTP helpers ─────────────────────────────────────────────────────────────
-function httpPost(port, urlPath, body) {
-  return new Promise((resolve, reject) => {
-    const bodyStr = JSON.stringify(body);
-    const req = http.request({
-      hostname: "127.0.0.1", port, path: urlPath, method: "POST",
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(bodyStr) },
-    }, (res) => {
-      let data = "";
-      res.on("data", c => { data += c; });
-      res.on("end", () => {
-        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
-        catch { resolve({ status: res.statusCode, body: data }); }
-      });
-    });
-    req.on("error", reject);
-    req.write(bodyStr);
-    req.end();
-  });
+// ─── Native transport mocks (NAT-25) ──────────────────────────────────────────
+// imsg chat ids: each chat guid used by a test gets a stable integer id.
+const chatIds = new Map();
+function chatIdFor(chatGuid) {
+  if (!chatIds.has(chatGuid)) chatIds.set(chatGuid, chatIds.size + 1);
+  return chatIds.get(chatGuid);
+}
+function chatGuidFor(id) {
+  for (const [g, i] of chatIds) if (i === id) return g;
+  return null;
+}
+
+ghost.setTransport({
+  // messages.history answers from global.__ghostMockMessages[chatGuid], in imsg's raw shape
+  imsgRequest: async (method, params) => {
+    if (method === "messages.history") {
+      const msgs = (global.__ghostMockMessages || {})[chatGuidFor(params.chat_id)] || [];
+      return { messages: msgs.map(m => ({
+        is_from_me: m.isFromMe === true,
+        text: m.text,
+        created_at: new Date(ghost.normalizeTs(m.dateCreated) || Date.now()).toISOString(),
+      })) };
+    }
+    if (method === "chats.list") return { chats: [] };
+    return {};
+  },
+  sendIMessage: async (target, text) => { global.__ghostSendLog.push({ target, message: text }); return { ok: true }; },
+  // Each request stays open until a test answers it with approval.resolve({ decision })
+  requestApproval: (opts) => new Promise(resolve => { global.__ghostApprovals.push({ opts, resolve }); }),
+});
+
+async function waitForApproval(n = 1, timeoutMs = 5000) {
+  const until = Date.now() + timeoutMs;
+  while ((global.__ghostApprovals || []).length < n) {
+    if (Date.now() > until) throw new Error(`expected ${n} approval request(s), saw ${(global.__ghostApprovals || []).length}`);
+    await new Promise(r => setTimeout(r, 20));
+  }
+  return global.__ghostApprovals[n - 1];
+}
+
+/** One inbound iMessage through the native path; shaped like the old webhook reply. */
+async function inbound(msg) {
+  return { status: 200, body: await ghost.handleInboundMessage(msg) };
+}
+
+/** The owner's decision on a pending draft's approval card. */
+async function decide(draftId, action) {
+  const draft = ghost.loadPendingDrafts().find(d => d.draftId === draftId);
+  const decision = action === "send" ? "allow-once" : "deny";
+  const r = await ghost.resolveDraftDecision(draftId, decision, draft ? draft.draftText : null);
+  return { status: 200, body: { ok: true, ...r } };
 }
 
 function makeEvent({
@@ -279,8 +210,8 @@ function makeEvent({
   isFromMe   = false,
 } = {}) {
   return {
-    type: "new-message",
-    data: { isFromMe, chatGuid, handle: { address: contact }, text, dateCreated },
+    isFromMe, chatGuid, chatId: chatIdFor(chatGuid), handle: { address: contact },
+    text, dateCreated, isGroup: false, isReaction: false,
   };
 }
 
@@ -310,22 +241,21 @@ function resetState() {
   if (ghost.kleinRepliedRecentlyChats) ghost.kleinRepliedRecentlyChats.clear();
   if (ghost.cancelledDraftIds)  { ghost.cancelledDraftIds.clear(); ghost.cancelledDraftTtl.clear(); }
   if (ghost.sendLocks) ghost.sendLocks.clear();
+  if (ghost.unknownAlertCounts) ghost.unknownAlertCounts.clear();
   // Reset global log arrays
   global.__ghostSpawnLog   = [];
-  global.__ghostBBLog      = [];
+  global.__ghostSendLog    = [];
+  global.__ghostApprovals  = [];
   global.__ghostDiscordLog = [];
   global.__ghostMockMessages = {};
   // Clear data files
   const files = [
     path.join(dataDir, "ghost-pending-drafts.json"),
-    path.join(dataDir, "ghost-button-registry.json"),
-    path.join(dataDir, "ghost-button-actions.json"),
     path.join(dataDir, "ghost-feedback.json"),
     path.join(dataDir, "ghost-conv-state.json"),
     path.join(dataDir, "ghost-spam-log.json"),
     path.join(dataDir, "ghost-spam-ratelimit.json"),
     path.join(dataDir, "ghost-denylist.json"),
-    path.join(dataDir, "ghost-reaction-check.lock"),
     path.join(dataDir, "ghost-outbound-rate.json"),
     path.join(dataDir, "ghost-outbound-backoff.json"),
     path.join(dataDir, "ghost-pause.json"),
@@ -468,13 +398,13 @@ describe("Group 1: Preflight gates", () => {
     );
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("unknown_contact");
-    // Verify alert was posted (via OC gateway or Discord fallback) and tracked in pendingUnknownAlerts
-    await new Promise(r => setTimeout(r, 100)); // let fire-and-forget settle
-    // postUnknownAlert now routes through OC gateway (ocGatewayPost) rather than raw curl.
-    // Verify either: pendingUnknownAlerts has an entry (success path) OR a discord curl was fired (fallback).
-    const discordPosts = global.__ghostDiscordLog.filter(d => d.url && d.url.includes("discord.com"));
-    const alertTracked = ghost.pendingUnknownAlerts.size > 0;
-    expect(discordPosts.length > 0 || alertTracked).toBe(true);
+    // The owner is asked through a native approval card; the notice is a plain post.
+    const approval = await waitForApproval();
+    expect(approval.opts.title).toContain(`+${UNKNOWN_PHONE}`);
+    expect(approval.opts.description).toContain("Hi, I got your number from a friend!");
+    expect(approval.opts.timeoutMs).toBe(ghost.UNKNOWN_APPROVAL_MS);
+    expect(ghost.pendingUnknownAlerts.has(UNKNOWN_PHONE)).toBe(true);
+    expect(ghost.isAllowed(UNKNOWN_PHONE)).toBe(false);
   });
 
   // ── Test 8: group_chat ──────────────────────────────────────────────────────
@@ -501,7 +431,7 @@ describe("Group 1: Preflight gates", () => {
       `+${ALLOWED_PHONE}`,
       "Sounds good, let me know when you're ready",
       chatGuid,
-      { dateCreated: Date.now() }
+      { dateCreated: Date.now(), chatId: chatIdFor(chatGuid) }
     );
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("klein_recently_active");
@@ -512,20 +442,17 @@ describe("Group 1: Preflight gates", () => {
 //  GROUP 2 — Draft generation + button registration
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("Group 2: Draft generation + button registry", () => {
+describe("Group 2: Draft generation + native approval card", () => {
   /**
-   * Helper: POST webhook, force a tiny auto-send window, invoke Phase A, then let Phase B fire.
-   * Current Ghost architecture is two-phase:
-   *   Phase A: pre-cancel alert
-   *   Phase B: LLM fires shortly before auto-send
-   * For tests we shrink autoSendMs to 30s so Phase B schedules in ~1s instead of minutes.
+   * Helper: inbound message → checkAndDraft → wait until the draft's approval request is
+   * open. Returns the running checkAndDraft promise and the open approval.
    */
   async function triggerDraftForContact({
     chatGuid   = `iMessage;-;+${ALLOWED_PHONE}`,
     contact    = `+${ALLOWED_PHONE}`,
     text       = "Hey, what are you up to?",
   } = {}) {
-    const resp = await httpPost(serverPort, "/bluebubbles/message-sent", makeEvent({ chatGuid, contact, text }));
+    const resp = await inbound(makeEvent({ chatGuid, contact, text }));
     expect(resp.body.action).toBe("draft_scheduled");
 
     const pending = ghost.pendingMessages.get(chatGuid);
@@ -533,12 +460,13 @@ describe("Group 2: Draft generation + button registry", () => {
     pending.autoSendMs = ghost.DRAFT_DELAY_MS; // 30s -> Phase B in ~1s (min clamp)
     ghost.pendingMessages.set(chatGuid, pending);
 
-    await ghost.checkAndDraft(chatGuid);
-    await new Promise(r => setTimeout(r, 1400));
+    const run = ghost.checkAndDraft(chatGuid);
+    const approval = await waitForApproval();
+    return { run, approval };
   }
 
   // ── Test 10: draft_generated ────────────────────────────────────────────────
-  test("10. draft_generated: valid message → draft posted to Discord, buttons registered", async () => {
+  test("10. draft_generated: valid message → draft posted to Discord, approval requested", async () => {
     await triggerDraftForContact({ text: "Hey, are you free this weekend?" });
 
     const drafts = ghost.loadPendingDrafts();
@@ -548,31 +476,36 @@ describe("Group 2: Draft generation + button registry", () => {
     expect(draft.draftText).toBeTruthy();
   }, 15000);
 
-  // ── Test 11: button_registry_populated ──────────────────────────────────────
-  test("11. button_registry_populated: button-registry.json has 2 entries (send + cancel)", async () => {
-    await triggerDraftForContact({ text: "Are you coming to the party tonight?" });
-
-    const registry = ghost.loadButtonRegistry();
-    const entries  = Object.values(registry);
-    expect(entries.length).toBeGreaterThanOrEqual(2);
-
-    const sendEntry   = entries.find(e => e.action === "send");
-    const cancelEntry = entries.find(e => e.action === "cancel");
-    expect(sendEntry).toBeDefined();
-    expect(cancelEntry).toBeDefined();
-    expect(sendEntry.draftId).toBe(cancelEntry.draftId);
+  // ── Test 11: approval_card_shape ────────────────────────────────────────────
+  test("11. approval_card_shape: description is the exact draft text; card routes to the ghost channel", async () => {
+    const { approval } = await triggerDraftForContact({ text: "Are you coming to the party tonight?" });
+    const draft = ghost.loadPendingDrafts()[0];
+    expect(approval.opts.description).toBe(draft.draftText);
+    expect(approval.opts.title).toContain(`+${ALLOWED_PHONE}`);
+    expect(approval.opts.channelId).toBe(ghost.GHOST_CHANNEL);
+    expect(approval.opts.timeoutMs).toBeGreaterThanOrEqual(60 * 1000);
+    expect(global.__ghostSendLog).toHaveLength(0); // nothing sends before a decision
   }, 15000);
 
-  // ── Test 12: reusable_buttons ────────────────────────────────────────────────
-  test("12. reusable_buttons: registry entries were created via OC gateway (shortId1/shortId2)", async () => {
-    await triggerDraftForContact({ text: "Can you help me with something?" });
+  // ── Test 12: allow_once_sends ────────────────────────────────────────────────
+  test("12. allow_once_sends: Allow Once sends the exact text to the contact's E.164 handle", async () => {
+    const { run, approval } = await triggerDraftForContact({ text: "Can you help me with something?" });
+    const draftText = approval.opts.description;
+    approval.resolve({ decision: "allow-once" });
+    await run;
+    expect(global.__ghostSendLog).toEqual([{ target: `+${ALLOWED_PHONE}`, message: draftText }]);
+    expect(ghost.loadPendingDrafts()).toHaveLength(0);
+  }, 15000);
 
-    const registry = ghost.loadButtonRegistry();
-    // shortId1 and shortId2 come from the mock Discord GET response (Components v2 structure)
-    expect(registry["shortId1"]).toBeDefined();
-    expect(registry["shortId2"]).toBeDefined();
-    // Both point to the same pending draft
-    expect(registry["shortId1"].draftId).toBe(registry["shortId2"].draftId);
+  // ── Test 12b: no_decision_expires_unsent ─────────────────────────────────────
+  test("12b. no_decision_expires_unsent: an expired card (decision null) never sends", async () => {
+    const { run, approval } = await triggerDraftForContact({ text: "Want to grab lunch this week?" });
+    approval.resolve({ decision: null });
+    await run;
+    expect(global.__ghostSendLog).toHaveLength(0);
+    expect(ghost.loadPendingDrafts()).toHaveLength(0);
+    const feedback = JSON.parse(fs.readFileSync(path.join(dataDir, "ghost-feedback.json"), "utf8"));
+    expect(feedback.some(e => e.decision === "expired")).toBe(true);
   }, 15000);
 });
 
@@ -580,7 +513,7 @@ describe("Group 2: Draft generation + button registry", () => {
 //  GROUP 3 — Button actions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("Group 3: Button actions", () => {
+describe("Group 3: Owner decisions", () => {
   /** Seed a pending draft to data dir and return draftId */
   function seedDraft(overrides = {}) {
     const draftId = "testdraft" + Math.random().toString(36).slice(2, 8);
@@ -588,6 +521,7 @@ describe("Group 3: Button actions", () => {
       draftId,
       messageId:   "discord-msg-abc",
       chatGuid:    `iMessage;-;+${ALLOWED_PHONE}`,
+      chatId:      chatIdFor(`iMessage;-;+${ALLOWED_PHONE}`),
       contact:     `+${ALLOWED_PHONE}`,
       contactName: "Test User",
       draftText:   "Hey! I'll be there around 7pm.",
@@ -600,14 +534,10 @@ describe("Group 3: Button actions", () => {
   }
 
   // ── Test 13: cancel_button ───────────────────────────────────────────────────
-  test("13. cancel_button: POST /action cancel → draft removed, Discord cancel confirmation", async () => {
+  test("13. deny: Deny on the card → draft removed, Discord cancel confirmation", async () => {
     const { draftId } = seedDraft();
 
-    const resp = await httpPost(serverPort, "/action", {
-      draftId,
-      action: "cancel",
-      userId: "KLEIN_USER_123",
-    });
+    const resp = await decide(draftId, "cancel");
     expect(resp.status).toBe(200);
     expect(resp.body.action).toBe("cancelled");
 
@@ -622,38 +552,28 @@ describe("Group 3: Button actions", () => {
   });
 
   // ── Test 14: send_button ─────────────────────────────────────────────────────
-  test("14. send_button: POST /action send → BB MCP called with correct chatGuid + text", async () => {
-    const chatGuid = `iMessage;-;+${ALLOWED_PHONE}`;
+  test("14. allow_once: Allow Once → native send to the contact's handle with the draft text", async () => {
     const draftText = "Yeah, sounds good! I'll be there.";
-    const { draftId } = seedDraft({ chatGuid, draftText });
+    const { draftId } = seedDraft({ draftText });
 
-    const resp = await httpPost(serverPort, "/action", {
-      draftId,
-      action: "send",
-      userId: "KLEIN_USER_123",
-    });
+    const resp = await decide(draftId, "send");
     expect(resp.status).toBe(200);
-    expect(resp.body.action).toBe("sent");
+    expect(resp.body.action).toBe("handled");
 
-    // BB send was called
-    await new Promise(r => setTimeout(r, 50));
-    expect(global.__ghostBBLog.length).toBeGreaterThan(0);
-    const bbCall = global.__ghostBBLog[0];
-    expect(bbCall.chat_guid).toBe(chatGuid);
-    expect(bbCall.message).toBe(draftText);
+    expect(global.__ghostSendLog).toEqual([{ target: `+${ALLOWED_PHONE}`, message: draftText }]);
   });
 
-  // ── Test 15: send_wrong_user ──────────────────────────────────────────────────
-  test("15. send_wrong_user: POST /action from non-Klein userId → 403", async () => {
-    const { draftId } = seedDraft();
+  // ── Test 15: late_allow_after_cancel ─────────────────────────────────────────
+  // A live card cannot be withdrawn. If Klein answered by hand (is_from_me row), a later
+  // Allow Once on the old card must not send.
+  test("15. late_allow_after_klein_replied: Allow Once after Klein's own reply → not sent", async () => {
+    const { draftId, draft } = seedDraft();
+    const out = await inbound(makeEvent({ isFromMe: true, text: "omw" }));
+    expect(out.body.action).toBe("draft_cancelled");
 
-    const resp = await httpPost(serverPort, "/action", {
-      draftId,
-      action: "send",
-      userId: "WRONG_USER_999",
-    });
-    expect(resp.status).toBe(403);
-    expect(resp.body.ok).toBe(false);
+    const r = await ghost.resolveDraftDecision(draftId, "allow-once", draft.draftText);
+    expect(r.action).toBe("stale");
+    expect(global.__ghostSendLog).toHaveLength(0);
   });
 });
 
@@ -667,14 +587,14 @@ describe("Group 4: Collision detection", () => {
     const chatGuid = `iMessage;-;+${ALLOWED_PHONE}`;
 
     // Incoming message → queues draft (30s debounce)
-    const inResp = await httpPost(serverPort, "/bluebubbles/message-sent",
+    const inResp = await inbound(
       makeEvent({ chatGuid, text: "What time should we meet?" })
     );
     expect(inResp.body.action).toBe("draft_scheduled");
     expect(ghost.pendingMessages.has(chatGuid)).toBe(true);
 
     // Klein replies BEFORE the 30s timer fires (outgoing message)
-    const outResp = await httpPost(serverPort, "/bluebubbles/message-sent",
+    const outResp = await inbound(
       makeEvent({ chatGuid, contact: `+15559999999`, isFromMe: true, text: "Let's say 6pm?" })
     );
     expect(outResp.body.action).toBe("draft_cancelled");
@@ -688,7 +608,7 @@ describe("Group 4: Collision detection", () => {
     const chatGuid  = `iMessage;-;+${ALLOWED_PHONE}`;
     const arrivedAt = Date.now();
 
-    const resp = await httpPost(serverPort, "/bluebubbles/message-sent",
+    const resp = await inbound(
       makeEvent({ chatGuid, text: "Are you free tomorrow?" })
     );
     expect(resp.body.action).toBe("draft_scheduled");
@@ -739,75 +659,55 @@ describe("Group 4: Collision detection", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("Group 5: Unknown contact flow", () => {
-  /** Seed a dummy pending draft so doReactionCheck doesn't early-return */
-  function seedDummyDraft() {
-    ghost.savePendingDrafts([{
-      draftId:     "dummy-for-reaction-check",
-      messageId:   "discord-msg-dummy",
-      chatGuid:    `iMessage;-;+${ALLOWED_PHONE}`,
-      contact:     `+${ALLOWED_PHONE}`,
-      contactName: "Test User",
-      draftText:   "test draft",
-      arrivedAt:   new Date().toISOString(),
-      postedAt:    new Date().toISOString(),
-    }]);
-  }
-
   // ── Test 19: unknown_approve ──────────────────────────────────────────────────
-  test("19. unknown_approve: approve_{phone} button click → phone added to allowlist", async () => {
+  test("19. unknown_approve: Allow Once on the unknown-contact card → phone added to allowlist", async () => {
     const phone = UNKNOWN_PHONE;
-    seedDummyDraft();  // doReactionCheck needs ≥1 draft to proceed past early return
-
-    // Write button-actions file as if OC registered an approve click
-    fs.writeFileSync(
-      path.join(dataDir, "ghost-button-actions.json"),
-      JSON.stringify([{ custom_id: `approve_${phone}`, ts: new Date().toISOString() }])
-    );
-
-    await ghost.doReactionCheck();
-
-    // Phone should now be in the allowlist
+    const p = ghost.postUnknownAlert(phone, "hey it's sam from class", `+${phone}`, { source: "unknown" });
+    const approval = await waitForApproval();
+    approval.resolve({ decision: "allow-once" });
+    expect((await p).action).toBe("approved");
     expect(ghost.isAllowed(phone)).toBe(true);
+    expect(ghost.pendingUnknownAlerts.has(phone)).toBe(false);
   });
 
   // ── Test 20: unknown_deny ─────────────────────────────────────────────────────
-  test("20. unknown_deny: deny_{phone} button click → phone added to denylist", async () => {
+  test("20. unknown_deny: Deny on the unknown-contact card → phone added to denylist", async () => {
     const phone = "15557777777";
-    seedDummyDraft();
-
-    fs.writeFileSync(
-      path.join(dataDir, "ghost-button-actions.json"),
-      JSON.stringify([{ custom_id: `deny_${phone}`, ts: new Date().toISOString() }])
-    );
-
-    await ghost.doReactionCheck();
-
+    const p = ghost.postUnknownAlert(phone, "hello?", `+${phone}`, { source: "unknown" });
+    (await waitForApproval()).resolve({ decision: "deny" });
+    expect((await p).action).toBe("denied");
     expect(ghost.isDenied(phone)).toBe(true);
   });
 
-  // ── Test 21: unknown_auto_deny_4h ─────────────────────────────────────────────
-  test("21. unknown_auto_deny_4h: pending alert >4h with no click → auto-denied", async () => {
+  // ── Test 21: unknown_auto_deny ────────────────────────────────────────────────
+  test("21. unknown_auto_deny: MAX_UNKNOWN_ALERTS unanswered cards → auto-denied", async () => {
     const phone = "15556666666";
-    const fiveHoursAgo = Date.now() - 5 * 60 * 60 * 1000;
-
-    // Manually insert into pendingUnknownAlerts as if it was posted 5h ago
-    ghost.pendingUnknownAlerts.set(phone, {
-      messageId:   "discord-alert-msg",
-      postedAt:    fiveHoursAgo,
-      alertedAt:   fiveHoursAgo,   // ← sweepStaleUnknownAlerts checks alertedAt
-      phone,
-      messageText: "Hey, how are you?",
-      contactName: `+${phone}`,
-      source:      "unknown",
-      enrichment:  null,
-    });
-
-    await ghost.sweepStaleUnknownAlerts();
-
-    // Phone should be in denylist
+    let last;
+    for (let i = 1; i <= ghost.MAX_UNKNOWN_ALERTS; i++) {
+      const p = ghost.postUnknownAlert(phone, `message ${i}`, `+${phone}`, { source: "unknown", alertCount: i });
+      (await waitForApproval(i)).resolve({ decision: null });
+      last = await p;
+      if (i < ghost.MAX_UNKNOWN_ALERTS) {
+        expect(last.action).toBe("expired");
+        expect(ghost.isDenied(phone)).toBe(false);
+      }
+    }
+    expect(last.action).toBe("auto_denied");
     expect(ghost.isDenied(phone)).toBe(true);
-    // Entry should be removed from pending alerts
     expect(ghost.pendingUnknownAlerts.has(phone)).toBe(false);
+  });
+
+  // ── Test 21b: unknown_coalesce ────────────────────────────────────────────────
+  test("21b. unknown_coalesce: a second message while a card is open joins it, no second card", async () => {
+    const chatGuid = `iMessage;-;+${UNKNOWN_PHONE}`;
+    const r1 = await inbound(makeEvent({ chatGuid, contact: `+${UNKNOWN_PHONE}`, text: "Hi, is this Klein?" }));
+    expect(r1.body.action).toBe("unknown_contact_alert");
+    await waitForApproval();
+    const r2 = await inbound(makeEvent({ chatGuid, contact: `+${UNKNOWN_PHONE}`, text: "It's Jordan from the lab" }));
+    expect(r2.body.action).toBe("unknown_contact_alert");
+    await new Promise(r => setTimeout(r, 50));
+    expect(global.__ghostApprovals).toHaveLength(1);
+    expect(ghost.pendingUnknownAlerts.get(UNKNOWN_PHONE).recentQuotes).toEqual(["Hi, is this Klein?", "It's Jordan from the lab"]);
   });
 });
 
@@ -901,12 +801,6 @@ describe("Group 7: Cannot-answer gate + Discord format", () => {
     nock.cleanAll();
     nock.enableNetConnect(`127.0.0.1:${serverPort}`);
 
-    // OC Gateway
-    nock("https://127.0.0.1:18789")
-      .persist()
-      .post("/tools/invoke")
-      .reply(200, { ok: true, result: {} });
-
     // OpenRouter → CANNOT_ANSWER
     nock("https://openrouter.ai")
       .persist()
@@ -919,14 +813,6 @@ describe("Group 7: Cannot-answer gate + Discord format", () => {
       .post(/embedContent/)
       .replyWithError("not-available-in-tests");
 
-    // BB direct HTTP
-    nock(`http://127.0.0.1:19234`)
-      .persist()
-      .get(/\/api\/v1\//)
-      .reply(200, { status: 200, data: [] })
-      .post(/\/api\/v1\//)
-      .reply(200, { status: "200", message: "Message sent successfully" });
-
     // Spark offline
     nock("http://127.0.0.1:18080")
       .persist()
@@ -934,7 +820,7 @@ describe("Group 7: Cannot-answer gate + Discord format", () => {
       .replyWithError("ECONNREFUSED");
 
     // Post the webhook + trigger checkAndDraft
-    const resp = await httpPost(serverPort, "/bluebubbles/message-sent", makeEvent({
+    const resp = await inbound(makeEvent({
       chatGuid,
       contact:  `+${ALLOWED_PHONE}`,
       text:     "What time are we meeting on Friday?",
@@ -1043,13 +929,13 @@ describe("Group 7: Cannot-answer gate + Discord format", () => {
     const chatGuid = `iMessage;-;+${ALLOWED_PHONE}`;
 
     // First message
-    const resp1 = await httpPost(serverPort, "/bluebubbles/message-sent",
+    const resp1 = await inbound(
       makeEvent({ chatGuid, text: "hey" })
     );
     expect(resp1.body.action).toBe("draft_scheduled");
 
     // Second message 5 seconds later — should debounce (replace the first)
-    const resp2 = await httpPost(serverPort, "/bluebubbles/message-sent",
+    const resp2 = await inbound(
       makeEvent({ chatGuid, text: "you there?" })
     );
     expect(resp2.body.action).toBe("draft_scheduled");
@@ -1063,30 +949,29 @@ describe("Group 7: Cannot-answer gate + Discord format", () => {
   // ── Test 28: group_chat_embedded_chats ────────────────────────────────────
   // BB sends individual handle but chats array reveals it came from a group.
   test("28. group_chat_embedded_chats: individual handle but chats array has group → blocked", async () => {
-    const resp = await httpPost(serverPort, "/bluebubbles/message-sent", {
-      type: "new-message",
-      data: {
-        isFromMe: false,
-        chatGuid: `iMessage;-;+${ALLOWED_PHONE}`,
-        handle: { address: `+${ALLOWED_PHONE}` },
-        text: "yo what's good",
-        dateCreated: Date.now(),
-        chats: [{ guid: "iMessage;+;chat999888", participants: [
-          { address: `+${ALLOWED_PHONE}` },
-          { address: "+15559999999" },
-          { address: "+15559999999" },
-        ]}],
-      },
+    // imsg marks groups with is_group; this keeps the older embedded-chats rule covered.
+    const resp = await inbound({
+      ...makeEvent({ text: "yo what's good" }),
+      chats: [{ guid: "iMessage;+;chat999888", participants: [
+        { address: `+${ALLOWED_PHONE}` },
+        { address: "+15559999999" },
+        { address: "+15559999999" },
+      ]}],
     });
+    expect(resp.body.action).toBe("ignored");
+    expect(resp.body.reason).toBe("group_chat");
+  }, 10000);
+
+  // ── Test 28b: imsg_is_group ───────────────────────────────────────────────
+  test("28b. imsg_is_group: is_group on a ;-;-looking chat → blocked", async () => {
+    const resp = await inbound({ ...makeEvent({ text: "who's coming saturday" }), isGroup: true });
     expect(resp.body.action).toBe("ignored");
     expect(resp.body.reason).toBe("group_chat");
   }, 10000);
 
   // ── Test 29: outgoing_cancels_posted_draft ────────────────────────────────
   // Fix 2b: Klein replies AFTER the draft is already posted to Discord.
-  // The outgoing webhook should cancel the draft from ghost-pending-drafts.json.
-  // Previously, only the in-memory pendingMessages was cleared; the posted draft
-  // would sit in the JSON file and auto-send anyway.
+  // Klein's own is_from_me row must cancel the posted draft in ghost-pending-drafts.json.
   test("29. outgoing_cancels_posted_draft: Klein replies after draft posted → draft removed from JSON", async () => {
     const chatGuid  = `iMessage;-;+${ALLOWED_PHONE}`;
     const arrivedAt = Date.now();
@@ -1107,7 +992,7 @@ describe("Group 7: Cannot-answer gate + Discord format", () => {
     expect(ghost.loadPendingDrafts().length).toBe(1);
 
     // Klein sends an outgoing message to this contact (after the draft was posted)
-    const resp = await httpPost(serverPort, "/bluebubbles/message-sent",
+    const resp = await inbound(
       makeEvent({ chatGuid, isFromMe: true, text: "Yeah I'll be there" })
     );
 
@@ -1130,6 +1015,7 @@ describe("Group 8: Rate limiting, backoff, security gates", () => {
     const draft = {
       draftId,
       chatGuid:    `iMessage;-;+${ALLOWED_PHONE}`,
+      chatId:      chatIdFor(`iMessage;-;+${ALLOWED_PHONE}`),
       contact:     `+${ALLOWED_PHONE}`,
       contactName: "Test User",
       draftText:   "Sounds good, see you then!",
@@ -1146,22 +1032,22 @@ describe("Group 8: Rate limiting, backoff, security gates", () => {
     const { draftId: id1 } = seedAllowedDraft();
 
     // First send — passes
-    const r1 = await httpPost(serverPort, "/action", { draftId: id1, action: "send", userId: "KLEIN_USER_123" });
+    const r1 = await decide(id1, "send");
     expect(r1.status).toBe(200);
     await new Promise(r => setTimeout(r, 100));
-    const bbAfterFirst = global.__ghostBBLog.length;
+    const bbAfterFirst = global.__ghostSendLog.length;
     expect(bbAfterFirst).toBeGreaterThan(0);
 
     // Second send to same contact immediately — must be blocked by rate gate
     const { draftId: id2 } = seedAllowedDraft();
-    global.__ghostBBLog = [];
+    global.__ghostSendLog = [];
     global.__ghostDiscordLog = [];
-    const r2 = await httpPost(serverPort, "/action", { draftId: id2, action: "send", userId: "KLEIN_USER_123" });
+    const r2 = await decide(id2, "send");
     expect(r2.status).toBe(200);
     await new Promise(r => setTimeout(r, 100));
 
     // BB send must NOT have been called a second time
-    expect(global.__ghostBBLog).toHaveLength(0);
+    expect(global.__ghostSendLog).toHaveLength(0);
 
     // Discord must have been notified about the block
     const discordNotified = global.__ghostDiscordLog.some(d => d.method === "POST_OR_GET");
@@ -1169,17 +1055,17 @@ describe("Group 8: Rate limiting, backoff, security gates", () => {
   }, 15000);
 
   // ── Test 31: drift_marker_blocked ───────────────────────────────────────
-  test("31. drift_marker_blocked: draft containing [KleinClaw-Ghost] prefix → not sent to BB", async () => {
+  test("31. drift_marker_blocked: draft containing [KleinClaw-Ghost] prefix → not sent", async () => {
     const { draftId } = seedAllowedDraft({
       draftText: "[KleinClaw-Ghost] Read: lines 1-50 from SOUL.md",
     });
 
-    const resp = await httpPost(serverPort, "/action", { draftId, action: "send", userId: "KLEIN_USER_123" });
+    const resp = await decide(draftId, "send");
     expect(resp.status).toBe(200);
     await new Promise(r => setTimeout(r, 100));
 
     // BB send must not have been called — drift marker should block it
-    expect(global.__ghostBBLog).toHaveLength(0);
+    expect(global.__ghostSendLog).toHaveLength(0);
   }, 10000);
 
   // ── Test 32: drift_marker_variants ──────────────────────────────────────
@@ -1195,28 +1081,23 @@ describe("Group 8: Rate limiting, backoff, security gates", () => {
     for (const leakyText of leakPatterns) {
       resetState();
       const { draftId } = seedAllowedDraft({ draftText: leakyText });
-      await httpPost(serverPort, "/action", { draftId, action: "send", userId: "KLEIN_USER_123" });
+      await decide(draftId, "send");
       await new Promise(r => setTimeout(r, 100));
-      expect(global.__ghostBBLog).toHaveLength(0);
+      expect(global.__ghostSendLog).toHaveLength(0);
     }
   }, 20000);
 
-  // ── Test 33: action_missing_userid ──────────────────────────────────────
-  test("33. action_missing_userid: POST /action with no userId → 403 when KLEIN_DISCORD_USER_ID is set", async () => {
+  // ── Test 33: approved_text_mismatch ─────────────────────────────────────
+  test("33. approved_text_mismatch: an approval for different text than the draft → not sent", async () => {
     const { draftId } = seedAllowedDraft();
-
-    const resp = await httpPost(serverPort, "/action", {
-      draftId,
-      action: "send",
-      // userId intentionally omitted
-    });
-
-    expect(resp.status).toBe(403);
-    expect(resp.body.ok).toBe(false);
+    const r = await ghost.resolveDraftDecision(draftId, "allow-once", "something else entirely");
+    expect(r.action).toBe("text_mismatch");
+    expect(global.__ghostSendLog).toHaveLength(0);
+    expect(ghost.loadPendingDrafts()).toHaveLength(0);
   }, 10000);
 
   // ── Test 34: dm_recipient_allowlist_gate ────────────────────────────────
-  test("34. dm_recipient_allowlist_gate: draft targeting non-allowlisted phone → blocked at bbSendMessage", async () => {
+  test("34. dm_recipient_allowlist_gate: draft targeting non-allowlisted phone → blocked before the wire", async () => {
     const nonAllowedGuid = `iMessage;-;+19995550000`;
     const { draftId } = seedAllowedDraft({
       chatGuid:    nonAllowedGuid,
@@ -1225,12 +1106,12 @@ describe("Group 8: Rate limiting, backoff, security gates", () => {
       draftText:   "Hey there!",
     });
 
-    const resp = await httpPost(serverPort, "/action", { draftId, action: "send", userId: "KLEIN_USER_123" });
+    const resp = await decide(draftId, "send");
     expect(resp.status).toBe(200);
     await new Promise(r => setTimeout(r, 100));
 
     // BB send must not have been called for an unlisted number
-    expect(global.__ghostBBLog).toHaveLength(0);
+    expect(global.__ghostSendLog).toHaveLength(0);
   }, 10000);
 
   // ── Test 35: backoff_escalation_discord_warn ────────────────────────────
@@ -1249,7 +1130,7 @@ describe("Group 8: Rate limiting, backoff, security gates", () => {
 
     const { draftId } = seedAllowedDraft();
     global.__ghostDiscordLog = [];
-    await httpPost(serverPort, "/action", { draftId, action: "send", userId: "KLEIN_USER_123" });
+    await decide(draftId, "send");
     await new Promise(r => setTimeout(r, 150));
 
     // Backoff escalated → Discord warned

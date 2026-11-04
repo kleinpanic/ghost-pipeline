@@ -3,11 +3,11 @@
 /**
  * sendToggleStyleGate.test.js — 90-03 additive chokepoint layers (RED→GREEN)
  *
- * Pins the two structural layers added INSIDE bbSendMessage (G10) per
+ * Pins the two structural layers added INSIDE the sendIMessage chokepoint (G10) per
  * 70-GHOST-RESEARCH §5b + GHOST-TOGGLE addendum and 90-RESEARCH AUTOSEND-FAILCLOSED:
  *
  *   Layer 1 — fail-closed master send toggle:
- *     absent / off / unparseable state ⇒ bbSendMessage returns false, ZERO wire
+ *     absent / off / unparseable state ⇒ sendIMessage returns false, ZERO wire
  *     calls, even for an otherwise-valid owner-allowlisted send.
  *     Enabled only by env GHOST_SEND_ENABLED=1|true or
  *     {"enabled": true} in data/ghost-send-enabled.json (re-read every send).
@@ -18,6 +18,9 @@
  *
  *   Preservation — with both new layers passing, every pre-existing gate
  *     (drift denylist G3, recipient allowlist G2) still blocks as before.
+ *
+ *   NAT-25 (2026-11-04): the wire is the native imessage channel, and the recipient
+ *     check is mandatory: only an allowlisted E.164 handle (or the owner) is sent to.
  */
 
 const fs   = require("fs");
@@ -27,8 +30,6 @@ const os   = require("os");
 // ─── Temp workspace (must precede require of ghost.js) ──────────────────────
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "ghost-toggle-"));
 process.env.HOME    = tmpHome;
-process.env.BB_HOST = "127.0.0.1";
-process.env.BB_PORT = "19234";
 delete process.env.GHOST_SEND_ENABLED; // fail-closed default under test
 
 const ghostWsDir = path.join(tmpHome, ".openclaw", "workspace-ghost");
@@ -47,63 +48,24 @@ fs.writeFileSync(
   ].join("\n") + "\n"
 );
 
-// ─── Mock child_process — capture every wire attempt ────────────────────────
-global.__toggleSpawnLog = [];
-global.__toggleBBLog    = [];
-
-jest.mock("child_process", () => {
-  const { EventEmitter } = require("events");
-  const actual = jest.requireActual("child_process");
-
-  const createChild = (stdoutData, exitCode = 0) => {
-    const child  = new EventEmitter();
-    child.stdout = new EventEmitter();
-    child.stderr = new EventEmitter();
-    child.stdin  = { write: jest.fn(), end: jest.fn() };
-    setImmediate(() => {
-      child.stdout.emit("data", typeof stdoutData === "string" ? stdoutData : JSON.stringify(stdoutData));
-      child.emit("close", exitCode);
-    });
-    return child;
-  };
-
-  return {
-    ...actual,
-    spawn: jest.fn((cmd, args) => {
-      global.__toggleSpawnLog.push({ cmd, args: [...(args || [])] });
-      if (cmd === "mcporter") {
-        const callIdx     = args.indexOf("call");
-        const tool        = callIdx !== -1 ? (args[callIdx + 1] || "") : "";
-        const argsJsonIdx = args.indexOf("--args");
-        let toolArgs = {};
-        if (argsJsonIdx !== -1) {
-          try { toolArgs = JSON.parse(args[argsJsonIdx + 1]); } catch {}
-        }
-        if (tool === "bluebubbles.bb_send_message") {
-          global.__toggleBBLog.push({ chat_guid: toolArgs.chat_guid, message: toolArgs.message });
-          return createChild({ status: 200, message: "sent" });
-        }
-        return createChild({});
-      }
-      return createChild("{}");
-    }),
-    spawnSync: actual.spawnSync,
-  };
-});
-
 const ghost = require("../../src/ghost.js");
 
+// ─── Capture every wire attempt (native send replaced by a recorder) ─────────
+global.__toggleWireLog = [];
+ghost.setTransport({
+  sendIMessage: async (target, text) => { global.__toggleWireLog.push({ target, text }); return { ok: true }; },
+});
+
 const TOGGLE_FILE = path.join(dataDir, "ghost-send-enabled.json");
-const CHAT_GUID   = `iMessage;-;+${ALLOWED_PHONE}`;
+const TARGET      = `+${ALLOWED_PHONE}`;
 const CASUAL_TEXT = "yeah for sure, running a bit late tho";
 
 function wireCalls() {
-  return global.__toggleBBLog.length;
+  return global.__toggleWireLog.length;
 }
 
 beforeEach(() => {
-  global.__toggleSpawnLog = [];
-  global.__toggleBBLog    = [];
+  global.__toggleWireLog = [];
   delete process.env.GHOST_SEND_ENABLED;
   try { fs.unlinkSync(TOGGLE_FILE); } catch {}
 });
@@ -113,43 +75,43 @@ beforeEach(() => {
 // ═══════════════════════════════════════════════════════════════════════════
 describe("fail-closed send toggle", () => {
   test("toggle_absent_blocks: no env, no state file → blocked, zero wire calls", async () => {
-    const ok = await ghost.bbSendMessage(CHAT_GUID, CASUAL_TEXT);
+    const ok = await ghost.sendIMessage(TARGET, CASUAL_TEXT);
     expect(ok).toBe(false);
     expect(wireCalls()).toBe(0);
   });
 
   test("toggle_file_disabled_blocks: {\"enabled\": false} → blocked", async () => {
     fs.writeFileSync(TOGGLE_FILE, JSON.stringify({ enabled: false }));
-    const ok = await ghost.bbSendMessage(CHAT_GUID, CASUAL_TEXT);
+    const ok = await ghost.sendIMessage(TARGET, CASUAL_TEXT);
     expect(ok).toBe(false);
     expect(wireCalls()).toBe(0);
   });
 
   test("toggle_file_corrupt_blocks: unparseable state file → blocked (fail-closed)", async () => {
     fs.writeFileSync(TOGGLE_FILE, "{not json!!");
-    const ok = await ghost.bbSendMessage(CHAT_GUID, CASUAL_TEXT);
+    const ok = await ghost.sendIMessage(TARGET, CASUAL_TEXT);
     expect(ok).toBe(false);
     expect(wireCalls()).toBe(0);
   });
 
   test("toggle_file_wrong_shape_blocks: {\"enabled\": \"yes\"} (non-boolean) → blocked", async () => {
     fs.writeFileSync(TOGGLE_FILE, JSON.stringify({ enabled: "yes" }));
-    const ok = await ghost.bbSendMessage(CHAT_GUID, CASUAL_TEXT);
+    const ok = await ghost.sendIMessage(TARGET, CASUAL_TEXT);
     expect(ok).toBe(false);
     expect(wireCalls()).toBe(0);
   });
 
   test("toggle_env_enables: GHOST_SEND_ENABLED=1 → send proceeds through gates to wire", async () => {
     process.env.GHOST_SEND_ENABLED = "1";
-    const ok = await ghost.bbSendMessage(CHAT_GUID, CASUAL_TEXT);
+    const ok = await ghost.sendIMessage(TARGET, CASUAL_TEXT);
     expect(ok).toBe(true);
     expect(wireCalls()).toBe(1);
-    expect(global.__toggleBBLog[0].chat_guid).toBe(CHAT_GUID);
+    expect(global.__toggleWireLog[0]).toEqual({ target: TARGET, text: CASUAL_TEXT });
   });
 
   test("toggle_file_enables: {\"enabled\": true} → send proceeds (runtime, no restart)", async () => {
     fs.writeFileSync(TOGGLE_FILE, JSON.stringify({ enabled: true }));
-    const ok = await ghost.bbSendMessage(CHAT_GUID, CASUAL_TEXT);
+    const ok = await ghost.sendIMessage(TARGET, CASUAL_TEXT);
     expect(ok).toBe(true);
     expect(wireCalls()).toBe(1);
   });
@@ -186,7 +148,7 @@ describe("positive style allowlist", () => {
   test.each(BLOCKED_CASES)(
     "style_blocked_%s: passes G3 denylist but fails style allowlist → blocked, zero wire",
     async (_name, text) => {
-      const ok = await ghost.bbSendMessage(CHAT_GUID, text);
+      const ok = await ghost.sendIMessage(TARGET, text);
       expect(ok).toBe(false);
       expect(wireCalls()).toBe(0);
     }
@@ -202,7 +164,7 @@ describe("positive style allowlist", () => {
   test.each(ALLOWED_CASES)(
     "style_allowed_%s: casual-register text passes the new layer",
     async (_name, text) => {
-      const ok = await ghost.bbSendMessage(CHAT_GUID, text);
+      const ok = await ghost.sendIMessage(TARGET, text);
       expect(ok).toBe(true);
       expect(wireCalls()).toBe(1);
     }
@@ -224,19 +186,42 @@ describe("gate preservation with new layers passing", () => {
   beforeEach(() => { process.env.GHOST_SEND_ENABLED = "1"; });
 
   test("drift_marker_still_blocked: G3 denylist fires with toggle enabled", async () => {
-    const ok = await ghost.bbSendMessage(CHAT_GUID, "[KleinClaw-Ghost] internal text");
+    const ok = await ghost.sendIMessage(TARGET, "[KleinClaw-Ghost] internal text");
     expect(ok).toBe(false);
     expect(wireCalls()).toBe(0);
   });
 
   test("recipient_allowlist_still_blocked: G2 fires for non-allowlisted DM", async () => {
-    const ok = await ghost.bbSendMessage("iMessage;-;+15559999999", CASUAL_TEXT);
+    const ok = await ghost.sendIMessage("+15559999999", CASUAL_TEXT);
     expect(ok).toBe(false);
     expect(wireCalls()).toBe(0);
   });
 
+  test.each([
+    ["chat guid", `iMessage;-;+${ALLOWED_PHONE}`],
+    ["any;-; guid", `any;-;+${ALLOWED_PHONE}`],
+    ["imsg chat id", "42"],
+    ["email handle", "someone@example.com"],
+    ["digits without +", ALLOWED_PHONE],
+  ])("non_e164_target_blocked (%s): fails closed, zero wire", async (_label, target) => {
+    const ok = await ghost.sendIMessage(target, CASUAL_TEXT);
+    expect(ok).toBe(false);
+    expect(wireCalls()).toBe(0);
+  });
+
+  test("native_send_failure_returns_false: channel unavailable → false", async () => {
+    ghost.setTransport({ sendIMessage: async () => ({ ok: false, error: "Channel is unavailable: imessage" }) });
+    try {
+      expect(await ghost.sendIMessage(TARGET, CASUAL_TEXT)).toBe(false);
+    } finally {
+      ghost.setTransport({
+        sendIMessage: async (target, text) => { global.__toggleWireLog.push({ target, text }); return { ok: true }; },
+      });
+    }
+  });
+
   test("empty_guard_still_blocked: empty outbound never reaches wire", async () => {
-    const ok = await ghost.bbSendMessage(CHAT_GUID, "   ");
+    const ok = await ghost.sendIMessage(TARGET, "   ");
     expect(ok).toBe(false);
     expect(wireCalls()).toBe(0);
   });

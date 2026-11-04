@@ -1,7 +1,8 @@
 "use strict";
 /**
  * Tests for the three bug fixes:
- *   BUG-1b — shortId registry lookup (OC-managed button clicks)
+ *   (BUG-1b, the button shortId registry, was removed with the buttons in NAT-25: owner
+ *    decisions now come from native plugin approvals.)
  *   BUG-2  — timestamp normalization (seconds vs ms)
  *   BUG-3  — Klein recently active gate
  */
@@ -17,12 +18,7 @@ fs.mkdirSync(path.join(tmpDir, ".openclaw", "data"), { recursive: true });
 fs.mkdirSync(path.join(tmpDir, ".openclaw", "workspace-ghost", "governance"), { recursive: true });
 fs.mkdirSync(path.join(tmpDir, ".openclaw", "workspace-ghost", "memory", "contacts"), { recursive: true });
 
-const {
-  normalizeTs,
-  loadButtonRegistry,
-  saveButtonRegistry,
-  BUTTON_REGISTRY_FILE,
-} = require("../../src/ghost");
+const { normalizeTs } = require("../../src/ghost");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BUG-2 — normalizeTs: timestamp normalization (seconds ↔ ms)
@@ -69,79 +65,6 @@ describe("normalizeTs — BUG-2: timestamp normalization", () => {
     const arrivedAt = Date.now();
     const tsSec     = Math.floor((arrivedAt - 60000) / 1000); // 1 min BEFORE arrival
     expect(normalizeTs(tsSec)).toBeLessThan(arrivedAt);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BUG-1b — shortId registry (loadButtonRegistry / saveButtonRegistry)
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("button registry — BUG-1b: shortId → draftId lookup", () => {
-  const registryPath = path.join(tmpDir, ".openclaw", "data", "ghost-button-registry.json");
-
-  beforeEach(() => {
-    // Clean up registry before each test
-    try { fs.unlinkSync(registryPath); } catch {}
-  });
-
-  test("loadButtonRegistry returns {} when file missing", () => {
-    const reg = loadButtonRegistry();
-    expect(reg).toEqual({});
-  });
-
-  test("saveButtonRegistry writes shortId entries", () => {
-    const reg = { abc123: { draftId: "dead1234", action: "send", chatGuid: "iMessage;-;+1234567890", contact: "1234567890", contactName: "Alice", postedAt: new Date().toISOString() } };
-    saveButtonRegistry(reg);
-    const loaded = loadButtonRegistry();
-    expect(loaded.abc123).toBeDefined();
-    expect(loaded.abc123.draftId).toBe("dead1234");
-    expect(loaded.abc123.action).toBe("send");
-  });
-
-  test("saveButtonRegistry trims entries older than 24h", () => {
-    const old   = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(); // 25h ago
-    const fresh = new Date().toISOString();
-    const reg   = {
-      stale: { draftId: "stale000", action: "send", postedAt: old },
-      fresh: { draftId: "fresh111", action: "cancel", postedAt: fresh },
-    };
-    saveButtonRegistry(reg);
-    const loaded = loadButtonRegistry();
-    expect(loaded.stale).toBeUndefined(); // trimmed
-    expect(loaded.fresh).toBeDefined();    // kept
-  });
-
-  test("saveButtonRegistry keeps entries with no postedAt (safety net)", () => {
-    const reg = { noTs: { draftId: "abc00000", action: "send" } }; // no postedAt
-    saveButtonRegistry(reg);
-    const loaded = loadButtonRegistry();
-    expect(loaded.noTs).toBeDefined();
-  });
-
-  test("round-trip: save then load preserves all fields", () => {
-    const entry = {
-      draftId:     "1a2b3c4d",
-      action:      "cancel",
-      contactName: "Bob",
-      chatGuid:    "iMessage;-;+15551234567",
-      contact:     "15551234567",
-      postedAt:    new Date().toISOString(),
-    };
-    saveButtonRegistry({ xyz789: entry });
-    const loaded = loadButtonRegistry();
-    expect(loaded.xyz789).toMatchObject(entry);
-  });
-
-  test("multiple shortIds stored independently", () => {
-    const now = new Date().toISOString();
-    saveButtonRegistry({
-      sendBtn:   { draftId: "aabbccdd", action: "send",   postedAt: now },
-      cancelBtn: { draftId: "aabbccdd", action: "cancel", postedAt: now },
-    });
-    const loaded = loadButtonRegistry();
-    expect(loaded.sendBtn.action).toBe("send");
-    expect(loaded.cancelBtn.action).toBe("cancel");
-    expect(loaded.sendBtn.draftId).toBe(loaded.cancelBtn.draftId);
   });
 });
 
