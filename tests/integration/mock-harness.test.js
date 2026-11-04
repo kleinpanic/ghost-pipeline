@@ -258,7 +258,8 @@ function resetState() {
     path.join(dataDir, "ghost-denylist.json"),
     path.join(dataDir, "ghost-outbound-rate.json"),
     path.join(dataDir, "ghost-outbound-backoff.json"),
-    path.join(dataDir, "ghost-pause.json"),
+    path.join(dataDir, "ghost-paused.json"),
+    path.join(dataDir, "ghost-event-dedup.json"),
   ];
   for (const f of files) { try { fs.unlinkSync(f); } catch {} }
   // Restore CONTACTS.md to known-good state
@@ -405,6 +406,24 @@ describe("Group 1: Preflight gates", () => {
     expect(approval.opts.timeoutMs).toBe(ghost.UNKNOWN_APPROVAL_MS);
     expect(ghost.pendingUnknownAlerts.has(UNKNOWN_PHONE)).toBe(true);
     expect(ghost.isAllowed(UNKNOWN_PHONE)).toBe(false);
+  });
+
+  // ── Test 7b: paused_is_quiet ────────────────────────────────────────────────
+  // With live inbound, a paused ghost must not ask about unknown numbers or post alerts.
+  test("7b. paused_is_quiet: paused → unknown number gets no card, no Discord post, no queue", async () => {
+    fs.writeFileSync(path.join(dataDir, "ghost-paused.json"), JSON.stringify({ paused: true }));
+    try {
+      const chatGuid = `iMessage;-;+${UNKNOWN_PHONE}`;
+      const r = await inbound(makeEvent({ chatGuid, contact: `+${UNKNOWN_PHONE}`, text: "Hi, is this Klein?" }));
+      expect(r.body.action).toBe("paused");
+      await new Promise(res => setTimeout(res, 50));
+      expect(global.__ghostApprovals).toHaveLength(0);
+      expect(global.__ghostDiscordLog).toHaveLength(0);
+      expect(ghost.pendingUnknownAlerts.size).toBe(0);
+      expect(ghost.pendingMessages.size).toBe(0);
+    } finally {
+      fs.unlinkSync(path.join(dataDir, "ghost-paused.json"));
+    }
   });
 
   // ── Test 8: group_chat ──────────────────────────────────────────────────────

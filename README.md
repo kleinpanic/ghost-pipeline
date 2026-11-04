@@ -46,7 +46,10 @@ a failed send is reported, never retried.
 
 ### Dependencies
 - **A Mac signed into Messages with `imsg`** (Homebrew), reachable as the `imsg-ssh` wrapper's
-  host. The SSH context needs Full Disk Access (reads) and Messages Automation (sends).
+  host. Reads need Full Disk Access for the SSH context (Remote Login: "Allow full disk
+  access for remote users"). Sends need Messages Automation, which macOS does not keep for
+  `sshd-keygen-wrapper`; the Gateway's send path needs an `imsg` running in the logged-in
+  user's session (installed docs `channels/imessage/setup.md`).
 - **OpenClaw Gateway** with the bundled `imessage` channel enabled and owner-only admission,
   and Discord native approvals for the ghost channel.
 - **OpenRouter API** for draft generation (model waterfall)

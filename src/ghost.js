@@ -3014,6 +3014,10 @@ async function handleInboundMessage(msg) {
 
     const messageText = extractMessageText(eventData);
 
+    // Paused means quiet: no preflight, so no unknown-number cards, alerts or drafts.
+    // Outgoing rows above still cancel pending work.
+    if (isPaused()) { log(`Paused — skipping ${normalized}`); return { ok: true, action: "paused" }; }
+
     const preflight = await runPreflight(contact, messageText, chatGuid, eventData);
     if (!preflight.ok) {
       log(`Preflight skip: ${preflight.reason} for ${normalized}`);
@@ -3026,8 +3030,6 @@ async function handleInboundMessage(msg) {
       }
       return { ok: true, action: preflight.reason };
     }
-
-    if (isPaused()) { log(`Paused — skipping ${normalized}`); return { ok: true, action: "paused" }; }
 
     const { contactName } = preflight.context;
     const arrivedAt = Date.now();
