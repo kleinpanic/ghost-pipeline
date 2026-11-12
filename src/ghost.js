@@ -2300,7 +2300,7 @@ async function postUnknownAlert(phone, messageText, contactName, { source = "unk
     title, description, timeoutMs: UNKNOWN_APPROVAL_MS, channelId: GHOST_CHANNEL,
   });
   if (error) log(`Unknown-contact approval for +${n} failed: ${error}`);
-  return resolveUnknownContactDecision(n, decision);
+  return resolveUnknownContactDecision(n, decision, { error });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2407,7 +2407,7 @@ function expireOrphanedDraftsOnStartup() {
 }
 
 /** Act on the owner's answer to "let ghost draft for this unknown number?". */
-async function resolveUnknownContactDecision(phone, decision) {
+async function resolveUnknownContactDecision(phone, decision, { error = null } = {}) {
   const n     = normalizePhone(phone);
   const entry = pendingUnknownAlerts.get(n) || { contactName: `+${n}`, alertCount: 1 };
   pendingUnknownAlerts.delete(n);
@@ -2430,6 +2430,13 @@ async function resolveUnknownContactDecision(phone, decision) {
     unknownAlertCounts.delete(n);
     await discordPost(GHOST_CHANNEL, { content: `🚫 Denied \`+${n}\` — added to denylist.` });
     return { action: "denied" };
+  }
+
+  // A request that failed never reached the owner, so it is not an unanswered request:
+  // it must not move the contact toward auto-deny. The count stays where it was.
+  if (error) {
+    log(`Unknown contact +${n}: approval request not delivered — not counted toward auto-deny`);
+    return { action: "error" };
   }
 
   const count = entry.alertCount || 1;
