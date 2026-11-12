@@ -716,6 +716,21 @@ describe("Group 5: Unknown contact flow", () => {
     expect(ghost.pendingUnknownAlerts.has(phone)).toBe(false);
   });
 
+  // ── Test 21a: unknown_delivery_failure ────────────────────────────────────────
+  // A card that never reached the owner is not an unanswered card (2026-11-09/10: three
+  // failed CLI calls auto-denied two numbers the owner never saw).
+  test("21a. unknown_delivery_failure: failed approval requests never count toward auto-deny", async () => {
+    const phone = "15554444444";
+    for (let i = 1; i <= ghost.MAX_UNKNOWN_ALERTS + 1; i++) {
+      const p = ghost.postUnknownAlert(phone, `message ${i}`, `+${phone}`, { source: "unknown", alertCount: i });
+      (await waitForApproval(i)).resolve({ decision: null, error: "gateway.auth.token is unavailable" });
+      expect((await p).action).toBe("error");
+    }
+    expect(ghost.isDenied(phone)).toBe(false);
+    expect(ghost.unknownAlertCounts.has(phone)).toBe(false);
+    expect(ghost.pendingUnknownAlerts.has(phone)).toBe(false);
+  });
+
   // ── Test 21b: unknown_coalesce ────────────────────────────────────────────────
   test("21b. unknown_coalesce: a second message while a card is open joins it, no second card", async () => {
     const chatGuid = `iMessage;-;+${UNKNOWN_PHONE}`;
